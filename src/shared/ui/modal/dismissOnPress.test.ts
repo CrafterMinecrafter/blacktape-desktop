@@ -8,6 +8,10 @@ describe("dismissOnPress", () => {
     expect(dismissOnPress(false, vi.fn())).toEqual({});
   });
 
+  it("marks the control as covered while a modal is open", () => {
+    expect(dismissOnPress(true, vi.fn())["data-covered"]).toBe("");
+  });
+
   it("closes the modal on mouse down and keeps the press from reaching the control", () => {
     const close = vi.fn();
     const event = fakeEvent();
