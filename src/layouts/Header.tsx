@@ -7,7 +7,7 @@ import { pickFolder } from "@/shared/lib/ui/dialog.ts";
 import { scanMusic } from "@/shared/lib/audio.ts";
 import { WindowControls } from "@/layouts/WindowControls.tsx";
 import { Dropdown } from "@/shared/ui/dropdown";
-import { MAIN_HEADER_HEIGHT, useChromeHeight } from "@/shared/ui/modal";
+import { MAIN_HEADER_HEIGHT, dismissOnPress, useChromeHeight } from "@/shared/ui/modal";
 import { useModalStore } from "@/shared/store/modalStore.ts";
 import { CgMenuLeft } from "react-icons/cg";
 import styles from "./header.module.css";
@@ -18,8 +18,11 @@ export const Header = () => {
   const { activeThemeId, setThemeId } = useTheme();
   const { fetchTabs, setActiveView } = useLibraryStore();
   useChromeHeight(MAIN_HEADER_HEIGHT);
-  // The header stays above an open modal (to drag the window), but its menu and search must not work then.
+  // The header stays above an open modal (to drag the window). A press on its menu or search closes the modal
+  // instead of using them.
   const modalOpen = useModalStore((s) => s.isOpen);
+  const closeModal = useModalStore((s) => s.closeModal);
+  const dismiss = dismissOnPress(modalOpen, closeModal);
 
   async function handlePickFolder() {
     const dir = await pickFolder();
@@ -72,7 +75,7 @@ export const Header = () => {
 
   return (
     <header data-tauri-drag-region className={styles.header}>
-      <Dropdown.Root trigger={<CgMenuLeft size={24} />} inert={modalOpen}>
+      <Dropdown.Root trigger={<CgMenuLeft size={24} />} {...dismiss}>
         <Dropdown.Item onClick={handleRescan}>Rescan Library</Dropdown.Item>
         <Dropdown.Item onClick={handlePickFolder}>
           Change Library Folder...
@@ -101,7 +104,7 @@ export const Header = () => {
         </Dropdown.Item>
       </Dropdown.Root>
 
-      <SearchBar className={styles.searchBar} inert={modalOpen} />
+      <SearchBar className={styles.searchBar} {...dismiss} />
       {/* one flex item on the right: with two auto margins the update pill landed in the middle, under the search bar */}
       <div className={styles.end}>
         <UpdateButton />

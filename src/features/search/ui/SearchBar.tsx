@@ -13,6 +13,7 @@ import {
 } from "@/shared/store/libraryStore.ts";
 import { FaCheckCircle } from "react-icons/fa";
 import type { ReactNode } from "react";
+import type { DismissOnPressProps } from "@/shared/ui/modal/dismissOnPress.ts";
 import { flyToLibrary } from "@/shared/lib/ui/flyAnimation.ts";
 import {
   matchesPlatformFilter,
@@ -76,13 +77,11 @@ const previewTarget = (item: SearchSuggestion): SearchSuggestion | null => {
   return null;
 };
 
-interface SearchBarProps {
+interface SearchBarProps extends DismissOnPressProps {
   className?: string;
-  /** Blocks the mouse and the keyboard, e.g. while a modal covers the page. */
-  inert?: boolean;
 }
 
-export const SearchBar = ({ className, inert }: SearchBarProps) => {
+export const SearchBar = ({ className, ...rootProps }: SearchBarProps) => {
   const [query, setQuery] = useState<string>("");
   const [debouncedQuery, setDebouncedQuery] = useState<string>(query);
   const [isSearching, setIsSearching] = useState<boolean>(false);
@@ -152,7 +151,7 @@ export const SearchBar = ({ className, inert }: SearchBarProps) => {
   }, [searchResults, activeCategory, activePlatform]);
 
   return (
-    <div className={clsx(styles.container, className)} inert={inert}>
+    <div className={clsx(styles.container, className)} {...rootProps}>
       <div className={styles.searchFieldWrapper}>
         <AiOutlineSearch size={18} className={styles.searchIcon} />
 

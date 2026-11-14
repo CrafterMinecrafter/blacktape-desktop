@@ -10,6 +10,7 @@ import styles from "./dropdown.module.css";
 import { MdArrowRight } from "react-icons/md";
 import { FiCheck } from "react-icons/fi";
 import clsx from "clsx";
+import type { DismissOnPressProps } from "@/shared/ui/modal/dismissOnPress.ts";
 
 // --- Context ---
 interface DropdownContextValue {
@@ -24,14 +25,12 @@ export const DropdownRoot = ({
   trigger,
   children,
   className,
-  inert,
+  ...containerProps
 }: {
   trigger: ReactNode;
   children: ReactNode;
   className?: string;
-  /** Blocks the mouse and the keyboard, e.g. while a modal covers the page. */
-  inert?: boolean;
-}) => {
+} & DismissOnPressProps) => {
   const [isOpen, setIsOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -53,7 +52,7 @@ export const DropdownRoot = ({
 
   return (
     <DropdownContext.Provider value={{ closeAll }}>
-      <div className={styles.container} ref={containerRef} inert={inert}>
+      <div className={styles.container} ref={containerRef} {...containerProps}>
         <div
           className={clsx(styles.trigger, className)}
           onClick={() => setIsOpen((prev) => !prev)}
