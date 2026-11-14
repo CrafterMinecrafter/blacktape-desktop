@@ -21,14 +21,19 @@ export const ModalHost = () => {
   if (!isOpen) return null;
 
   return (
-    <div className={styles.backdrop} onMouseDown={closeModal}>
-      <div
-        className={styles.modalContainer}
-        onMouseDown={(e) => e.stopPropagation()}
-        onClick={(e) => e.stopPropagation()}
-      >
-        {content}
+    <>
+      {/* The backdrop starts below the header, so the header stays usable: it can still drag the window and its
+          buttons work. This layer only dims it and lets every click through. */}
+      <div className={styles.headerDim} aria-hidden />
+      <div className={styles.backdrop} onMouseDown={closeModal}>
+        <div
+          className={styles.modalContainer}
+          onMouseDown={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {content}
+        </div>
       </div>
-    </div>
+    </>
   );
 };

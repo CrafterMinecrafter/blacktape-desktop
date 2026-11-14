@@ -68,6 +68,18 @@
     color: var(--color-info) !important;
 }
 
+/* A modal covers the header: the search only closes it, so it must not look usable. */
+.container[data-covered] {
+    & * {
+        cursor: default;
+    }
+
+    & .filterToggleBtn:hover {
+        background-color: transparent;
+        color: rgba(255, 255, 255, 0.5);
+    }
+}
+
 .filterPopover {
     position: absolute;
     top: calc(35px + 4px);
