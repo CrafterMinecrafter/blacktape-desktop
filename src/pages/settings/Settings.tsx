@@ -19,6 +19,7 @@ import { openPath } from "@tauri-apps/plugin-opener";
 import { UpdateSettings } from "@/features/updater/ui/UpdateSettings";
 import { AccountsSettings } from "@/features/accounts/ui/AccountsSettings";
 import { DownloaderSettings } from "@/features/downloader-setup";
+import { SETTINGS_HEADER_HEIGHT, useChromeHeight } from "@/shared/ui/modal";
 
 type SettingsTab = "appearance" | "playback" | "library" | "downloader" | "accounts" | "about";
 
@@ -34,6 +35,7 @@ export const Settings = () => {
     setBgBlur,
   } = useTheme();
   const { fetchTabs } = useLibraryStore();
+  useChromeHeight(SETTINGS_HEADER_HEIGHT);
   const [activeTab, setActiveTab] = useState<SettingsTab>("appearance");
 
   const [libraryDir, setLibraryDir] = useState<string>(() => {

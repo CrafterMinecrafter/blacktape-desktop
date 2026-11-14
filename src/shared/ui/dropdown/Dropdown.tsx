@@ -24,10 +24,13 @@ export const DropdownRoot = ({
   trigger,
   children,
   className,
+  inert,
 }: {
   trigger: ReactNode;
   children: ReactNode;
   className?: string;
+  /** Blocks the mouse and the keyboard, e.g. while a modal covers the page. */
+  inert?: boolean;
 }) => {
   const [isOpen, setIsOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -50,7 +53,7 @@ export const DropdownRoot = ({
 
   return (
     <DropdownContext.Provider value={{ closeAll }}>
-      <div className={styles.container} ref={containerRef}>
+      <div className={styles.container} ref={containerRef} inert={inert}>
         <div
           className={clsx(styles.trigger, className)}
           onClick={() => setIsOpen((prev) => !prev)}

@@ -7,6 +7,8 @@ import { pickFolder } from "@/shared/lib/ui/dialog.ts";
 import { scanMusic } from "@/shared/lib/audio.ts";
 import { WindowControls } from "@/layouts/WindowControls.tsx";
 import { Dropdown } from "@/shared/ui/dropdown";
+import { MAIN_HEADER_HEIGHT, useChromeHeight } from "@/shared/ui/modal";
+import { useModalStore } from "@/shared/store/modalStore.ts";
 import { CgMenuLeft } from "react-icons/cg";
 import styles from "./header.module.css";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -15,6 +17,9 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 export const Header = () => {
   const { activeThemeId, setThemeId } = useTheme();
   const { fetchTabs, setActiveView } = useLibraryStore();
+  useChromeHeight(MAIN_HEADER_HEIGHT);
+  // The header stays above an open modal (to drag the window), but its menu and search must not work then.
+  const modalOpen = useModalStore((s) => s.isOpen);
 
   async function handlePickFolder() {
     const dir = await pickFolder();
@@ -67,7 +72,7 @@ export const Header = () => {
 
   return (
     <header data-tauri-drag-region className={styles.header}>
-      <Dropdown.Root trigger={<CgMenuLeft size={24} />}>
+      <Dropdown.Root trigger={<CgMenuLeft size={24} />} inert={modalOpen}>
         <Dropdown.Item onClick={handleRescan}>Rescan Library</Dropdown.Item>
         <Dropdown.Item onClick={handlePickFolder}>
           Change Library Folder...
@@ -96,7 +101,7 @@ export const Header = () => {
         </Dropdown.Item>
       </Dropdown.Root>
 
-      <SearchBar className={styles.searchBar} />
+      <SearchBar className={styles.searchBar} inert={modalOpen} />
       {/* one flex item on the right: with two auto margins the update pill landed in the middle, under the search bar */}
       <div className={styles.end}>
         <UpdateButton />

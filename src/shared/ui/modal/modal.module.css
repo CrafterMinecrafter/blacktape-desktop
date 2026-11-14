@@ -1,12 +1,24 @@
 .backdrop {
     position: fixed;
-    inset: 0;
+    inset: var(--chrome-height, 0px) 0 0 0;
     background-color: rgba(0, 0, 0, 0.7);
     display: flex;
     justify-content: center;
     align-items: center;
     z-index: 1000;
     backdrop-filter: blur(1px);
+}
+
+/* Dims the header like the rest of the window but does not catch the mouse (the header is above it). */
+.headerDim {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: var(--chrome-height, 0px);
+    background-color: rgba(0, 0, 0, 0.7);
+    pointer-events: none;
+    z-index: 100001;
 }
 
 .modalContainer {

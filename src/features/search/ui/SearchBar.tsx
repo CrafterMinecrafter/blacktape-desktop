@@ -78,9 +78,11 @@ const previewTarget = (item: SearchSuggestion): SearchSuggestion | null => {
 
 interface SearchBarProps {
   className?: string;
+  /** Blocks the mouse and the keyboard, e.g. while a modal covers the page. */
+  inert?: boolean;
 }
 
-export const SearchBar = ({ className }: SearchBarProps) => {
+export const SearchBar = ({ className, inert }: SearchBarProps) => {
   const [query, setQuery] = useState<string>("");
   const [debouncedQuery, setDebouncedQuery] = useState<string>(query);
   const [isSearching, setIsSearching] = useState<boolean>(false);
@@ -150,7 +152,7 @@ export const SearchBar = ({ className }: SearchBarProps) => {
   }, [searchResults, activeCategory, activePlatform]);
 
   return (
-    <div className={clsx(styles.container, className)}>
+    <div className={clsx(styles.container, className)} inert={inert}>
       <div className={styles.searchFieldWrapper}>
         <AiOutlineSearch size={18} className={styles.searchIcon} />
 
