@@ -4,7 +4,9 @@
 //! focused. A window without decorations shows it as flat black unless the DWM frame is extended
 //! over the whole client area, so that is done together with the effect. Windows draws the
 //! native caption buttons into that extended frame; they show through the app's own header while
-//! the window is maximized, so the caption style is dropped while it is maximized and blurred.
+//! the window is maximized, so the system-menu style (which is what makes Windows draw them) is
+//! dropped while it is maximized and blurred. The caption style itself stays: without it Windows
+//! plays no minimize, maximize or restore animation.
 //! macOS: vibrancy (needs `macOSPrivateApi`, which the transparent window needs anyway).
 //! Other platforms have no window effects in Tauri; the setting is hidden there.
 
@@ -39,7 +41,7 @@ mod platform {
     use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED,
-        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WM_NCACTIVATE, WS_CAPTION,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WM_NCACTIVATE, WS_SYSMENU,
     };
 
     /// Id of the subclass below; any value unique to this module.
@@ -47,7 +49,7 @@ mod platform {
 
     /// Labels of the windows that are blurred now.
     static BLURRED: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    /// Labels of the windows that already re-check their caption on every resize.
+    /// Labels of the windows that already re-check their caption buttons on every resize.
     static WATCHED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     const ACCENT_DISABLED: u32 = 0;
@@ -117,33 +119,34 @@ mod platform {
             let watched = window.clone();
             window.on_window_event(move |event| {
                 if matches!(event, WindowEvent::Resized(_)) {
-                    sync_caption(&watched);
+                    sync_buttons(&watched);
                 }
             });
         }
-        sync_caption(window);
+        sync_buttons(window);
         Ok(())
     }
 
-    /// Whether the window is blurred and maximized: then it must have no caption, or Windows
+    /// Whether the window is blurred and maximized: then it must have no system menu, or Windows
     /// draws its caption buttons into the blurred frame behind the app's header.
-    pub(super) fn hide_caption(blurred: bool, maximized: bool) -> bool {
+    pub(super) fn hide_buttons(blurred: bool, maximized: bool) -> bool {
         blurred && maximized
     }
 
-    /// The window style with the caption removed or put back.
-    pub(super) fn caption_style(style: u32, hide: bool) -> u32 {
+    /// The window style with the system menu (and with it the caption buttons) removed or put back.
+    pub(super) fn buttons_style(style: u32, hide: bool) -> u32 {
         if hide {
-            style & !WS_CAPTION
+            style & !WS_SYSMENU
         } else {
-            style | WS_CAPTION
+            style | WS_SYSMENU
         }
     }
 
-    /// Without a caption Windows paints an old-style title bar over the app's header when the
-    /// window gains or loses focus. lParam -1 on WM_NCACTIVATE tells it not to repaint that area.
+    /// While the caption buttons are hidden Windows can paint an old-style title bar over the
+    /// app's header when the window gains or loses focus. lParam -1 on WM_NCACTIVATE tells it not
+    /// to repaint that area.
     pub(super) fn skip_frame_repaint(msg: u32, style: u32) -> bool {
-        msg == WM_NCACTIVATE && style & WS_CAPTION == 0
+        msg == WM_NCACTIVATE && style & WS_SYSMENU == 0
     }
 
     unsafe extern "system" fn subclass_proc(
@@ -162,7 +165,7 @@ mod platform {
         }
     }
 
-    fn sync_caption<R: Runtime>(window: &WebviewWindow<R>) {
+    fn sync_buttons<R: Runtime>(window: &WebviewWindow<R>) {
         let Ok(handle) = window.hwnd() else { return };
         let hwnd = handle.0 as HWND;
         let blurred = BLURRED
@@ -173,7 +176,7 @@ mod platform {
         let maximized = window.is_maximized().unwrap_or(false);
         // SAFETY: `hwnd` is the live handle of this process's window.
         let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
-        let wanted = caption_style(style, hide_caption(blurred, maximized));
+        let wanted = buttons_style(style, hide_buttons(blurred, maximized));
         if wanted == style {
             return;
         }
@@ -338,30 +341,33 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn caption_is_hidden_only_while_blurred_and_maximized() {
-        assert!(platform::hide_caption(true, true));
-        assert!(!platform::hide_caption(true, false));
-        assert!(!platform::hide_caption(false, true));
-        assert!(!platform::hide_caption(false, false));
+    fn buttons_are_hidden_only_while_blurred_and_maximized() {
+        assert!(platform::hide_buttons(true, true));
+        assert!(!platform::hide_buttons(true, false));
+        assert!(!platform::hide_buttons(false, true));
+        assert!(!platform::hide_buttons(false, false));
     }
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn caption_style_removes_and_restores_only_the_caption_bits() {
+    fn buttons_style_removes_and_restores_only_the_system_menu_bit() {
         use windows_sys::Win32::UI::WindowsAndMessaging::{WS_CAPTION, WS_SYSMENU, WS_THICKFRAME};
         let style = WS_CAPTION | WS_SYSMENU | WS_THICKFRAME;
-        let hidden = platform::caption_style(style, true);
-        assert_eq!(hidden, WS_SYSMENU | WS_THICKFRAME);
-        assert_eq!(platform::caption_style(hidden, false), style);
+        let hidden = platform::buttons_style(style, true);
+        // The caption stays: without it Windows plays no minimize/restore animation.
+        assert_eq!(hidden, WS_CAPTION | WS_THICKFRAME);
+        assert_eq!(platform::buttons_style(hidden, false), style);
     }
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn frame_repaint_is_skipped_only_on_activation_without_a_caption() {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_NCACTIVATE, WM_NCPAINT, WS_CAPTION, WS_SYSMENU};
-        assert!(platform::skip_frame_repaint(WM_NCACTIVATE, WS_SYSMENU));
+    fn frame_repaint_is_skipped_only_on_activation_while_the_buttons_are_hidden() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            WM_NCACTIVATE, WM_NCPAINT, WS_CAPTION, WS_SYSMENU,
+        };
+        assert!(platform::skip_frame_repaint(WM_NCACTIVATE, WS_CAPTION));
         assert!(!platform::skip_frame_repaint(WM_NCACTIVATE, WS_CAPTION | WS_SYSMENU));
-        assert!(!platform::skip_frame_repaint(WM_NCPAINT, WS_SYSMENU));
+        assert!(!platform::skip_frame_repaint(WM_NCPAINT, WS_CAPTION));
     }
 
     #[cfg(target_os = "windows")]
