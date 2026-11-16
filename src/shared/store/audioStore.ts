@@ -66,6 +66,12 @@ interface AudioState {
   playbackContextId: number | null;
 }
 
+let progressSeq = 0;
+
+export const resetProgressSeq = () => {
+  progressSeq = 0;
+};
+
 export const useAudioStore = create<AudioState>((set, get) => ({
   queue: [],
   currentSong: null,
@@ -128,7 +134,10 @@ export const useAudioStore = create<AudioState>((set, get) => ({
     await tauriPause();
   },
 
-  setProgress: (progress) => set({ progress }),
+  setProgress: (progress) => {
+    progressSeq++;
+    set({ progress });
+  },
 
   setVolume: async (volume) => {
     set({ volume });
@@ -136,6 +145,7 @@ export const useAudioStore = create<AudioState>((set, get) => ({
   },
 
   seek: async (progress) => {
+    progressSeq++;
     set({ progress });
     await tauriSeek(progress);
   },
@@ -151,7 +161,9 @@ export const useAudioStore = create<AudioState>((set, get) => ({
   updateProgress: async () => {
     const { currentSong, isPlaying } = get();
     if (!currentSong || !isPlaying) return;
+    const seq = progressSeq;
     const pos = await getPosition();
+    if (seq !== progressSeq) return;
     // the song changed while the position was being fetched: that position belongs to the old one
     if (songChanged(get().currentSong, currentSong)) return;
     set({ progress: pos });
@@ -179,6 +191,7 @@ export const keepPlaybackError = (
 
 if (typeof window !== "undefined") {
   listen("player-state", (event) => {
+    progressSeq++;
     const state: any = event.payload;
     const previous = useAudioStore.getState().currentSong;
     // a different song starts at 0 right away, whatever position the event still carries

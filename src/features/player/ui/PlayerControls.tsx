@@ -1,7 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
-import { seek } from "@/shared/lib/audio.ts";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useAudioStore } from "@/shared/store/audioStore.ts";
 import styles from "./player-controls.module.css";
+import {
+  calculateDisplayProgress,
+  progressToSliderValue,
+  sliderValueToProgress,
+} from "@/features/player/ui/seekProgress.ts";
 import { DownloadSplitButton } from "@/shared/ui/download-split-button/DownloadSplitButton.tsx";
 import { openQualityMenu } from "@/features/download-quality/ui/QualityModal.tsx";
 import { formatDuration } from "@/shared/lib/ui/time.ts";
@@ -24,7 +28,11 @@ import {
 import clsx from "clsx";
 import { coverSrc } from "@/shared/lib/remote/cover";
 import placeholderSongImage from "@/assets/react.svg";
-import { ItemType, useLibraryStore, type SearchSuggestion } from "@/shared/store/libraryStore.ts";
+import {
+  ItemType,
+  useLibraryStore,
+  type SearchSuggestion,
+} from "@/shared/store/libraryStore.ts";
 import { useAlbumPreviewStore } from "@/features/album-preview/model/albumPreviewStore.ts";
 import { remoteTrackDownloadParams } from "@/features/remote-track-menu/model/buildRemoteTrackMenu.ts";
 import { AddToPlaylistModal } from "@/features/library/ui/playlists/AddToPlaylistModal.tsx";
@@ -32,7 +40,11 @@ import { useModalStore } from "@/shared/store/modalStore.ts";
 import { useTrackStatus } from "@/shared/hooks/useDownloadStatus.ts";
 import { findDownload, isRunning } from "@/shared/lib/library/downloadMatch.ts";
 import { streamAlbumUrl } from "@/shared/lib/remote/stream.ts";
-import { albumTarget, remoteTrackRef, streamSongToRemoteTrack } from "../lib/currentSong.ts";
+import {
+  albumTarget,
+  remoteTrackRef,
+  streamSongToRemoteTrack,
+} from "../lib/currentSong.ts";
 import { RepeatMode } from "@/shared/types.ts";
 
 export const PlayerControls = () => {
@@ -57,7 +69,17 @@ export const PlayerControls = () => {
     playbackError,
   } = useAudioStore();
   const [isDragging, setIsDragging] = useState<boolean>(false);
+  const [dragProgress, setDragProgress] = useState<number | null>(null);
+  const isDraggingRef = useRef<boolean>(false);
+  const dragProgressRef = useRef<number | null>(null);
   const [mutedVolume, setMutedVolume] = useState<number>(volume);
+
+  useEffect(() => {
+    isDraggingRef.current = false;
+    dragProgressRef.current = null;
+    setIsDragging(false);
+    setDragProgress(null);
+  }, [currentSong?.id, currentSong?.source_url]);
 
   useEffect(() => {
     if (isDragging) return;
@@ -68,10 +90,61 @@ export const PlayerControls = () => {
     };
   }, [updateProgress, isDragging]);
 
-  const handleSeek = async (value: number) => {
+  const commitSeek = async (value: number) => {
+    isDraggingRef.current = false;
+    dragProgressRef.current = null;
     setProgress(value);
-    if (isDragging) return;
+    setDragProgress(null);
+    setIsDragging(false);
     await storeSeek(value);
+  };
+
+  useEffect(() => {
+    if (!isDragging) return;
+
+    const handleWindowPointerUp = () => {
+      if (!isDraggingRef.current) return;
+      const target = dragProgressRef.current ?? dragProgress;
+      if (target !== null) {
+        void commitSeek(target);
+      } else {
+        isDraggingRef.current = false;
+        setIsDragging(false);
+        setDragProgress(null);
+      }
+    };
+
+    window.addEventListener("pointerup", handleWindowPointerUp);
+    window.addEventListener("pointercancel", handleWindowPointerUp);
+    return () => {
+      window.removeEventListener("pointerup", handleWindowPointerUp);
+      window.removeEventListener("pointercancel", handleWindowPointerUp);
+    };
+  }, [isDragging, dragProgress, storeSeek]);
+
+  const handlePointerDown = (e: React.PointerEvent<HTMLInputElement>) => {
+    isDraggingRef.current = true;
+    setIsDragging(true);
+    const initialProgress = sliderValueToProgress(Number(e.currentTarget.value));
+    dragProgressRef.current = initialProgress;
+    setDragProgress(initialProgress);
+  };
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const value = sliderValueToProgress(Number(e.target.value));
+    if (isDraggingRef.current) {
+      dragProgressRef.current = value;
+      setDragProgress(value);
+    } else {
+      void commitSeek(value);
+    }
+  };
+
+  const handlePointerUp = (e: React.PointerEvent<HTMLInputElement>) => {
+    if (!isDraggingRef.current) return;
+    const value =
+      dragProgressRef.current ?? sliderValueToProgress(Number(e.currentTarget.value));
+    void commitSeek(value);
   };
 
   const handleMute = () => {
@@ -84,18 +157,33 @@ export const PlayerControls = () => {
 
   const openModal = useModalStore((s) => s.openModal);
   const albumUrl = streamAlbumUrl(currentSong?.source_url);
-  const target = currentSong ? albumTarget(currentSong, isStreaming, albumUrl) : null;
+  const target = currentSong
+    ? albumTarget(currentSong, isStreaming, albumUrl)
+    : null;
   // A stream is not in the library: it can be downloaded (and only then added to a playlist).
   const streamTrack = useMemo(
-    () => (currentSong && isStreaming ? streamSongToRemoteTrack(currentSong, albumUrl) : null),
+    () =>
+      currentSong && isStreaming
+        ? streamSongToRemoteTrack(currentSong, albumUrl)
+        : null,
     [currentSong, isStreaming, albumUrl],
   );
-  const downloadState = useTrackStatus(streamTrack ? remoteTrackRef(streamTrack) : null);
-  const downloadParams = useMemo(() => (streamTrack ? remoteTrackDownloadParams(streamTrack) : null), [streamTrack]);
+  const downloadState = useTrackStatus(
+    streamTrack ? remoteTrackRef(streamTrack) : null,
+  );
+  const downloadParams = useMemo(
+    () => (streamTrack ? remoteTrackDownloadParams(streamTrack) : null),
+    [streamTrack],
+  );
   // The download of this song started from anywhere (here, a menu, the album page), if any.
-  const download = useLibraryStore((s) => (downloadParams ? findDownload(s.activeDownloads, downloadParams) : undefined));
+  const download = useLibraryStore((s) =>
+    downloadParams
+      ? findDownload(s.activeDownloads, downloadParams)
+      : undefined,
+  );
   const downloading = isRunning(download);
-  const downloaded = downloadState === "downloaded" || download?.status === "completed";
+  const downloaded =
+    downloadState === "downloaded" || download?.status === "completed";
 
   const openAlbum = () => {
     if (!currentSong || !target) return;
@@ -114,7 +202,8 @@ export const PlayerControls = () => {
     void useAlbumPreviewStore.getState().open(item);
   };
 
-  const currentTime = currentSong ? currentSong.duration_ms * progress : 0;
+  const displayProgress = calculateDisplayProgress(progress, dragProgress);
+  const currentTime = currentSong ? currentSong.duration_ms * displayProgress : 0;
 
   return (
     <div
@@ -125,27 +214,15 @@ export const PlayerControls = () => {
         className={styles.progressBar}
         type="range"
         style={{
-          background: `linear-gradient(to right, var(--color-primary) ${progress * 100}%, #555 0)`,
+          background: `linear-gradient(to right, var(--color-primary) ${displayProgress * 100}%, #555 0)`,
         }}
         disabled={!currentSong || streamLoading}
         min={0}
         max={1000}
-        value={progress * 1000}
-        onChange={(e) => handleSeek(Number(e.target.value) / 1000)}
-        onMouseDown={() => {
-          setIsDragging(true);
-        }}
-        onTouchStart={() => {
-          setIsDragging(true);
-        }}
-        onMouseUp={async (e) => {
-          setIsDragging(false);
-          await seek(Number(e.currentTarget.value) / 1000);
-        }}
-        onTouchEnd={async (e) => {
-          setIsDragging(false);
-          await seek(Number(e.currentTarget.value) / 1000);
-        }}
+        value={progressToSliderValue(displayProgress)}
+        onChange={handleChange}
+        onPointerDown={handlePointerDown}
+        onPointerUp={handlePointerUp}
       />
       <div className={styles.innerBlock}>
         <div className={styles.leftBlock}>
@@ -193,8 +270,8 @@ export const PlayerControls = () => {
             <>
               {currentSong.cover_url ? (
                 <img
- loading="lazy"
- decoding="async"
+                  loading="lazy"
+                  decoding="async"
                   className={styles.currentSongCover}
                   src={coverSrc(currentSong.cover_url, 64)}
                   alt={currentSong.title}
@@ -211,11 +288,20 @@ export const PlayerControls = () => {
                   {currentSong.title}
                 </div>
                 {playbackError && (
-                  <div className={clsx(styles.playbackError, "truncate")} title={playbackError.message}>
+                  <div
+                    className={clsx(styles.playbackError, "truncate")}
+                    title={playbackError.message}
+                  >
                     Can't play this song: {playbackError.message}
                   </div>
                 )}
-                <div className={clsx(styles.currentSongArtist, "truncate", playbackError && styles.hidden)}>
+                <div
+                  className={clsx(
+                    styles.currentSongArtist,
+                    "truncate",
+                    playbackError && styles.hidden,
+                  )}
+                >
                   {isStreaming && (
                     <span
                       className={styles.streamBadge}
@@ -247,7 +333,9 @@ export const PlayerControls = () => {
                   ) : (
                     currentSong.album
                   )}
-                  {currentSong.release_year ? ` • ${currentSong.release_year}` : ""}
+                  {currentSong.release_year
+                    ? ` • ${currentSong.release_year}`
+                    : ""}
                 </div>
               </div>
               <div className={styles.songActions}>
@@ -255,8 +343,14 @@ export const PlayerControls = () => {
                   type="button"
                   className={styles.songAction}
                   disabled={isStreaming}
-                  title={isStreaming ? "Download the song first to add it to a playlist" : "Add to playlist"}
-                  onClick={() => openModal(<AddToPlaylistModal songIds={[currentSong.id]} />)}
+                  title={
+                    isStreaming
+                      ? "Download the song first to add it to a playlist"
+                      : "Add to playlist"
+                  }
+                  onClick={() =>
+                    openModal(<AddToPlaylistModal songIds={[currentSong.id]} />)
+                  }
                 >
                   <MdPlaylistAdd />
                 </button>
@@ -274,10 +368,16 @@ export const PlayerControls = () => {
                       type="button"
                       className={styles.songAction}
                       disabled
-                      title={downloaded ? "Already in your library" : "Downloading…"}
+                      title={
+                        downloaded ? "Already in your library" : "Downloading…"
+                      }
                     >
                       {downloading ? (
-                        <span className={styles.actionSpinner} role="status" aria-label="Downloading" />
+                        <span
+                          className={styles.actionSpinner}
+                          role="status"
+                          aria-label="Downloading"
+                        />
                       ) : (
                         <MdCheck />
                       )}
@@ -289,7 +389,11 @@ export const PlayerControls = () => {
                       className={styles.downloadSplit}
                       icon={<MdFileDownload />}
                       title="Download this song"
-                      onDownload={() => void useLibraryStore.getState().startDownload(downloadParams)}
+                      onDownload={() =>
+                        void useLibraryStore
+                          .getState()
+                          .startDownload(downloadParams)
+                      }
                       onChooseQuality={() => openQualityMenu(downloadParams)}
                     />
                   ))}
