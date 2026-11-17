@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:fast": "tauri build -- --profile fast",
-    "test": "vitest run"
+    "test": "vitest run",
+    "bump": "node scripts/bump.js"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
