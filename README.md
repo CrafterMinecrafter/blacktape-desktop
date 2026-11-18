@@ -35,7 +35,7 @@ Most players only play what you already have, and most downloaders don't care ab
 
 Windows builds are on the [Releases page](https://github.com/seafoodd/blacktape-desktop/releases). Other systems are not built yet, so for now you'd need to run it from source.
 
-The app downloads [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [ffmpeg](https://ffmpeg.org), which are required for downloading songs.
+Downloading tracks requires [yt-dlp](https://github.com/yt-dlp/yt-dlp), [Deno](https://deno.com) (for YouTube's JS challenges), and [FFmpeg](https://ffmpeg.org) (for audio conversion). Blacktape uses existing system installs of Deno and FFmpeg if found, downloads anything missing, and checks for updates automatically.
 
 ## Run from source
 
