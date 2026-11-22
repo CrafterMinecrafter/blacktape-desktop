@@ -7,13 +7,14 @@ pub mod download;
 pub mod library_index;
 mod lyrics;
 mod playlists;
-pub mod scan;
-pub mod song_edit;
-pub mod source_tag;
 mod preview;
+pub mod scan;
 mod search;
+pub mod song_edit;
 pub mod soundcloud;
+pub mod source_tag;
 pub mod tags;
+pub mod telemetry;
 mod thumbs;
 pub mod trash;
 pub mod types;
@@ -242,7 +243,12 @@ async fn get_stream_lyrics(
     static CACHE: OnceLock<std::sync::Mutex<HashMap<String, LyricsSource>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     let provider = provider.filter(|p| !p.trim().is_empty() && p != "auto");
-    let key = format!("{}|{}|{}", artist.to_lowercase(), title.to_lowercase(), provider.as_deref().unwrap_or(""));
+    let key = format!(
+        "{}|{}|{}",
+        artist.to_lowercase(),
+        title.to_lowercase(),
+        provider.as_deref().unwrap_or("")
+    );
     if provider.is_none() {
         if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
             return Ok(hit.clone());
@@ -250,13 +256,15 @@ async fn get_stream_lyrics(
     }
     let album = album.filter(|a| !a.trim().is_empty());
     let result = match provider.as_deref() {
-        Some(p) => fetch_lyrics_from_provider(p, &artist, &title, album.as_deref(), duration_ms).await,
+        Some(p) => {
+            fetch_lyrics_from_provider(p, &artist, &title, album.as_deref(), duration_ms).await
+        }
         None => fetch_lyrics(&artist, &title, album.as_deref(), duration_ms).await,
     }?;
-    cache
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(format!("{}|{}|", artist.to_lowercase(), title.to_lowercase()), result.clone());
+    cache.lock().unwrap_or_else(|e| e.into_inner()).insert(
+        format!("{}|{}|", artist.to_lowercase(), title.to_lowercase()),
+        result.clone(),
+    );
     Ok(result)
 }
 
@@ -516,10 +524,7 @@ async fn delete_songs(
     delete_file: bool,
 ) -> Result<(), String> {
     let db = state.lock().await;
-    let songs = db
-        .get_songs_by_ids(&ids)
-        .await
-        .map_err(|e| e.to_string())?;
+    let songs = db.get_songs_by_ids(&ids).await.map_err(|e| e.to_string())?;
 
     let outcome = song_edit::delete_song_files(&songs, delete_file);
     db.delete_songs(outcome.deleted_ids.clone())
@@ -728,7 +733,9 @@ fn quits_app(label: &str, event: &tauri::WindowEvent) -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let _sentry_guard = telemetry::init();
+
+    let mut builder = tauri::Builder::default()
         // Must come first: a second start only brings the running window forward. Two instances would both
         // download and swap yt-dlp, deno and ffmpeg in the same folder.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -737,7 +744,14 @@ pub fn run() {
                 let _ = window.show();
                 let _ = window.set_focus();
             }
-        }))
+        }));
+
+    // 2. Register the Tauri Sentry bridge if a DSN was compiled in
+    if let Some(ref client) = _sentry_guard {
+        builder = builder.plugin(tauri_plugin_sentry::init(client));
+    }
+
+    builder
         // thumb://localhost/<encoded path>?s=<px> -> downscaled cover (see thumbs.rs)
         .register_asynchronous_uri_scheme_protocol("thumb", |ctx, request, responder| {
             let cache_dir = ctx
@@ -790,12 +804,30 @@ pub fn run() {
                 .path()
                 .app_config_dir()
                 .expect("failed to get app config dir");
+
+            telemetry::init_install_id(&config_dir);
+
             let db_path = db_file_path(&config_dir);
             let db_path_str = db_path.to_str().expect("path is not valid utf-8");
             let db = tauri::async_runtime::block_on(async { Database::new(db_path_str).await });
+
+            let telemetry_enabled = tauri::async_runtime::block_on(async {
+                db.get_app_setting(telemetry::TELEMETRY_SETTING_KEY)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|v| v != "false")
+                    .unwrap_or(true)
+            });
+            telemetry::set_enabled(telemetry_enabled);
+
             // The interface reads covers only from the library and the folders of known covers.
             let (library_dir, cover_paths) = tauri::async_runtime::block_on(async {
-                let library_dir = db.get_app_setting(trash::LIBRARY_DIR_KEY).await.ok().flatten();
+                let library_dir = db
+                    .get_app_setting(trash::LIBRARY_DIR_KEY)
+                    .await
+                    .ok()
+                    .flatten();
                 let covers: Vec<String> = db
                     .get_all_songs()
                     .await

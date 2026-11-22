@@ -7,6 +7,7 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { Album, ArtistSummary, Platform } from "@/shared/types.ts";
 import { findDownload, isRunning } from "@/shared/lib/library/downloadMatch.ts";
+import { captureFrontendError } from "@/shared/lib/telemetry.ts";
 
 export type DownloadStatus =
   | "idle"
@@ -201,6 +202,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       }));
     } catch (error) {
       console.error("Search failed", error);
+      captureFrontendError(error, "libraryStore.executeSearch");
     }
   },
 
@@ -214,6 +216,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       set({ albums });
     } catch (error) {
       console.error("Failed to fetch artist albums:", error);
+      captureFrontendError(error, "libraryStore.getArtistAlbums");
       set({ albums: [] });
     }
   },
@@ -597,6 +600,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       });
     } catch (e) {
       console.error("Download invoke failed:", e);
+      captureFrontendError(e, "libraryStore.startDownload");
       set((state) => {
         const existing = state.activeDownloads[taskId];
         if (!existing) return {};
@@ -619,6 +623,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       await invoke("cancel_download", { taskId });
     } catch (e) {
       console.error("Cancel download invoke failed:", e);
+      captureFrontendError(e, "libraryStore.cancelDownload");
     }
     set((state) => {
       const activeDownloads = { ...state.activeDownloads };
