@@ -660,7 +660,33 @@ async fn download_track_internal(
             stdout_str.trim()
         );
         crate::download::tools::after_failure(&ctx.app, &stderr_str);
-        ctx.record_failure(failure_reason(&stderr_str, status.code()));
+        let summary = failure_reason(&stderr_str, status.code());
+        let platform = if track.url.contains("bandcamp.com") {
+            "bandcamp"
+        } else if track.url.contains("soundcloud.com") {
+            "soundcloud"
+        } else {
+            "youtube"
+        };
+        let full_log = format!(
+            "[yt-dlp ERROR] [{}] [Track {}/{}] Exited with code {:?}\n--- STDERR ---\n{}\n--- STDOUT ---\n{}",
+            ctx.session_id,
+            track_num,
+            total_tracks,
+            status.code(),
+            stderr_str.trim(),
+            stdout_str.trim()
+        );
+        let track_name = format!("{} - {}", track.artists.join(", "), track.title);
+        crate::telemetry::report_download_error_with_context(
+            platform,
+            "download",
+            &summary,
+            Some(&track.url),
+            Some(&track_name),
+            Some(&full_log),
+        );
+        ctx.record_failure(summary);
         return None;
     }
 
@@ -678,7 +704,34 @@ async fn download_track_internal(
     if found.is_none() {
         // exit code 0 but no file: yt-dlp usually printed why ("Requested format is not available")
         crate::download::tools::after_failure(&ctx.app, &stderr_str);
-        ctx.record_failure(failure_reason(&stderr_str, status.code()));
+        let summary = failure_reason(&stderr_str, status.code());
+        let platform = if track.url.contains("bandcamp.com") {
+            "bandcamp"
+        } else if track.url.contains("soundcloud.com") {
+            "soundcloud"
+        } else {
+            "youtube"
+        };
+        let full_log = format!(
+            "[yt-dlp ERROR] [{}] [Track {}/{}] Process succeeded, but no output file matching '{}.*' was found in {:?}\n--- STDERR ---\n{}\n--- STDOUT ---\n{}",
+            ctx.session_id,
+            track_num,
+            total_tracks,
+            track_num,
+            ctx.temp_dir,
+            stderr_str.trim(),
+            stdout_str.trim()
+        );
+        let track_name = format!("{} - {}", track.artists.join(", "), track.title);
+        crate::telemetry::report_download_error_with_context(
+            platform,
+            "download",
+            &summary,
+            Some(&track.url),
+            Some(&track_name),
+            Some(&full_log),
+        );
+        ctx.record_failure(summary);
     }
     found
 }

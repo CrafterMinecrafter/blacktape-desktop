@@ -117,9 +117,27 @@ pub fn total_duration(rows: &[AlbumTrackInfo]) -> Option<u64> {
 /// Fetches the preview of the album/set at `url`.
 pub async fn album_preview(platform: Platform, url: &str) -> Result<AlbumPreview, String> {
     let (album, skipped) = match platform {
-        Platform::Bandcamp => (bandcamp::parse_album(url).await?, Vec::new()),
-        Platform::Youtube => (youtube::parse_album(url).await?, Vec::new()),
-        Platform::Soundcloud => soundcloud::parse_album_with_skipped(url).await?,
+        Platform::Bandcamp => match bandcamp::parse_album(url).await {
+            Ok(res) => (res, Vec::new()),
+            Err(e) => {
+                crate::telemetry::report_parser_failure("bandcamp", "album_preview", &e);
+                return Err(e);
+            }
+        },
+        Platform::Youtube => match youtube::parse_album(url).await {
+            Ok(res) => (res, Vec::new()),
+            Err(e) => {
+                crate::telemetry::report_parser_failure("youtube", "album_preview", &e);
+                return Err(e);
+            }
+        },
+        Platform::Soundcloud => match soundcloud::parse_album_with_skipped(url).await {
+            Ok(res) => res,
+            Err(e) => {
+                crate::telemetry::report_parser_failure("soundcloud", "album_preview", &e);
+                return Err(e);
+            }
+        },
         Platform::Local => return Err("Local albums have no preview.".to_string()),
     };
     Ok(build_preview(platform, url, album, &skipped))

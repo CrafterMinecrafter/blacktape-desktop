@@ -40,6 +40,15 @@ pub async fn handle_download_task(task: DownloadTask, app_handle: AppHandle) -> 
         _ => None,
     };
 
+    let (target_url, track_info) = match &task.payload {
+        DownloadPayload::Single(t) => (Some(t.url.clone()), Some(format!("{} - {}", t.artists.join(", "), t.title))),
+        DownloadPayload::Batch { tracks } => (tracks.first().map(|t| t.url.clone()), tracks.first().map(|t| format!("{} - {}", t.artists.join(", "), t.title))),
+        DownloadPayload::AlbumURL(u) => (Some(u.clone()), None),
+        DownloadPayload::AlbumSelection { url, .. } => (Some(url.clone()), None),
+        DownloadPayload::TrackURL(u) => (Some(u.clone()), None),
+        DownloadPayload::PlacedTrack { url, placement } => (Some(url.clone()), Some(format!("{} - {}", placement.album_artist, placement.title))),
+    };
+
     let download_result = match task.payload {
         DownloadPayload::AlbumURL(url) => {
             process_album_url(task.platform, &url, None, &task.output_dir, &app_handle, &task_id)
@@ -112,6 +121,19 @@ pub async fn handle_download_task(task: DownloadTask, app_handle: AppHandle) -> 
     let (target_dir, downloaded_files, cover_path) = match download_result {
         Ok(res) => res,
         Err(e) => {
+            // yt-dlp failures are reported per track with full stderr/stdout in ytdlp.rs.
+            // If the failure occurred outside yt-dlp (e.g. metadata parsing, album discovery, cover fetching),
+            // report it here with the task's url and track context.
+            if !e.starts_with("ERROR:") && !e.starts_with("[yt-dlp") && !e.contains("No such file or directory") {
+                crate::telemetry::report_download_error_with_context(
+                    &format!("{:?}", task.platform).to_lowercase(),
+                    "download",
+                    &e,
+                    target_url.as_deref(),
+                    track_info.as_deref(),
+                    None,
+                );
+            }
             emit_event(
                 &app_handle,
                 "download-task-failed",

@@ -107,27 +107,151 @@ pub fn init() -> Option<ClientInitGuard> {
     Some(guard)
 }
 
-/// Reports a non-fatal platform/parser failure without leaking track names or URLs.
-pub fn report_parser_error(platform: &str, stage: &str, error_kind: &str) {
+/// Classifies a raw download or yt-dlp error string into a normalized category without private URLs or paths.
+pub fn classify_error(message: &str) -> &'static str {
+    let lower = message.to_lowercase();
+    if lower.contains("did not get any data blocks") {
+        "no_data_blocks"
+    } else if lower.contains("403") || lower.contains("forbidden") {
+        "http_403_forbidden"
+    } else if lower.contains("429") || lower.contains("too many requests") {
+        "rate_limited_429"
+    } else if lower.contains("not a bot") || lower.contains("login required") || lower.contains("sign in to confirm") {
+        "bot_or_login_required"
+    } else if lower.contains("private video") || lower.contains("members-only") || lower.contains("granted access") {
+        "restricted_access"
+    } else if lower.contains("age-restricted") || lower.contains("age restricted") {
+        "age_restricted"
+    } else if lower.contains("no output file matching") {
+        "no_output_file"
+    } else if lower.contains("part-frag")
+        || lower.contains("fragment not found")
+        || lower.contains("unable to download video")
+    {
+        "fragment_download_failed"
+    } else if lower.contains("errno 2") || lower.contains("no such file or directory") {
+        "file_not_found"
+    } else if lower.contains("permission denied") || lower.contains("access is denied") {
+        "permission_denied"
+    } else if lower.contains("no video formats found")
+        || lower.contains("requested format is not available")
+        || lower.contains("produced no audio file")
+    {
+        "format_not_available"
+    } else if lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("unreachable")
+        || lower.contains("connection")
+        || lower.contains("temporary failure in name resolution")
+        || lower.contains("network request failed")
+    {
+        "network_timeout"
+    } else if lower.contains("auth_window_closed") || lower.contains("auth window closed") {
+        "auth_window_closed"
+    } else if lower.contains("rustypipe failed")
+        || lower.contains("failed to fetch youtube")
+        || lower.contains("failed to fetch album")
+        || lower.contains("video details")
+        || lower.contains("music details")
+    {
+        "metadata_fetch_failed"
+    } else if lower.contains("failed to parse") || lower.contains("parse error") {
+        "parser_failed"
+    } else if lower.contains("404") || lower.contains("not found") {
+        "not_found_404"
+    } else {
+        "unknown_download_error"
+    }
+}
+
+/// Classifies a raw download failure and sends a privacy-safe telemetry event to Sentry with detailed error context.
+pub fn report_download_error(platform: &str, stage: &str, raw_error: &str) {
+    report_download_error_with_context(platform, stage, raw_error, None, None, None);
+}
+
+/// Reports a download failure with full context: target URL, track name, and full stderr/stdout.
+pub fn report_download_error_with_context(
+    platform: &str,
+    stage: &str,
+    raw_error: &str,
+    target_url: Option<&str>,
+    track_name: Option<&str>,
+    detailed_log: Option<&str>,
+) {
     if !is_enabled() {
         return;
     }
+
+    let error_kind = classify_error(raw_error);
+    let sanitized_error = scrub_home_dir(raw_error);
+
+    // Extract the most informative line for the title
+    let summary_line = sanitized_error
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("ERROR:") || l.starts_with("Failed") || l.contains("Error"))
+        .or_else(|| sanitized_error.lines().map(str::trim).find(|l| !l.is_empty()))
+        .unwrap_or(error_kind);
 
     sentry::with_scope(
         |scope| {
             scope.set_tag("platform", platform);
             scope.set_tag("stage", stage);
             scope.set_tag("error_kind", error_kind);
-            // Group issues by (platform, stage, error_kind) instead of raw error strings
-            scope.set_fingerprint(Some(&[platform, stage, error_kind]));
+
+            if let Some(url) = target_url {
+                if let Ok(parsed) = url::Url::parse(url) {
+                    if let Some(host) = parsed.host_str() {
+                        scope.set_tag("url_host", host);
+                    }
+                }
+                scope.set_extra("target_url", serde_json::Value::String(scrub_home_dir(url)));
+            }
+
+            if let Some(name) = track_name {
+                scope.set_extra("track_name", serde_json::Value::String(scrub_home_dir(name)));
+            }
+
+            let full_details = match detailed_log {
+                Some(log) => scrub_home_dir(log),
+                None => sanitized_error.clone(),
+            };
+
+            scope.set_extra(
+                "error_details",
+                serde_json::Value::String(full_details),
+            );
+
+            if error_kind != "unknown_download_error" {
+                // Group known issues by (platform, stage, error_kind)
+                scope.set_fingerprint(Some(&[platform, stage, error_kind]));
+            } else {
+                // Distinct unknown errors get distinct issues in Sentry so they can be identified
+                scope.set_fingerprint(Some(&[platform, stage, summary_line]));
+            }
         },
         || {
             sentry::capture_message(
-                &format!("[{platform}] {stage} failed: {error_kind}"),
+                &format!("[{platform}] {stage} failed ({error_kind}): {summary_line}"),
                 Level::Error,
             );
         },
     );
+}
+
+/// Classifies a raw parser failure and sends a privacy-safe telemetry event to Sentry with detailed error context.
+pub fn report_parser_failure(platform: &str, stage: &str, raw_error: &str) {
+    report_download_error_with_context(platform, stage, raw_error, None, None, None);
+}
+
+/// Reports a non-fatal platform/parser failure without leaking track names or URLs.
+pub fn report_parser_error(platform: &str, stage: &str, error_kind: &str) {
+    report_download_error_with_context(platform, stage, error_kind, None, None, None);
+}
+
+/// Reports an error with normalized tags, fingerprinting, and sanitized details in Sentry's Additional Data.
+pub fn report_error_with_details(platform: &str, stage: &str, raw_error: &str) {
+    report_download_error_with_context(platform, stage, raw_error, None, None, None);
 }
 
 #[cfg(test)]
@@ -137,6 +261,41 @@ mod tests {
     use std::sync::Mutex;
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_classify_error() {
+        assert_eq!(classify_error("ERROR: Did not get any data blocks"), "no_data_blocks");
+        assert_eq!(classify_error("HTTP Error 403: Forbidden"), "http_403_forbidden");
+        assert_eq!(classify_error("HTTP Error 429: Too Many Requests"), "rate_limited_429");
+        assert_eq!(classify_error("Sign in to confirm you're not a bot"), "bot_or_login_required");
+        assert_eq!(classify_error("Private video. Sign in if you've been granted access"), "restricted_access");
+        assert_eq!(classify_error("This video is age-restricted"), "age_restricted");
+        assert_eq!(classify_error("Process succeeded, but no output file matching '1.*' was found in dir"), "no_output_file");
+        assert_eq!(
+            classify_error("ERROR: Unable to download video: [Errno 2] No such file or directory: '<HOME>\\blacktape-lib\\.temp\\batch_1795381982395\\1.mp4.part-Frag56'"),
+            "fragment_download_failed"
+        );
+        assert_eq!(
+            classify_error("[download] fragment not found; Skipping fragment 78 ..."),
+            "fragment_download_failed"
+        );
+        assert_eq!(
+            classify_error("[Errno 2] No such file or directory: 'some/file.mp3'"),
+            "file_not_found"
+        );
+        assert_eq!(
+            classify_error("Permission denied: 'C:\\test\\locked.mp3'"),
+            "permission_denied"
+        );
+        assert_eq!(classify_error("no video formats found"), "format_not_available");
+        assert_eq!(classify_error("Connection timed out after 30000ms"), "network_timeout");
+        assert_eq!(classify_error("auth_window_closed"), "auth_window_closed");
+        assert_eq!(classify_error("Failed to fetch YouTube video details: not found"), "metadata_fetch_failed");
+        assert_eq!(classify_error("RustyPipe failed to fetch album: 404"), "metadata_fetch_failed");
+        assert_eq!(classify_error("Failed to parse JSON payload"), "parser_failed");
+        assert_eq!(classify_error("Item not found"), "not_found_404");
+        assert_eq!(classify_error("some totally unmapped failure occurred"), "unknown_download_error");
+    }
 
     #[test]
     fn test_toggle_enabled() {
