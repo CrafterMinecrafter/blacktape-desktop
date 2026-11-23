@@ -85,10 +85,29 @@ async fn scan_music(
             .map_err(|e| e.to_string())?;
     }
 
-    let songs = scan::scan_music_dir(dir.clone(), &covers_path);
+    let app_clone = app.clone();
+    let songs = scan::scan_music_dir_with_progress(dir.clone(), &covers_path, move |scanned, total| {
+        let _ = app_clone.emit(
+            "scan-progress",
+            serde_json::json!({
+                "phase": "scanning",
+                "scanned": scanned,
+                "total": total,
+            }),
+        );
+    });
     db.insert_songs(songs.clone())
         .await
         .map_err(|e| e.to_string())?;
+
+    let _ = app.emit(
+        "scan-progress",
+        serde_json::json!({
+            "phase": "done",
+            "scanned": songs.len(),
+            "total": songs.len(),
+        }),
+    );
     // The trash folder lives inside the library dir, so the backend needs to know it (D11).
     db.set_app_setting(trash::LIBRARY_DIR_KEY, &dir)
         .await
@@ -726,6 +745,65 @@ async fn get_active_downloads(
     Ok(task_registry.get_all_states().await)
 }
 
+#[command]
+async fn get_telemetry_enabled(
+    state: State<'_, tokio::sync::Mutex<Database>>,
+) -> Result<bool, String> {
+    let db = state.lock().await;
+    let enabled = db
+        .get_app_setting(telemetry::TELEMETRY_SETTING_KEY)
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|v| v != "false")
+        .unwrap_or(true);
+    Ok(enabled)
+}
+
+#[command]
+async fn set_telemetry_enabled(
+    enabled: bool,
+    state: State<'_, tokio::sync::Mutex<Database>>,
+) -> Result<(), String> {
+    let db = state.lock().await;
+    db.set_app_setting(
+        telemetry::TELEMETRY_SETTING_KEY,
+        if enabled { "true" } else { "false" },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    telemetry::set_enabled(enabled);
+    Ok(())
+}
+
+#[command]
+async fn get_onboarding_completed(
+    state: State<'_, tokio::sync::Mutex<Database>>,
+) -> Result<bool, String> {
+    let db = state.lock().await;
+    let completed = db
+        .get_app_setting(telemetry::ONBOARDING_COMPLETED_KEY)
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    Ok(completed)
+}
+
+#[command]
+async fn set_onboarding_completed(
+    completed: bool,
+    state: State<'_, tokio::sync::Mutex<Database>>,
+) -> Result<(), String> {
+    let db = state.lock().await;
+    db.set_app_setting(
+        telemetry::ONBOARDING_COMPLETED_KEY,
+        if completed { "true" } else { "false" },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Closing the main window quits the app, so the Settings window does not stay open on its own.
 fn quits_app(label: &str, event: &tauri::WindowEvent) -> bool {
     label == "main" && matches!(event, tauri::WindowEvent::Destroyed)
@@ -978,6 +1056,11 @@ pub fn run() {
             trash::empty_trash,
             trash::get_trash_settings,
             trash::set_trash_settings,
+            // Telemetry & Onboarding
+            get_telemetry_enabled,
+            set_telemetry_enabled,
+            get_onboarding_completed,
+            set_onboarding_completed,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

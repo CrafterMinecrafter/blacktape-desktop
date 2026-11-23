@@ -1,0 +1,311 @@
+.container {
+    display: flex;
+    flex-direction: column;
+    width: 560px;
+    max-width: 92vw;
+    color: var(--color-text);
+    padding: 8px 4px;
+}
+
+.header {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 24px;
+}
+
+.stepBadge {
+    display: inline-flex;
+    align-items: center;
+    align-self: flex-start;
+    padding: 3px 10px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    border-radius: 999px;
+    background: rgba(99, 102, 241, 0.15);
+    color: var(--color-primaryLight, #818cf8);
+    border: 1px solid rgba(99, 102, 241, 0.25);
+}
+
+.title {
+    font-size: 22px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    color: var(--color-text);
+    margin: 0;
+    line-height: 1.25;
+}
+
+.subtitle {
+    font-size: 14px;
+    color: var(--color-muted, #9ca3af);
+    margin: 0;
+    line-height: 1.5;
+}
+
+.body {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+.stepPrompt {
+    font-size: 14px;
+    color: var(--color-text);
+    line-height: 1.5;
+    margin-bottom: 4px;
+}
+
+.folderBox {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 14px 16px;
+    background-color: var(--color-surface, rgba(255, 255, 255, 0.04));
+    border: 1px solid var(--color-border, rgba(255, 255, 255, 0.12));
+    border-radius: 10px;
+    transition: border-color 150ms ease, background-color 150ms ease;
+
+    &:hover {
+        background-color: rgba(255, 255, 255, 0.06);
+    }
+}
+
+.folderInfo {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+    flex: 1;
+}
+
+.folderIcon {
+    font-size: 22px;
+    color: var(--color-primaryLight, #818cf8);
+    flex-shrink: 0;
+}
+
+.folderDetails {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.folderLabel {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-muted, #888);
+    font-weight: 600;
+}
+
+.folderPath {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--color-text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.folderPathMuted {
+    color: var(--color-muted, #777);
+    font-style: italic;
+    font-weight: 400;
+}
+
+.chooseButton {
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 500;
+    border-radius: 6px;
+    background-color: rgba(255, 255, 255, 0.08);
+    border: 1px solid var(--color-border, rgba(255, 255, 255, 0.15));
+    color: var(--color-text);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background-color 120ms ease, border-color 120ms ease;
+
+    &:hover {
+        background-color: rgba(255, 255, 255, 0.14);
+        border-color: rgba(255, 255, 255, 0.25);
+    }
+}
+
+.hintText {
+    font-size: 12px;
+    color: var(--color-muted, #888);
+    line-height: 1.4;
+    margin: 4px 0 0 0;
+}
+
+/* Step 2 Privacy Cards */
+.privacyCard {
+    background-color: var(--color-surface, rgba(255, 255, 255, 0.03));
+    border: 1px solid var(--color-border, rgba(255, 255, 255, 0.1));
+    border-radius: 10px;
+    padding: 18px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.privacyHeading {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--color-text);
+}
+
+.privacyHeadingIcon {
+    color: #10b981;
+    font-size: 16px;
+}
+
+.bulletList {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.bulletItem {
+    font-size: 13px;
+    color: var(--color-muted, #bbb);
+    line-height: 1.4;
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+}
+
+.bulletCheck {
+    color: #10b981;
+    font-weight: bold;
+    font-size: 13px;
+    flex-shrink: 0;
+    margin-top: 1px;
+}
+
+.toggleCard {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 14px 18px;
+    background-color: var(--color-surface, rgba(255, 255, 255, 0.04));
+    border: 1px solid var(--color-border, rgba(255, 255, 255, 0.12));
+    border-radius: 10px;
+    cursor: pointer;
+    user-select: none;
+    transition: background-color 150ms ease;
+
+    &:hover {
+        background-color: rgba(255, 255, 255, 0.07);
+    }
+}
+
+.toggleTextGroup {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.toggleTitle {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--color-text);
+}
+
+.toggleDescription {
+    font-size: 12px;
+    color: var(--color-muted, #888);
+}
+
+/* Footer & Navigation */
+.footer {
+    margin-top: 32px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding-top: 18px;
+    border-top: 1px solid var(--color-border, rgba(255, 255, 255, 0.08));
+}
+
+.footerLeft {
+    display: flex;
+    align-items: center;
+}
+
+.footerRight {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.primaryButton {
+    padding: 10px 24px;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    border-radius: 8px;
+    background-color: var(--color-primary, #6366f1);
+    color: #ffffff;
+    border: none;
+    cursor: pointer;
+    transition: filter 120ms ease, transform 100ms ease;
+
+    &:hover:not(:disabled) {
+        filter: brightness(1.1);
+    }
+
+    &:active:not(:disabled) {
+        transform: scale(0.98);
+    }
+
+    &:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+    }
+}
+
+.secondaryButton {
+    padding: 9px 18px;
+    font-size: 13px;
+    font-weight: 500;
+    border-radius: 8px;
+    background-color: transparent;
+    border: 1px solid var(--color-border, rgba(255, 255, 255, 0.15));
+    color: var(--color-text);
+    cursor: pointer;
+    transition: background-color 120ms ease, border-color 120ms ease;
+
+    &:hover {
+        background-color: var(--color-surface, rgba(255, 255, 255, 0.08));
+        border-color: rgba(255, 255, 255, 0.25);
+    }
+}
+
+.skipButton {
+    background: transparent;
+    border: none;
+    color: var(--color-muted, #888);
+    font-size: 13px;
+    cursor: pointer;
+    padding: 6px 10px;
+    border-radius: 6px;
+    transition: color 120ms ease, background-color 120ms ease;
+
+    &:hover {
+        color: var(--color-text);
+        background-color: rgba(255, 255, 255, 0.05);
+    }
+}
