@@ -235,6 +235,7 @@ const AlbumPreview = () => {
                 >
                   {selectedCount >= selectable.length && selectable.length > 0 ? "Clear selection" : "Select all"}
                 </button>
+                <StreamActionRow items={streamItems} playLabel="Play album" />
                 <button
                   type="button"
                   className={styles.secondaryButton}
@@ -243,7 +244,6 @@ const AlbumPreview = () => {
                 >
                   Edit Tags
                 </button>
-                <StreamActionRow items={streamItems} playLabel="Play album" />
                 {selectedCount > 0 && <span className={styles.count}>{selectedCount} selected</span>}
               </div>
 

@@ -142,16 +142,27 @@ pub async fn process_album_url(
         let mut track_downloads = Vec::new();
         for disc in &canonical.discs {
             for t in &disc.tracks {
-                let candidates = crate::resolver::resolve_candidates_for_track(
-                    t.artists.first().map(|s| s.as_str()).unwrap_or(&canonical.album_artist),
-                    &t.title,
-                    t.duration_ms,
-                ).await;
+                let candidates = if !t.candidates.is_empty() {
+                    t.candidates.clone()
+                } else {
+                    crate::resolver::resolve_candidates_for_track(
+                        t.artists.first().map(|s| s.as_str()).unwrap_or(&canonical.album_artist),
+                        &t.title,
+                        t.duration_ms,
+                    ).await
+                };
 
                 let primary_url = candidates
                     .first()
                     .map(|c| c.source.primary_url().to_string())
                     .unwrap_or_default();
+
+                let fallback_urls: Vec<String> = candidates
+                    .iter()
+                    .skip(1)
+                    .map(|c| c.source.primary_url().to_string())
+                    .filter(|u| !u.is_empty() && u != &primary_url)
+                    .collect();
 
                 track_downloads.push(crate::download::TrackDownload {
                     url: primary_url,
@@ -166,6 +177,7 @@ pub async fn process_album_url(
                     release_year: canonical.release_year.map(|y| y as i32),
                     source_item_id: None,
                     duration_ms: Some(t.duration_ms),
+                    fallback_urls,
                 });
             }
         }

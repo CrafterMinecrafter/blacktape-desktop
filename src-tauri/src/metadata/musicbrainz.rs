@@ -69,7 +69,7 @@ impl MusicBrainzClient {
         tokio::fs::read_to_string(path).await.ok()
     }
 
-    async fn write_cache(&self, key: &str, content: &str) {
+    pub async fn write_cache(&self, key: &str, content: &str) {
         if let Some(path) = self.cache_path(key) {
             if let Some(parent) = path.parent() {
                 let _ = tokio::fs::create_dir_all(parent).await;
@@ -133,6 +133,10 @@ impl MusicBrainzClient {
                 tracing::debug!("Cache hit for MusicBrainz canonical release");
                 return Ok(parsed);
             }
+        }
+
+        if mbid.starts_with("synth:") {
+            return Err(format!("Synthesized release '{mbid}' not found in cache"));
         }
 
         self.enforce_rate_limit().await;

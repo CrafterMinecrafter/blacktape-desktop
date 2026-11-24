@@ -266,6 +266,13 @@
     text-transform: uppercase;
 }
 
+.canonicalBadge {
+    background: linear-gradient(135deg, rgba(147, 51, 234, 0.25), rgba(59, 130, 246, 0.25));
+    color: #c084fc;
+    border: 1px solid rgba(192, 132, 252, 0.4);
+    font-weight: 700;
+}
+
 .browseButton {
     display: flex;
     align-items: center;

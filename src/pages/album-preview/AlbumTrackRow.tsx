@@ -1,7 +1,8 @@
-import type { MouseEvent } from "react";
+import { useState, useRef, useEffect, type MouseEvent } from "react";
 import clsx from "clsx";
 import { DownloadSplitButton } from "@/shared/ui/download-split-button/DownloadSplitButton.tsx";
-import { MdPause, MdPlayArrow } from "react-icons/md";
+import { MdKeyboardArrowDown, MdPause, MdPlayArrow } from "react-icons/md";
+import { FiCheck } from "react-icons/fi";
 import rowStyles from "@/features/library/ui/song-list-item/song-list-item.module.css";
 import { isStreamingUrl, useStreamStore } from "@/features/preview/model/streamStore.ts";
 import { DownloadStatusBadge } from "@/shared/ui/download-status-badge/DownloadStatusBadge.tsx";
@@ -11,11 +12,127 @@ import {
   type AlbumTrackInfo,
   type TrackTaskState,
 } from "@/shared/lib/remote/albumPreview.ts";
+import type { AudioCandidate } from "@/shared/types/canonical.ts";
 import type { DownloadState } from "@/shared/lib/library/libraryIndex.ts";
 import { formatTrackDuration } from "@/shared/lib/library/trackDuration.ts";
 import { decodeHtmlEntities } from "@/shared/lib/ui/html.ts";
 import { useAudioStore } from "@/shared/store/audioStore.ts";
 import styles from "./album-preview.module.css";
+
+const tierClass = (tier: string) => {
+  switch (tier) {
+    case "lossless":
+      return styles.lossless;
+    case "high_lossy":
+      return styles.high;
+    case "standard_lossy":
+      return styles.standard;
+    case "low":
+    default:
+      return styles.low;
+  }
+};
+
+const candidateShortBadge = (cand: AudioCandidate) => {
+  const codec = cand.codec.toUpperCase();
+  switch (cand.quality_tier) {
+    case "lossless":
+      return `${codec} · Lossless`;
+    case "high_lossy":
+      return `${codec} · High`;
+    case "standard_lossy":
+      return `${codec} · Standard`;
+    case "low":
+    default:
+      return `${codec} · Low`;
+  }
+};
+
+const CandidateSelector = ({
+  candidates,
+  selectedIdx,
+  onSelect,
+}: {
+  candidates: AudioCandidate[];
+  selectedIdx: number;
+  onSelect?: (idx: number) => void;
+}) => {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const selected = candidates[selectedIdx] ?? candidates[0];
+
+  useEffect(() => {
+    if (!open) return;
+    const handleClickOutside = (e: globalThis.MouseEvent | PointerEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", handleClickOutside);
+    return () => document.removeEventListener("pointerdown", handleClickOutside);
+  }, [open]);
+
+  if (!selected) return null;
+
+  return (
+    <div
+      ref={ref}
+      className={styles.candidateSelector}
+      onClick={(e) => e.stopPropagation()}
+      onDoubleClick={(e) => e.stopPropagation()}
+    >
+      <button
+        type="button"
+        className={clsx(styles.candidateBadgeButton, tierClass(selected.quality_tier))}
+        onClick={() => setOpen((v) => !v)}
+        title={`Audio source: ${selected.display_label} (${candidates.length} candidate${candidates.length > 1 ? "s" : ""})`}
+      >
+        <span>{candidateShortBadge(selected)}</span>
+        {candidates.length > 1 && (
+          <MdKeyboardArrowDown className={clsx(styles.arrowIcon, open && styles.arrowOpen)} />
+        )}
+      </button>
+
+      {open && candidates.length > 1 && (
+        <div className={styles.candidateMenu} role="menu">
+          <div className={styles.candidateMenuHeader}>
+            Available Audio Sources ({candidates.length})
+          </div>
+          {candidates.map((cand, idx) => {
+            const isSelected = idx === selectedIdx;
+            return (
+              <button
+                key={idx}
+                type="button"
+                role="menuitem"
+                className={clsx(
+                  styles.candidateMenuItem,
+                  isSelected && styles.candidateMenuItemActive,
+                )}
+                onClick={() => {
+                  onSelect?.(idx);
+                  setOpen(false);
+                }}
+              >
+                <span className={clsx(styles.candidateItemBadge, tierClass(cand.quality_tier))}>
+                  {cand.codec.toUpperCase()}
+                </span>
+                <div className={styles.candidateDetails}>
+                  <span className={styles.candidateTitle}>{cand.display_label}</span>
+                  <span className={styles.candidateMeta}>
+                    {cand.is_strict_match ? "Strict duration match" : "Similar title"}
+                    {cand.bitrate_kbps ? ` · ${cand.bitrate_kbps} kbps` : ""}
+                  </span>
+                </div>
+                {isSelected && <FiCheck className={styles.candidateCheck} />}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+};
 
 export interface AlbumTrackRowProps {
   track: AlbumTrackInfo;
@@ -122,27 +239,11 @@ export const AlbumTrackRow = ({
           <div className={clsx(styles.note, "truncate")}>{track.note}</div>
         )}
         {track.candidates && track.candidates.length > 0 && (
-          <div
-            className={styles.candidateSelector}
-            onClick={(e) => e.stopPropagation()}
-            onDoubleClick={(e) => e.stopPropagation()}
-          >
-            <select
-              className={styles.candidateSelect}
-              value={track.selected_candidate_idx ?? 0}
-              onChange={(e) => {
-                const idx = Number(e.target.value);
-                onSelectCandidate?.(idx);
-              }}
-              title="Select audio source candidate"
-            >
-              {track.candidates.map((cand, cIdx) => (
-                <option key={cIdx} value={cIdx}>
-                  {cand.display_label} {cand.is_strict_match ? "✓" : "~"}
-                </option>
-              ))}
-            </select>
-          </div>
+          <CandidateSelector
+            candidates={track.candidates}
+            selectedIdx={track.selected_candidate_idx ?? 0}
+            onSelect={onSelectCandidate}
+          />
         )}
         <span className={styles.duration}>{formatTrackDuration(track.duration_ms)}</span>
         <div className={styles.rowAction}>

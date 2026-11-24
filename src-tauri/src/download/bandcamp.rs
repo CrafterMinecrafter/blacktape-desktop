@@ -109,6 +109,7 @@ pub async fn parse_track(track_url: &str) -> Result<(TrackDownload, Option<Strin
         file_name: format!("{}.mp3", sanitized_name),
         source_item_id,
         duration_ms,
+        fallback_urls: Vec::new(),
     };
 
     Ok((track, meta.external_cover_url))
@@ -367,6 +368,7 @@ fn parse_tracks_from_html(html: &str, base_url: &str) -> Result<Vec<TrackDownloa
             release_year: None,
             source_item_id,
             duration_ms: duration_map.get(relative_path).copied(),
+            fallback_urls: Vec::new(),
         });
 
         track_count += 1;

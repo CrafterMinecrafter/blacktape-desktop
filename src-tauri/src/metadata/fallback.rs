@@ -42,6 +42,57 @@ pub fn synthesize_canonical_from_preview(preview: AlbumPreview) -> CanonicalRele
 
         let duration_ms = track.duration_ms.unwrap_or(0);
 
+        let mut initial_candidates = Vec::new();
+        if track.available && !track.url.is_empty() {
+            let (codec, bitrate, sample_rate, display_label, tier) = match preview.platform {
+                crate::types::Platform::Bandcamp => (
+                    "MP3".to_string(),
+                    Some(128),
+                    Some(44100),
+                    "Bandcamp · MP3 128 kbps".to_string(),
+                    crate::metadata::types::AudioQualityTier::StandardLossy,
+                ),
+                crate::types::Platform::Youtube => (
+                    "Opus".to_string(),
+                    Some(160),
+                    Some(48000),
+                    "YouTube · Opus 160 kbps".to_string(),
+                    crate::metadata::types::AudioQualityTier::HighLossy,
+                ),
+                crate::types::Platform::Soundcloud => (
+                    "MP3".to_string(),
+                    Some(128),
+                    Some(44100),
+                    "SoundCloud · MP3 128 kbps".to_string(),
+                    crate::metadata::types::AudioQualityTier::StandardLossy,
+                ),
+                crate::types::Platform::Local => (
+                    "Local".to_string(),
+                    None,
+                    None,
+                    "Local File".to_string(),
+                    crate::metadata::types::AudioQualityTier::StandardLossy,
+                ),
+            };
+            initial_candidates.push(crate::metadata::types::AudioCandidate {
+                source: crate::metadata::types::AudioSource::HttpStream {
+                    platform: preview.platform.to_string().to_lowercase(),
+                    url: track.url.clone(),
+                    format_id: None,
+                    direct_stream_url: None,
+                    expires_at: None,
+                },
+                quality_tier: tier,
+                codec,
+                bitrate_kbps: bitrate,
+                sample_rate_hz: sample_rate,
+                duration_ms,
+                match_confidence: 1.0,
+                is_strict_match: true,
+                display_label,
+            });
+        }
+
         discs_map.entry(disc_num).or_default().push(CanonicalTrack {
             track_number: track_num,
             disc_number: disc_num,
@@ -49,7 +100,7 @@ pub fn synthesize_canonical_from_preview(preview: AlbumPreview) -> CanonicalRele
             artists,
             duration_ms,
             isrc: None,
-            candidates: Vec::new(),
+            candidates: initial_candidates,
             selected_candidate_idx: 0,
         });
     }

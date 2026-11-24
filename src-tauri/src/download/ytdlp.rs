@@ -853,7 +853,34 @@ pub async fn download_batch_streaming(
             let jitter = (index % 4) * 150 + 50;
             sleep(Duration::from_millis(jitter as u64)).await;
 
-            let downloaded_file = download_track_internal(&ctx, &track, track_num, total_tracks).await;
+            let mut downloaded_file = download_track_internal(&ctx, &track, track_num, total_tracks).await;
+
+            if downloaded_file.is_none() && !track.fallback_urls.is_empty() {
+                for fallback_url in &track.fallback_urls {
+                    tracing::warn!(
+                        session = %ctx.session_id,
+                        track = track_num,
+                        title = %track.title,
+                        primary = %track.url,
+                        fallback = %fallback_url,
+                        "Primary track download failed; attempting fallback candidate"
+                    );
+                    let mut fallback_track = track.clone();
+                    fallback_track.url = fallback_url.clone();
+                    let res = download_track_internal(&ctx, &fallback_track, track_num, total_tracks).await;
+                    if res.is_some() {
+                        tracing::info!(
+                            session = %ctx.session_id,
+                            track = track_num,
+                            title = %track.title,
+                            fallback = %fallback_url,
+                            "Fallback candidate download succeeded!"
+                        );
+                        downloaded_file = res;
+                        break;
+                    }
+                }
+            }
 
             if let Some(ref path) = downloaded_file {
                 let current = completed.fetch_add(1, Ordering::SeqCst) + 1;

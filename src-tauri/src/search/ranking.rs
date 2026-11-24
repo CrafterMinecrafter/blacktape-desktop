@@ -324,6 +324,10 @@ pub fn score(
     let position = POSITION_WEIGHT / (native_index as f32 + 1.0).sqrt();
     s += position + bias;
 
+    if item.item_url_path.starts_with("canonical:") {
+        s += 20.0;
+    }
+
     if item.platform == Platform::Bandcamp {
         s += BANDCAMP_BIAS;
     }

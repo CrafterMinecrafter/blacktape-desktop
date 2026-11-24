@@ -45,7 +45,41 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
   const album = isAlbumDownload(params);
   const platform = String(params.platform).toLowerCase();
 
+  const isCanonical = params.url.startsWith("canonical:");
+
   useEffect(() => {
+    if (isCanonical) {
+      const canonicalFormats: AudioFormat[] = [
+        {
+          id: "best",
+          label: "Automatic Best Quality (Lossless / Opus 160k)",
+          codec: "Opus / FLAC",
+          bitrate_kbps: 160,
+          sample_rate_hz: 48000,
+          lossless: true,
+        },
+        {
+          id: "high",
+          label: "High Quality (Opus 160k / AAC 256k)",
+          codec: "Opus",
+          bitrate_kbps: 160,
+          sample_rate_hz: 48000,
+          lossless: false,
+        },
+        {
+          id: "standard",
+          label: "Standard Quality (MP3 128k)",
+          codec: "MP3",
+          bitrate_kbps: 128,
+          sample_rate_hz: 44100,
+          lossless: false,
+        },
+      ];
+      setFormats(canonicalFormats);
+      setPicked("best");
+      return;
+    }
+
     let cancelled = false;
     probeAudioFormats(params.platform, params.url, album, params.trackUrls?.[0])
       .then((found) => {
@@ -61,7 +95,7 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
     return () => {
       cancelled = true;
     };
-  }, [params.platform, params.url, params.trackUrls, album]);
+  }, [params.platform, params.url, params.trackUrls, album, isCanonical]);
 
   const download = () => {
     const format = picked ?? undefined;
@@ -72,14 +106,15 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
   };
 
   const onlyLossy = formats !== null && formats.length > 0 && !formats.some((f) => f.lossless);
-  const showBandcampHint = platform === "bandcamp" && (onlyLossy || error !== null);
+  const showBandcampHint = !isCanonical && platform === "bandcamp" && (onlyLossy || error !== null);
 
   return (
     <div className={styles.container}>
       <h2 className={styles.title}>Download quality</h2>
       <span className={styles.subtitle}>
         {params.title || "Download"}
-        {params.artistName ? ` · ${params.artistName}` : ""} · {platformLabel(params.platform)}
+        {params.artistName ? ` · ${params.artistName}` : ""} ·{" "}
+        {isCanonical ? "Multi-Source Engine" : platformLabel(params.platform)}
       </span>
 
       {formats === null ? (

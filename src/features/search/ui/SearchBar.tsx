@@ -144,9 +144,10 @@ export const SearchBar = ({ className, ...rootProps }: SearchBarProps) => {
       const matchesCategory =
         activeCategory === "All" ||
         item.item_type.toLowerCase() === activeCategory.toLowerCase();
-      return (
-        matchesCategory && matchesPlatformFilter(item.platform, activePlatform)
-      );
+      const matchesPlatform =
+        item.item_url_path?.startsWith("canonical:") ||
+        matchesPlatformFilter(item.platform, activePlatform);
+      return matchesCategory && matchesPlatform;
     });
   }, [searchResults, activeCategory, activePlatform]);
 
@@ -343,10 +344,16 @@ export const SearchBar = ({ className, ...rootProps }: SearchBarProps) => {
                         <span className={styles.type}>
                           {formatSuggestionType(suggestion.item_type)}
                         </span>
-                        {suggestion.platform && (
-                          <span className={styles.badge}>
-                            {suggestion.platform}
+                        {suggestion.item_url_path?.startsWith("canonical:") ? (
+                          <span className={clsx(styles.badge, styles.canonicalBadge)}>
+                            MULTI-SOURCE
                           </span>
+                        ) : (
+                          suggestion.platform && (
+                            <span className={styles.badge}>
+                              {suggestion.platform}
+                            </span>
+                          )
                         )}
                       </div>
                     </div>

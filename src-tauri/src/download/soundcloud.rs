@@ -124,6 +124,7 @@ pub fn track_to_download(
         url,
         source_item_id: Some(track.id.to_string()),
         duration_ms: track_duration_ms(track),
+        fallback_urls: Vec::new(),
     })
 }
 

@@ -153,7 +153,11 @@ async fn get_artist_albums(
 }
 
 #[command]
-async fn get_search_suggestions(query: String, platforms: Vec<Platform>) -> Vec<SearchSuggestion> {
+async fn get_search_suggestions(
+    app: AppHandle,
+    query: String,
+    platforms: Vec<Platform>,
+) -> Vec<SearchSuggestion> {
     let mut tasks: JoinSet<Result<Vec<SearchSuggestion>, Box<dyn Error + Send + Sync>>> =
         JoinSet::new();
 
@@ -170,9 +174,10 @@ async fn get_search_suggestions(query: String, platforms: Vec<Platform>) -> Vec<
     }
 
     let q_mb = query.clone();
+    let cache_dir = app.path().app_cache_dir().ok();
     tasks.spawn(async move {
-        let client = crate::metadata::MusicBrainzClient::new(None);
-        match tokio::time::timeout(std::time::Duration::from_millis(1500), client.search_releases(&q_mb)).await {
+        let client = crate::metadata::MusicBrainzClient::new(cache_dir);
+        match tokio::time::timeout(std::time::Duration::from_millis(2000), client.search_releases(&q_mb)).await {
             Ok(Ok(releases)) => {
                 let suggestions = releases
                     .into_iter()
@@ -710,45 +715,91 @@ async fn get_album_preview(
     platform: Platform,
     url: String,
 ) -> Result<crate::download::album_preview::AlbumPreview, String> {
-    if url.starts_with("canonical:") {
+    let cache_dir = app.path().app_cache_dir().ok();
+    let client = crate::metadata::MusicBrainzClient::new(cache_dir);
+
+    let mut canonical = if url.starts_with("canonical:") {
         let mbid = url.trim_start_matches("canonical:");
-        let cache_dir = app.path().app_cache_dir().ok();
-        let client = crate::metadata::MusicBrainzClient::new(cache_dir);
-        let mut canonical = client.fetch_canonical_release(mbid).await?;
+        client.fetch_canonical_release(mbid).await?
+    } else {
+        let raw = crate::download::album_preview::album_preview(platform, &url).await?;
+        crate::metadata::fallback::synthesize_canonical_from_preview(raw)
+    };
 
-        let mut prewarm_items = Vec::new();
-        for disc in &mut canonical.discs {
-            for track in &mut disc.tracks {
-                let candidates = crate::resolver::resolve_candidates_for_track(
-                    track.artists.first().map(|s| s.as_str()).unwrap_or(&canonical.album_artist),
-                    &track.title,
-                    track.duration_ms,
-                ).await;
-                if let Some(first) = candidates.first() {
-                    let plat = match first.source.platform_name() {
-                        "youtube" => Platform::Youtube,
-                        "bandcamp" => Platform::Bandcamp,
-                        "soundcloud" => Platform::Soundcloud,
-                        _ => Platform::Youtube,
-                    };
-                    prewarm_items.push((plat, first.source.primary_url().to_string()));
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(6));
+    let mut tasks = tokio::task::JoinSet::new();
+
+    for (d_idx, disc) in canonical.discs.iter().enumerate() {
+        for (t_idx, track) in disc.tracks.iter().enumerate() {
+            let sem_clone = sem.clone();
+            let artist = track
+                .artists
+                .first()
+                .cloned()
+                .unwrap_or_else(|| canonical.album_artist.clone());
+            let title = track.title.clone();
+            let duration_ms = track.duration_ms;
+            let existing_candidates = track.candidates.clone();
+
+            tasks.spawn(async move {
+                let _permit = sem_clone.acquire().await.ok();
+                let mut candidates = existing_candidates;
+                let resolved = crate::resolver::resolve_candidates_for_track(&artist, &title, duration_ms).await;
+
+                for r in resolved {
+                    let r_url = r.source.primary_url();
+                    if !candidates.iter().any(|c| c.source.primary_url() == r_url) {
+                        candidates.push(r);
+                    }
                 }
-                track.candidates = candidates;
-                track.selected_candidate_idx = 0;
-            }
-        }
-
-        // Spawn background pre-warming for the first 3 tracks
-        for (plat, u) in prewarm_items.into_iter().take(3) {
-            let app_clone = app.clone();
-            tokio::spawn(async move {
-                let _ = crate::preview::resolve::resolve(&app_clone, plat, &u).await;
+                crate::resolver::arbiter::rank_candidates(&mut candidates);
+                (d_idx, t_idx, candidates)
             });
         }
-
-        return Ok(crate::download::album_preview::canonical_release_to_preview(canonical));
     }
-    crate::download::album_preview::album_preview(platform, &url).await
+
+    while let Some(res) = tasks.join_next().await {
+        if let Ok((d_idx, t_idx, candidates)) = res {
+            if let Some(disc) = canonical.discs.get_mut(d_idx) {
+                if let Some(track) = disc.tracks.get_mut(t_idx) {
+                    track.candidates = candidates;
+                    track.selected_candidate_idx = 0;
+                }
+            }
+        }
+    }
+
+    if let Ok(serialized) = serde_json::to_string(&canonical) {
+        client.write_cache(&format!("release:{}", canonical.id), &serialized).await;
+    }
+
+    // Spawn background pre-warming for the first 3 tracks
+    let mut prewarm_count = 0;
+    for disc in &canonical.discs {
+        for track in &disc.tracks {
+            if prewarm_count >= 3 {
+                break;
+            }
+            if let Some(first) = track.candidates.first() {
+                let plat = match first.source.platform_name() {
+                    "youtube" => Platform::Youtube,
+                    "bandcamp" => Platform::Bandcamp,
+                    "soundcloud" => Platform::Soundcloud,
+                    _ => Platform::Youtube,
+                };
+                let u = first.source.primary_url().to_string();
+                if !u.is_empty() {
+                    let app_clone = app.clone();
+                    tokio::spawn(async move {
+                        let _ = crate::preview::resolve::resolve(&app_clone, plat, &u).await;
+                    });
+                    prewarm_count += 1;
+                }
+            }
+        }
+    }
+
+    Ok(crate::download::album_preview::canonical_release_to_preview(canonical))
 }
 
 #[command]

@@ -103,6 +103,7 @@ pub async fn parse_album(browse_url: &str) -> Result<AlbumDownload, String> {
                 file_name: format!("{}.mp3", sanitized_name),
                 source_item_id: Some(track.id.clone()),
                 duration_ms: secs_to_ms(track.duration),
+                fallback_urls: Vec::new(),
             }
         })
         .collect();
@@ -172,6 +173,7 @@ pub async fn parse_track(url: &str) -> Result<(TrackDownload, Option<String>), S
             file_name: format!("{}.mp3", sanitized_name),
             source_item_id: Some(video_id),
             duration_ms,
+            fallback_urls: Vec::new(),
         };
 
         return Ok((track, external_cover_url));
@@ -204,6 +206,7 @@ pub async fn parse_track(url: &str) -> Result<(TrackDownload, Option<String>), S
         file_name: format!("{}.mp3", sanitized_name),
         source_item_id: Some(video_id),
         duration_ms: None,
+        fallback_urls: Vec::new(),
     };
 
     Ok((track, external_cover_url))

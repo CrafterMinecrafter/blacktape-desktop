@@ -55,6 +55,7 @@ pub struct TrackDownload {
     pub source_item_id: Option<String>,
     /// Length in milliseconds when the platform page/API provides it (parsers fill it; None otherwise).
     pub duration_ms: Option<u64>,
+    pub fallback_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +143,7 @@ mod placement_tests {
             release_year: None,
             source_item_id: None,
             duration_ms: None,
+            fallback_urls: Vec::new(),
         }
     }
 
