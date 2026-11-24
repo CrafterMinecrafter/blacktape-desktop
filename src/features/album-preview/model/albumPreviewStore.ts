@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { listen } from "@tauri-apps/api/event";
 import { createLatestGuard } from "@/shared/lib/search/searchGuard.ts";
 import {
   getAlbumPreview,
@@ -8,6 +9,7 @@ import {
   type AlbumPreview,
   type AlbumTrackInfo,
 } from "@/shared/lib/remote/albumPreview.ts";
+import type { AudioCandidate } from "@/shared/types/canonical.ts";
 import {
   EMPTY_SELECTION,
   nextSelection,
@@ -162,3 +164,31 @@ export const useAlbumPreviewStore = create<AlbumPreviewStore>((set, get) => ({
     await startAlbumDownload(preview, { trackUrls: [track.url], rows: [track.url], format });
   },
 }));
+
+export interface AlbumTrackCandidatesEvent {
+  album_url: string;
+  track_index: number;
+  candidates: AudioCandidate[];
+  selected_candidate_idx: number;
+}
+
+if (typeof window !== "undefined") {
+  listen<AlbumTrackCandidatesEvent>("album-track-candidates", (event) => {
+    const { preview } = useAlbumPreviewStore.getState();
+    if (!preview || preview.url !== event.payload.album_url) return;
+    const tracks = [...preview.tracks];
+    const t = tracks[event.payload.track_index];
+    if (!t) return;
+    const bestCandidate = event.payload.candidates[0];
+    tracks[event.payload.track_index] = {
+      ...t,
+      candidates: event.payload.candidates,
+      selected_candidate_idx: event.payload.selected_candidate_idx,
+      url:
+        bestCandidate && bestCandidate.source.kind === "http_stream"
+          ? bestCandidate.source.url
+          : t.url,
+    };
+    useAlbumPreviewStore.setState({ preview: { ...preview, tracks } });
+  }).catch(console.error);
+}

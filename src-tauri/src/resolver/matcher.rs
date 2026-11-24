@@ -1,4 +1,21 @@
+use std::sync::LazyLock;
 use strsim::jaro_winkler;
+
+static RE_REMASTER: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"[\(\[](?:(?:\d{4}\s+)?remaster(?:ed)?(?:\s+\d{4})?)[\)\]]").unwrap()
+});
+
+static RE_FEAT: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"[\(\[](?:feat|ft)\.?\s+[^\)\]]+[\)\]]").unwrap()
+});
+
+static RE_PUNCT: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"[^\w\s]").unwrap()
+});
+
+static RE_WS: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\s+").unwrap()
+});
 
 /// Cleans track titles by stripping common streaming / video suffixes and noise.
 pub fn clean_title(raw: &str) -> String {
@@ -39,20 +56,10 @@ pub fn clean_title(raw: &str) -> String {
         cleaned = cleaned.replace(pattern, " ");
     }
 
-    // Strip out generic "(remastered 20xx)" or "(20xx remaster)"
-    let re_remaster = regex::Regex::new(r"[\(\[](?:(?:\d{4}\s+)?remaster(?:ed)?(?:\s+\d{4})?)[\)\]]").unwrap();
-    cleaned = re_remaster.replace_all(&cleaned, " ").to_string();
-
-    // Strip featured artist suffixes like "(feat. ...)" or "[feat ...]"
-    let re_feat = regex::Regex::new(r"[\(\[](?:feat|ft)\.?\s+[^\)\]]+[\)\]]").unwrap();
-    cleaned = re_feat.replace_all(&cleaned, " ").to_string();
-
-    // Remove extra punctuation and collapse whitespace
-    let re_punct = regex::Regex::new(r"[^\w\s]").unwrap();
-    let no_punct = re_punct.replace_all(&cleaned, " ");
-
-    let re_ws = regex::Regex::new(r"\s+").unwrap();
-    re_ws.replace_all(&no_punct, " ").trim().to_string()
+    cleaned = RE_REMASTER.replace_all(&cleaned, " ").to_string();
+    cleaned = RE_FEAT.replace_all(&cleaned, " ").to_string();
+    let no_punct = RE_PUNCT.replace_all(&cleaned, " ");
+    RE_WS.replace_all(&no_punct, " ").trim().to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -122,6 +129,51 @@ pub fn evaluate_track_match(
     }
 }
 
+/// Matches a canonical track against a slice of tracks from a platform album.
+pub fn find_matching_track<'a>(
+    target_title: &str,
+    target_duration_ms: u64,
+    target_track_number: u32,
+    platform_tracks: &'a [crate::download::TrackDownload],
+) -> Option<&'a crate::download::TrackDownload> {
+    // 1. Try matching by exact track number + duration tolerance (delta <= 3.5s)
+    let by_number = platform_tracks.iter().find(|pt| {
+        pt.track_number == Some(target_track_number as i32)
+    });
+    if let Some(cand) = by_number {
+        let eval = evaluate_track_match(
+            target_title,
+            target_duration_ms,
+            &cand.title,
+            cand.duration_ms.unwrap_or(0),
+        );
+        if eval.is_strict_match || eval.confidence >= 0.70 {
+            return Some(cand);
+        }
+    }
+
+    // 2. Try best match by title + duration across all tracks
+    let mut best: Option<(&'a crate::download::TrackDownload, f32)> = None;
+    for cand in platform_tracks {
+        let eval = evaluate_track_match(
+            target_title,
+            target_duration_ms,
+            &cand.title,
+            cand.duration_ms.unwrap_or(0),
+        );
+        if eval.confidence >= 0.75 {
+            if let Some((_, best_score)) = best {
+                if eval.confidence > best_score {
+                    best = Some((cand, eval.confidence));
+                }
+            } else {
+                best = Some((cand, eval.confidence));
+            }
+        }
+    }
+    best.map(|(t, _)| t)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +234,165 @@ mod tests {
         );
         assert!(!eval.is_strict_match);
         assert!(eval.confidence < 0.70);
+    }
+
+    #[test]
+    fn benchmarks_one_hundred_songs_matching_popular_and_niche_albums() {
+        let popular_and_niche_tracks: Vec<(&str, u64, u32, &str, u64)> = vec![
+            // Drukqs (Aphex Twin) - 30 tracks
+            ("Jynweythek", 144000, 1, "Aphex Twin - Jynweythek (Audio)", 144500),
+            ("Vordhosbn", 291000, 2, "Vordhosbn", 291200),
+            ("Kladfvgbung Mischk", 127000, 3, "Kladfvgbung Mischk", 127100),
+            ("Omgyjya-Switch7", 292000, 4, "Omgyjya-Switch7 (Official Audio)", 293000),
+            ("Strotha Tynhe", 132000, 5, "Strotha Tynhe", 132000),
+            ("Gwely Mernans", 308000, 6, "Gwely Mernans", 308500),
+            ("Bbydhyonchord", 153000, 7, "Bbydhyonchord", 153200),
+            ("Cock/ver10", 318000, 8, "Cock/ver10", 318000),
+            ("Avril 14th", 126000, 9, "Avril 14th (Official)", 126500),
+            ("Mt Saint Michel + Saint Michaels Mount", 490000, 10, "Mt Saint Michel + Saint Michaels Mount", 491000),
+            ("Gwarek2", 407000, 11, "Gwarek2", 407000),
+            ("Orban Eq Trx 4", 95000, 12, "Orban Eq Trx 4", 95100),
+            ("Aussois", 13000, 13, "Aussois", 13000),
+            ("Hy A Scullyas Lyf Adhagrow", 135000, 14, "Hy A Scullyas Lyf Adhagrow", 135200),
+            ("Kesson Dalek", 81000, 15, "Kesson Dalek", 81000),
+            ("54 Cymru Beats", 367000, 16, "54 Cymru Beats", 367800),
+            ("Btoum-Roumada", 118000, 17, "Btoum-Roumada", 118000),
+            ("Lornaderek", 31000, 18, "Lornaderek", 31000),
+            ("QKThr", 87000, 19, "QKThr (Penty Harmonium)", 88000),
+            ("Meltphace 6", 384000, 20, "Meltphace 6", 384200),
+            ("Bit 4", 25000, 21, "Bit 4", 25000),
+            ("Prep Gwarek 36", 79000, 22, "Prep Gwarek 36", 79000),
+            ("Father", 61000, 23, "Father", 61000),
+            ("Taking Control", 434000, 24, "Taking Control", 434500),
+            ("Petiatil Cx Htdui", 170000, 25, "Petiatil Cx Htdui", 170000),
+            ("Ruglen Holon", 105000, 26, "Ruglen Holon", 105000),
+            ("Afx237 v.7", 263000, 27, "Afx237 v.7", 263400),
+            ("Ziggomatic 17", 508000, 28, "Ziggomatic 17", 508200),
+            ("Beskhu3ep6", 118000, 29, "Beskhu3ep6", 118000),
+            ("Nanou2", 205000, 30, "Nanou2", 205500),
+
+            // In Rainbows (Radiohead) - 10 tracks
+            ("15 Step", 237000, 1, "Radiohead - 15 Step", 238000),
+            ("Bodysnatchers", 242000, 2, "Radiohead - Bodysnatchers", 242500),
+            ("Nude", 255000, 3, "Radiohead - Nude", 255200),
+            ("Weird Fishes/Arpeggi", 318000, 4, "Radiohead - Weird Fishes/Arpeggi", 318000),
+            ("All I Need", 228000, 5, "Radiohead - All I Need", 228800),
+            ("Faust Arp", 129000, 6, "Radiohead - Faust Arp", 129000),
+            ("Reckoner", 290000, 7, "Radiohead - Reckoner", 290000),
+            ("House of Cards", 328000, 8, "Radiohead - House of Cards", 328000),
+            ("Jigsaw Falling Into Place", 249000, 9, "Radiohead - Jigsaw Falling Into Place", 249000),
+            ("Videotape", 279000, 10, "Radiohead - Videotape", 279500),
+
+            // Discovery (Daft Punk) - 14 tracks
+            ("One More Time", 320000, 1, "Daft Punk - One More Time (Official Audio)", 321000),
+            ("Aerodynamic", 207000, 2, "Daft Punk - Aerodynamic", 207500),
+            ("Digital Love", 298000, 3, "Daft Punk - Digital Love", 298200),
+            ("Harder, Better, Faster, Stronger", 224000, 4, "Harder Better Faster Stronger", 224500),
+            ("Crescendolls", 211000, 5, "Crescendolls", 211000),
+            ("Nightvision", 104000, 6, "Nightvision", 104000),
+            ("Superheroes", 237000, 7, "Superheroes", 237500),
+            ("High Life", 202000, 8, "High Life", 202000),
+            ("Something About Us", 231000, 9, "Something About Us", 231500),
+            ("Voyager", 227000, 10, "Voyager", 227500),
+            ("Veridis Quo", 344000, 11, "Veridis Quo", 344500),
+            ("Short Circuit", 206000, 12, "Short Circuit", 206000),
+            ("Face to Face", 240000, 13, "Face to Face", 240000),
+            ("Too Long", 600000, 14, "Too Long", 600500),
+
+            // The Dark Side of the Moon (Pink Floyd) - 10 tracks
+            ("Speak to Me", 65000, 1, "Pink Floyd - Speak to Me", 66000),
+            ("Breathe (In the Air)", 163000, 2, "Breathe In the Air", 163500),
+            ("On the Run", 216000, 3, "On the Run", 216000),
+            ("Time", 413000, 4, "Time (2023 Remaster)", 414000),
+            ("The Great Gig in the Sky", 284000, 5, "The Great Gig in the Sky", 284500),
+            ("Money", 382000, 6, "Money (Official Audio)", 383000),
+            ("Us and Them", 469000, 7, "Us and Them", 469000),
+            ("Any Colour You Like", 205000, 8, "Any Colour You Like", 205500),
+            ("Brain Damage", 228000, 9, "Brain Damage", 228500),
+            ("Eclipse", 123000, 10, "Eclipse", 123000),
+
+            // Selected Ambient Works 85-92 (Aphex Twin) - 13 tracks
+            ("Xtal", 294000, 1, "Aphex Twin - Xtal", 294500),
+            ("Tha", 546000, 2, "Tha", 546000),
+            ("Pulsewidth", 226000, 3, "Pulsewidth", 226500),
+            ("Ageispolis", 323000, 4, "Ageispolis", 323000),
+            ("i", 77000, 5, "i", 77000),
+            ("Green Calx", 365000, 6, "Green Calx", 365500),
+            ("Heliosphan", 291000, 7, "Heliosphan", 291000),
+            ("We Are the Music Makers", 463000, 8, "We Are the Music Makers", 463000),
+            ("Schottkey 7th Path", 266000, 9, "Schottkey 7th Path", 266000),
+            ("Ptolemy", 250000, 10, "Ptolemy", 250500),
+            ("Hedphelym", 360000, 11, "Hedphelym", 360000),
+            ("Delphium", 326000, 12, "Delphium", 326000),
+            ("Actium", 452000, 13, "Actium", 452500),
+
+            // Niche Underground Bandcamp EP - 5 tracks
+            ("Night Walk 1984", 215000, 1, "VaporNight - Night Walk 1984 (Cassette Rip)", 216000),
+            ("Neon Decay", 184000, 2, "Neon Decay", 184000),
+            ("Tape Loop 03", 95000, 3, "Tape Loop 03", 95200),
+            ("Broken VCR Head", 142000, 4, "Broken VCR Head", 142000),
+            ("Endless Highway", 305000, 5, "Endless Highway (Night Drive)", 306000),
+
+            // SoundCloud Underground Set & VIP Singles - 4 tracks
+            ("Unreleased VIP 140BPM", 210000, 1, "ProducerX - Unreleased VIP 140BPM [Dubplate]", 211000),
+            ("Acid Jam 303", 360000, 2, "Acid Jam 303 (Live Hardware)", 361000),
+            ("Sub Low Frequency Test", 120000, 3, "Sub Low Frequency Test 40Hz", 120000),
+            ("Ghost In The Shell Rework", 275000, 4, "Ghost In The Shell Rework (Free DL)", 276000),
+
+            // Hip Hop Classics & Collaborations - 10 tracks
+            ("Lose Yourself", 326000, 1, "Eminem - Lose Yourself (Explicit Audio)", 326500),
+            ("In Da Club", 193000, 2, "50 Cent - In Da Club", 193500),
+            ("Stan", 404000, 3, "Eminem feat. Dido - Stan", 404500),
+            ("The Real Slim Shady", 284000, 4, "The Real Slim Shady (Clean)", 284200),
+            ("Without Me", 290000, 5, "Without Me", 290500),
+            ("Sing For The Moment", 340000, 6, "Sing For The Moment", 340000),
+            ("Till I Collapse", 297000, 7, "Till I Collapse (feat. Nate Dogg)", 297500),
+            ("Cleanin' Out My Closet", 297000, 8, "Cleanin' Out My Closet", 297000),
+            ("Mockingbird", 250000, 9, "Mockingbird", 251000),
+            ("When I'm Gone", 281000, 10, "When I'm Gone", 281500),
+
+            // Nirvana - Nevermind - 4 tracks (to make exactly 100)
+            ("Smells Like Teen Spirit", 301000, 1, "Nirvana - Smells Like Teen Spirit (Official Audio)", 301500),
+            ("In Bloom", 255000, 2, "Nirvana - In Bloom", 255400),
+            ("Come As You Are", 219000, 3, "Nirvana - Come As You Are", 219500),
+            ("Lithium", 257000, 4, "Nirvana - Lithium", 257200),
+        ];
+
+        assert_eq!(popular_and_niche_tracks.len(), 100);
+
+        let mut matched_count = 0;
+        let start = std::time::Instant::now();
+
+        for (target_title, target_duration, track_num, cand_title, cand_duration) in &popular_and_niche_tracks {
+            let platform_track = crate::download::TrackDownload {
+                url: format!("https://music.test/track/{}", track_num),
+                file_name: format!("{}.mp3", cand_title),
+                title: cand_title.to_string(),
+                artists: vec!["Artist".to_string()],
+                album_artist: "Artist".to_string(),
+                album: "Album".to_string(),
+                track_number: Some(*track_num as i32),
+                disc_number: Some(1),
+                genres: None,
+                release_year: Some(2020),
+                source_item_id: None,
+                duration_ms: Some(*cand_duration),
+                fallback_urls: Vec::new(),
+            };
+
+            let candidate_slice = vec![platform_track];
+            let matched = find_matching_track(target_title, *target_duration, *track_num, &candidate_slice);
+
+            assert!(matched.is_some(), "Track '{}' failed to match candidate '{}'", target_title, cand_title);
+            let eval = evaluate_track_match(target_title, *target_duration, cand_title, *cand_duration);
+            assert!(eval.is_strict_match, "Track '{}' did not evaluate to strict match (confidence: {})", target_title, eval.confidence);
+
+            matched_count += 1;
+        }
+
+        let elapsed = start.elapsed();
+        println!("Matched {}/{} popular and niche songs in {:?}", matched_count, popular_and_niche_tracks.len(), elapsed);
+        assert_eq!(matched_count, 100);
+        assert!(elapsed.as_millis() < 50, "100 songs took too long: {:?}", elapsed);
     }
 }

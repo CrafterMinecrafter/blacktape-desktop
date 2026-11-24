@@ -23,6 +23,7 @@
 
 #![allow(dead_code)]
 
+use crate::search::bandcamp::ItemType;
 use crate::search::{bandcamp_full, ranking, soundcloud, youtube_full, SearchSuggestion};
 use crate::types::Platform;
 use serde::{Deserialize, Serialize};
@@ -348,7 +349,12 @@ pub(crate) fn assemble_platforms(
         soundcloud: next_offset,
     });
     let has_more = next_cursor.is_some();
-    let (items, copies) = ranking::rank_flat_with_copies(items, query);
+    let (mut items, copies) = ranking::rank_flat_with_copies(items, query);
+    for item in &mut items {
+        if item.item_type == ItemType::Album && !item.item_url_path.starts_with("canonical:") {
+            item.item_url_path = format!("canonical:{}", item.item_url_path);
+        }
+    }
     Ok(FullSearchPage {
         items,
         copies: copies.into_iter().map(|(of, item)| PlatformCopy { of, item }).collect(),

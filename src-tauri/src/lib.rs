@@ -216,7 +216,30 @@ async fn get_search_suggestions(
         }
     }
 
-    search::ranking::rank(raw_suggestions, &query)
+    // Cluster albums across platforms and upgrade all album items to canonical multi-source
+    let mut seen_albums = std::collections::HashSet::new();
+    let mut processed_suggestions = Vec::new();
+
+    for mut item in raw_suggestions {
+        if item.item_type == search::bandcamp::ItemType::Album {
+            let norm_artist = crate::resolver::matcher::clean_title(&item.band_name);
+            let norm_title = crate::resolver::matcher::clean_title(&item.name);
+            let key = (norm_artist, norm_title);
+
+            if !key.0.is_empty() && !key.1.is_empty() {
+                if !seen_albums.insert(key) {
+                    continue;
+                }
+            }
+
+            if !item.item_url_path.starts_with("canonical:") {
+                item.item_url_path = format!("canonical:{}", item.item_url_path);
+            }
+        }
+        processed_suggestions.push(item);
+    }
+
+    search::ranking::rank(processed_suggestions, &query)
 }
 
 #[command]
@@ -716,90 +739,68 @@ async fn get_album_preview(
     url: String,
 ) -> Result<crate::download::album_preview::AlbumPreview, String> {
     let cache_dir = app.path().app_cache_dir().ok();
-    let client = crate::metadata::MusicBrainzClient::new(cache_dir);
+    let client = crate::metadata::MusicBrainzClient::new(cache_dir.clone());
 
-    let mut canonical = if url.starts_with("canonical:") {
-        let mbid = url.trim_start_matches("canonical:");
-        client.fetch_canonical_release(mbid).await?
+    let raw_target = url.trim_start_matches("canonical:");
+
+    let mut canonical = if !raw_target.starts_with("http://")
+        && !raw_target.starts_with("https://")
+        && !raw_target.starts_with("synth:")
+    {
+        client.fetch_canonical_release(raw_target).await?
     } else {
-        let raw = crate::download::album_preview::album_preview(platform, &url).await?;
+        let detected_platform = if raw_target.contains("bandcamp.com") {
+            Platform::Bandcamp
+        } else if raw_target.contains("soundcloud.com") {
+            Platform::Soundcloud
+        } else if raw_target.contains("youtube.com") || raw_target.contains("youtu.be") {
+            Platform::Youtube
+        } else {
+            platform
+        };
+        let raw = crate::download::album_preview::album_preview(detected_platform, raw_target).await?;
         crate::metadata::fallback::synthesize_canonical_from_preview(raw)
     };
 
-    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(6));
-    let mut tasks = tokio::task::JoinSet::new();
-
-    for (d_idx, disc) in canonical.discs.iter().enumerate() {
-        for (t_idx, track) in disc.tracks.iter().enumerate() {
-            let sem_clone = sem.clone();
-            let artist = track
-                .artists
-                .first()
-                .cloned()
-                .unwrap_or_else(|| canonical.album_artist.clone());
-            let title = track.title.clone();
-            let duration_ms = track.duration_ms;
-            let existing_candidates = track.candidates.clone();
-
-            tasks.spawn(async move {
-                let _permit = sem_clone.acquire().await.ok();
-                let mut candidates = existing_candidates;
-                let resolved = crate::resolver::resolve_candidates_for_track(&artist, &title, duration_ms).await;
-
-                for r in resolved {
-                    let r_url = r.source.primary_url();
-                    if !candidates.iter().any(|c| c.source.primary_url() == r_url) {
-                        candidates.push(r);
-                    }
-                }
-                crate::resolver::arbiter::rank_candidates(&mut candidates);
-                (d_idx, t_idx, candidates)
-            });
-        }
-    }
-
-    while let Some(res) = tasks.join_next().await {
-        if let Ok((d_idx, t_idx, candidates)) = res {
-            if let Some(disc) = canonical.discs.get_mut(d_idx) {
-                if let Some(track) = disc.tracks.get_mut(t_idx) {
-                    track.candidates = candidates;
-                    track.selected_candidate_idx = 0;
-                }
+    // Check if we already have the fully resolved release in cache
+    let cache_key = format!("release:{}", canonical.id);
+    if let Some(cached_str) = client.read_cache(&cache_key).await {
+        if let Ok(cached_release) =
+            serde_json::from_str::<crate::metadata::types::CanonicalRelease>(&cached_str)
+        {
+            if cached_release
+                .discs
+                .iter()
+                .any(|d| d.tracks.iter().any(|t| !t.candidates.is_empty()))
+            {
+                return Ok(crate::download::album_preview::canonical_release_to_preview(
+                    cached_release,
+                ));
             }
         }
     }
 
-    if let Ok(serialized) = serde_json::to_string(&canonical) {
-        client.write_cache(&format!("release:{}", canonical.id), &serialized).await;
-    }
+    // Build immediate initial preview to display instantly to the UI (< 300ms)
+    let initial_preview =
+        crate::download::album_preview::canonical_release_to_preview(canonical.clone());
 
-    // Spawn background pre-warming for the first 3 tracks
-    let mut prewarm_count = 0;
-    for disc in &canonical.discs {
-        for track in &disc.tracks {
-            if prewarm_count >= 3 {
-                break;
-            }
-            if let Some(first) = track.candidates.first() {
-                let plat = match first.source.platform_name() {
-                    "youtube" => Platform::Youtube,
-                    "bandcamp" => Platform::Bandcamp,
-                    "soundcloud" => Platform::Soundcloud,
-                    _ => Platform::Youtube,
-                };
-                let u = first.source.primary_url().to_string();
-                if !u.is_empty() {
-                    let app_clone = app.clone();
-                    tokio::spawn(async move {
-                        let _ = crate::preview::resolve::resolve(&app_clone, plat, &u).await;
-                    });
-                    prewarm_count += 1;
-                }
-            }
+    // Spawn fast progressive multi-source resolution in background:
+    // Performs parallel album-level searches across platforms, matching tracks,
+    // and emits live "album-track-candidates" events to the frontend.
+    let app_handle = app.clone();
+    let album_url = initial_preview.url.clone();
+    tokio::spawn(async move {
+        crate::resolver::resolve_release_candidates(&mut canonical, Some(&app_handle), &album_url)
+            .await;
+        if let Ok(serialized) = serde_json::to_string(&canonical) {
+            let client = crate::metadata::MusicBrainzClient::new(cache_dir);
+            client
+                .write_cache(&format!("release:{}", canonical.id), &serialized)
+                .await;
         }
-    }
+    });
 
-    Ok(crate::download::album_preview::canonical_release_to_preview(canonical))
+    Ok(initial_preview)
 }
 
 #[command]

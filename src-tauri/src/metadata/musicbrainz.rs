@@ -51,7 +51,7 @@ impl MusicBrainzClient {
         Some(dir.join(format!("{hash:016x}.json")))
     }
 
-    async fn read_cache(&self, key: &str) -> Option<String> {
+    pub async fn read_cache(&self, key: &str) -> Option<String> {
         let path = self.cache_path(key)?;
         if !path.is_file() {
             return None;
@@ -96,7 +96,9 @@ impl MusicBrainzClient {
 
         self.enforce_rate_limit().await;
 
-        let encoded = urlencoding_simple(trimmed);
+        let clean = trimmed.replace('"', " ").trim().to_string();
+        let lucene_query = format!(r#"release:"{clean}" OR artist:"{clean}" OR "{clean}""#);
+        let encoded = urlencoding_simple(&lucene_query);
         let url = format!("https://musicbrainz.org/ws/2/release/?query={encoded}&fmt=json&limit=10");
 
         tracing::info!(url = %url, "Fetching releases from MusicBrainz");
@@ -135,8 +137,8 @@ impl MusicBrainzClient {
             }
         }
 
-        if mbid.starts_with("synth:") {
-            return Err(format!("Synthesized release '{mbid}' not found in cache"));
+        if mbid.starts_with("synth:") || mbid.starts_with("http://") || mbid.starts_with("https://") {
+            return Err(format!("Direct/synthesized URL '{mbid}' not found in cache"));
         }
 
         self.enforce_rate_limit().await;
