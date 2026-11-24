@@ -325,6 +325,9 @@ fn download_args(
         "4",
         "--http-chunk-size",
         "10M",
+        "--buffer-size",
+        "16M",
+        "--no-cache-dir",
         "-o",
         output_template,
     ]
@@ -344,7 +347,7 @@ fn download_args(
                 "--audio-quality",
                 "0", // Ensures maximum VBR quality if ffmpeg runs
                 "--extractor-args",
-                "youtube:player-client=web_embedded,tv_samsung,web", // tv_samsung provides direct HTTPS formats when account has SABR experiment
+                "youtube:player_js_variant=tv;player-client=tv_samsung,web", // tv_samsung provides direct HTTPS formats and player_js_variant=tv bypasses broken addOnDisposeCallback in YouTube base.js
             ]
             .map(String::from)
             .into_iter()
@@ -750,11 +753,23 @@ pub async fn download_single(
         .ok_or_else(|| format!("Failed to download track: {}", track.title))
 }
 
+pub type TrackDoneSender = tokio::sync::mpsc::Sender<(PathBuf, TrackDownload, usize)>;
+
 pub async fn download_batch(
     app: &AppHandle,
     tracks: &[TrackDownload],
     output_dir: &str,
     task_id: &str,
+) -> Result<Vec<(PathBuf, TrackDownload)>, String> {
+    download_batch_streaming(app, tracks, output_dir, task_id, None).await
+}
+
+pub async fn download_batch_streaming(
+    app: &AppHandle,
+    tracks: &[TrackDownload],
+    output_dir: &str,
+    task_id: &str,
+    track_sender: Option<TrackDoneSender>,
 ) -> Result<Vec<(PathBuf, TrackDownload)>, String> {
     let now = Instant::now();
     let ctx = Arc::new(DownloadContext::prepare(app, output_dir, "batch", task_id).await?);
@@ -816,6 +831,7 @@ pub async fn download_batch(
         let app_handle = app.clone();
         let ctx = Arc::clone(&ctx);
         let task_id = task_id.to_string();
+        let track_sender = track_sender.clone();
 
         join_set.spawn(async move {
             if let Some(registry) = app_handle.try_state::<crate::download::TaskRegistry>() {
@@ -834,7 +850,7 @@ pub async fn download_batch(
             }
 
             let track_num = index + 1;
-            let jitter = (index % 4) * 100 + 50;
+            let jitter = (index % 4) * 150 + 50;
             sleep(Duration::from_millis(jitter as u64)).await;
 
             let downloaded_file = download_track_internal(&ctx, &track, track_num, total_tracks).await;
@@ -888,6 +904,10 @@ pub async fn download_batch(
                         .await;
                 }
 
+                if let Some(ref sender) = track_sender {
+                    let _ = sender.send((path.clone(), track.clone(), index)).await;
+                }
+
                 Some((path.clone(), track))
             } else {
                 tracing::error!(
@@ -902,6 +922,8 @@ pub async fn download_batch(
             }
         });
     }
+
+    drop(track_sender);
 
     let mut downloaded: Vec<(PathBuf, TrackDownload)> = Vec::new();
     while let Some(res) = join_set.join_next().await {
@@ -1231,7 +1253,7 @@ mod hardening_tests {
         assert_eq!(args[cookies + 1], COOKIES);
 
         let clients = args.iter().position(|a| a == "--extractor-args").unwrap();
-        assert_eq!(args[clients + 1], "youtube:player-client=web_embedded,tv_samsung,web");
+        assert_eq!(args[clients + 1], "youtube:player_js_variant=tv;player-client=tv_samsung,web");
 
         let frags = args.iter().position(|a| a == "--concurrent-fragments").unwrap();
         assert_eq!(args[frags + 1], "4");
@@ -1266,6 +1288,44 @@ mod hardening_tests {
     #[test]
     fn download_args_refuses_option_like_urls() {
         assert!(download_args("--exec=calc", TEMPLATE, &cookie_args(), None).is_err());
+    }
+
+    #[test]
+    fn download_args_includes_performance_flags() {
+        let args = download_args("https://music.youtube.com/watch?v=abc", TEMPLATE, &[], None).unwrap();
+        assert!(args.contains(&"--buffer-size".to_string()));
+        let buf_idx = args.iter().position(|a| a == "--buffer-size").unwrap();
+        assert_eq!(args[buf_idx + 1], "16M");
+        assert!(args.contains(&"--no-cache-dir".to_string()));
+        assert_eq!(MAX_CONCURRENT_DOWNLOADS, 4);
+    }
+
+    #[tokio::test]
+    async fn track_done_sender_transmits_completed_track() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(PathBuf, TrackDownload, usize)>(2);
+        let sample_track = TrackDownload {
+            title: "Test Track".into(),
+            artists: vec!["Test Artist".into()],
+            album: "Test Album".into(),
+            album_artist: "Test Artist".into(),
+            track_number: Some(1),
+            disc_number: Some(1),
+            duration_ms: Some(120_000),
+            url: "https://example.com/audio".into(),
+            ..Default::default()
+        };
+        let sample_path = PathBuf::from("/temp/1.opus");
+        let sender: TrackDoneSender = tx;
+        sender.send((sample_path.clone(), sample_track.clone(), 0)).await.unwrap();
+        drop(sender);
+
+        let received = rx.recv().await;
+        assert!(received.is_some());
+        let (path, track, idx) = received.unwrap();
+        assert_eq!(path, sample_path);
+        assert_eq!(track.title, "Test Track");
+        assert_eq!(idx, 0);
+        assert!(rx.recv().await.is_none());
     }
 
     #[test]

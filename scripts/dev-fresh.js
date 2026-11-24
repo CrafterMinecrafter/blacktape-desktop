@@ -56,6 +56,74 @@ export function cleanFreshDirs(
   }
 }
 
+export function seedFreshToolsAndCookies(
+  platform = process.platform,
+  env = process.env,
+  home = os.homedir(),
+) {
+  const baseDirs = [];
+  if (platform === "win32") {
+    if (env.APPDATA) {
+      baseDirs.push({
+        src: path.join(env.APPDATA, "dev.seafood.blacktape"),
+        dst: path.join(env.APPDATA, "dev.seafood.blacktape.fresh"),
+      });
+    }
+    if (env.LOCALAPPDATA) {
+      baseDirs.push({
+        src: path.join(env.LOCALAPPDATA, "dev.seafood.blacktape"),
+        dst: path.join(env.LOCALAPPDATA, "dev.seafood.blacktape.fresh"),
+      });
+    }
+  } else if (platform === "darwin") {
+    const appSupport = path.join(home, "Library", "Application Support");
+    baseDirs.push({
+      src: path.join(appSupport, "dev.seafood.blacktape"),
+      dst: path.join(appSupport, "dev.seafood.blacktape.fresh"),
+    });
+  } else {
+    const dataHome = env.XDG_DATA_HOME || path.join(home, ".local", "share");
+    const configHome = env.XDG_CONFIG_HOME || path.join(home, ".config");
+    baseDirs.push({
+      src: path.join(dataHome, "dev.seafood.blacktape"),
+      dst: path.join(dataHome, "dev.seafood.blacktape.fresh"),
+    });
+    baseDirs.push({
+      src: path.join(configHome, "dev.seafood.blacktape"),
+      dst: path.join(configHome, "dev.seafood.blacktape.fresh"),
+    });
+  }
+
+  for (const { src, dst } of baseDirs) {
+    if (!fs.existsSync(src)) continue;
+    try {
+      fs.mkdirSync(dst, { recursive: true });
+      const cookieFile = path.join(src, "youtube_cookies.txt");
+      if (fs.existsSync(cookieFile)) {
+        fs.copyFileSync(cookieFile, path.join(dst, "youtube_cookies.txt"));
+      }
+      for (const file of [
+        "yt-dlp.exe",
+        "yt-dlp",
+        "yt-dlp.version",
+        "yt-dlp.checked",
+        "deno.exe",
+        "deno",
+      ]) {
+        const s = path.join(src, file);
+        if (fs.existsSync(s)) {
+          fs.copyFileSync(s, path.join(dst, file));
+        }
+      }
+      const ffmpegSrc = path.join(src, "ffmpeg");
+      const ffmpegDst = path.join(dst, "ffmpeg");
+      if (fs.existsSync(ffmpegSrc)) {
+        fs.cpSync(ffmpegSrc, ffmpegDst, { recursive: true });
+      }
+    } catch (_) {}
+  }
+}
+
 export function isWorkspaceDevProcess(execPath, workspaceRoot = process.cwd()) {
   if (!execPath || typeof execPath !== "string") return false;
   const isWindowsPath =
@@ -166,6 +234,7 @@ if (invokedFile && currentFile === invokedFile) {
   }
 
   cleanFreshDirs();
+  seedFreshToolsAndCookies();
 
   const isWin = process.platform === "win32";
   const tauriCmd = isWin ? "npx.cmd" : "npx";
