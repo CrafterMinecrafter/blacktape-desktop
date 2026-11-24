@@ -7,8 +7,10 @@ pub mod download;
 pub mod favorites;
 pub mod library_index;
 mod lyrics;
+pub mod metadata;
 mod playlists;
 mod preview;
+pub mod resolver;
 pub mod scan;
 mod search;
 pub mod song_edit;
@@ -166,6 +168,39 @@ async fn get_search_suggestions(query: String, platforms: Vec<Platform>) -> Vec<
             }
         });
     }
+
+    let q_mb = query.clone();
+    tasks.spawn(async move {
+        let client = crate::metadata::MusicBrainzClient::new(None);
+        match tokio::time::timeout(std::time::Duration::from_millis(1500), client.search_releases(&q_mb)).await {
+            Ok(Ok(releases)) => {
+                let suggestions = releases
+                    .into_iter()
+                    .take(3)
+                    .map(|r| {
+                        let summary = r.into_canonical_summary();
+                        SearchSuggestion {
+                            item_type: search::bandcamp::ItemType::Album,
+                            name: summary.title,
+                            band_name: summary.artist,
+                            album_name: None,
+                            item_url_path: format!("canonical:{}", summary.id),
+                            img: summary.cover_url.unwrap_or_default(),
+                            subscriber_count: None,
+                            audience_kind: None,
+                            album_url: None,
+                            view_count: None,
+                            year: summary.year.map(|y| y as i32),
+                            duration: None,
+                            platform: Platform::Youtube,
+                        }
+                    })
+                    .collect();
+                Ok(suggestions)
+            }
+            _ => Ok(Vec::new()),
+        }
+    });
 
     let mut raw_suggestions = Vec::new();
     while let Some(res) = tasks.join_next().await {
@@ -671,9 +706,48 @@ async fn download(
 /// Track list of an album/set for the album preview page.
 #[command]
 async fn get_album_preview(
+    app: AppHandle,
     platform: Platform,
     url: String,
 ) -> Result<crate::download::album_preview::AlbumPreview, String> {
+    if url.starts_with("canonical:") {
+        let mbid = url.trim_start_matches("canonical:");
+        let cache_dir = app.path().app_cache_dir().ok();
+        let client = crate::metadata::MusicBrainzClient::new(cache_dir);
+        let mut canonical = client.fetch_canonical_release(mbid).await?;
+
+        let mut prewarm_items = Vec::new();
+        for disc in &mut canonical.discs {
+            for track in &mut disc.tracks {
+                let candidates = crate::resolver::resolve_candidates_for_track(
+                    track.artists.first().map(|s| s.as_str()).unwrap_or(&canonical.album_artist),
+                    &track.title,
+                    track.duration_ms,
+                ).await;
+                if let Some(first) = candidates.first() {
+                    let plat = match first.source.platform_name() {
+                        "youtube" => Platform::Youtube,
+                        "bandcamp" => Platform::Bandcamp,
+                        "soundcloud" => Platform::Soundcloud,
+                        _ => Platform::Youtube,
+                    };
+                    prewarm_items.push((plat, first.source.primary_url().to_string()));
+                }
+                track.candidates = candidates;
+                track.selected_candidate_idx = 0;
+            }
+        }
+
+        // Spawn background pre-warming for the first 3 tracks
+        for (plat, u) in prewarm_items.into_iter().take(3) {
+            let app_clone = app.clone();
+            tokio::spawn(async move {
+                let _ = crate::preview::resolve::resolve(&app_clone, plat, &u).await;
+            });
+        }
+
+        return Ok(crate::download::album_preview::canonical_release_to_preview(canonical));
+    }
     crate::download::album_preview::album_preview(platform, &url).await
 }
 
@@ -973,6 +1047,11 @@ pub fn run() {
             preview::commands::stream_prefetch,
             preview::commands::stream_add_to_queue,
             preview::commands::start_mixed_playback,
+            // Canonical metadata & Multi-source resolver
+            metadata::commands::search_canonical_releases,
+            metadata::commands::get_canonical_release,
+            metadata::commands::resolve_canonical_candidates,
+            metadata::commands::prewarm_album_previews,
             // Library index (status of remote items, missing tracks)
             library_index::commands::get_download_status,
             library_index::commands::get_album_status,

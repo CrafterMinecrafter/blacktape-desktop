@@ -11,6 +11,7 @@ import {
 import { formatTotalDuration } from "@/shared/lib/library/trackDuration.ts";
 import { ItemType, type SearchSuggestion } from "@/shared/store/libraryStore.ts";
 import type { Platform } from "@/shared/types.ts";
+import type { AudioCandidate } from "@/shared/types/canonical.ts";
 
 export interface AlbumTrackInfo {
   /** Position in the album (0-based, also for unavailable rows). */
@@ -26,6 +27,8 @@ export interface AlbumTrackInfo {
   note: string | null;
   /** Length in ms when the platform provides it. */
   duration_ms?: number | null;
+  candidates?: AudioCandidate[];
+  selected_candidate_idx?: number;
 }
 
 export interface AlbumPreview {

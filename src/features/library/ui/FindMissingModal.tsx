@@ -156,7 +156,7 @@ const FindMissingModal = ({ albumArtist, album, excludeUrl, failedSong }: FindMi
               )
             }
           >
-            Only this song from YouTube / SoundCloud
+            Only this song from another platform
           </button>
         )}
         <button className={styles.cancelButton} onClick={closeModal} disabled={linking}>

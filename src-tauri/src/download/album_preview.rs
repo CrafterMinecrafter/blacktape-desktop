@@ -26,6 +26,10 @@ pub struct AlbumTrackInfo {
     /// Length in ms when the platform provides it.
     #[serde(default)]
     pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub candidates: Vec<crate::metadata::types::AudioCandidate>,
+    #[serde(default)]
+    pub selected_candidate_idx: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -65,6 +69,8 @@ pub fn build_preview(
             available: true,
             note: None,
             duration_ms: t.duration_ms,
+            candidates: Vec::new(),
+            selected_candidate_idx: 0,
         })
         .collect();
 
@@ -84,6 +90,8 @@ pub fn build_preview(
                 available: false,
                 note: Some(s.reason.clone()),
                 duration_ms: None,
+                candidates: Vec::new(),
+                selected_candidate_idx: 0,
             },
         );
     }
@@ -145,6 +153,55 @@ pub async fn album_preview(platform: Platform, url: &str) -> Result<AlbumPreview
         Platform::Local => return Err("Local albums have no preview.".to_string()),
     };
     Ok(build_preview(platform, url, album, &skipped))
+}
+
+/// Converts a CanonicalRelease (with resolved track candidates) into an AlbumPreview for UI display.
+pub fn canonical_release_to_preview(release: crate::metadata::types::CanonicalRelease) -> AlbumPreview {
+    let mut tracks = Vec::new();
+    let mut idx = 0;
+    for disc in &release.discs {
+        for track in &disc.tracks {
+            let primary_url = track
+                .selected_candidate()
+                .map(|c| c.source.primary_url().to_string())
+                .unwrap_or_default();
+            tracks.push(AlbumTrackInfo {
+                index: idx,
+                title: track.title.clone(),
+                artists: track.artists.clone(),
+                track_number: Some(track.track_number as i32),
+                disc_number: Some(disc.disc_number as i32),
+                url: primary_url,
+                available: true,
+                note: None,
+                duration_ms: Some(track.duration_ms),
+                candidates: track.candidates.clone(),
+                selected_candidate_idx: track.selected_candidate_idx,
+            });
+            idx += 1;
+        }
+    }
+
+    let total_duration_ms = {
+        let sum: u64 = tracks.iter().filter_map(|t| t.duration_ms).sum();
+        if sum > 0 {
+            Some(sum)
+        } else {
+            None
+        }
+    };
+
+    AlbumPreview {
+        platform: Platform::Youtube,
+        url: format!("canonical:{}", release.id),
+        title: release.title,
+        artist: release.album_artist,
+        cover_url: release.cover_url,
+        year: release.release_year.map(|y| y as i32),
+        genres: Vec::new(),
+        tracks,
+        total_duration_ms,
+    }
 }
 
 #[cfg(test)]
@@ -292,6 +349,8 @@ mod tests {
             available: true,
             note: None,
             duration_ms: ms,
+            candidates: Vec::new(),
+            selected_candidate_idx: 0,
         };
         assert_eq!(total_duration(&[row(Some(1)), row(None), row(Some(2))]), Some(3));
     }

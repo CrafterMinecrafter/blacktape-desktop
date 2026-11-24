@@ -1,5 +1,5 @@
 import { coverSrc } from "@/shared/lib/remote/cover";
-import { useEffect, useMemo } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import clsx from "clsx";
 import { BiArrowBack, BiDownload, BiRightArrowAlt } from "react-icons/bi";
 import { FaCheckCircle } from "react-icons/fa";
@@ -33,11 +33,17 @@ import { EMPTY_SELECTION } from "@/shared/lib/ui/selection.ts";
 import { decodeHtmlEntities } from "@/shared/lib/ui/html.ts";
 import { isDownloadBusy } from "@/pages/search-results/searchResultsFormat.ts";
 import { AlbumTrackRow } from "./AlbumTrackRow.tsx";
+import {
+  MetadataEditModal,
+  applyMetadataPatch,
+} from "@/features/album-preview/ui/MetadataEditModal.tsx";
 import styles from "./album-preview.module.css";
 
 const AlbumPreview = () => {
   const { item, status, preview, error, selection, trackTasks } = useAlbumPreviewStore();
   const { close, reload, selectTrack, selectAll, clearSelection, download, downloadUrls, downloadTrack } =
+    useAlbumPreviewStore.getState();
+  const [editModalOpen, setEditModalOpen] = useState(false);
     useAlbumPreviewStore.getState();
   const activeDownloads = useLibraryStore((s) => s.activeDownloads);
   const playStream = useStreamStore((s) => s.play);
@@ -229,6 +235,14 @@ const AlbumPreview = () => {
                 >
                   {selectedCount >= selectable.length && selectable.length > 0 ? "Clear selection" : "Select all"}
                 </button>
+                <button
+                  type="button"
+                  className={styles.secondaryButton}
+                  onClick={() => setEditModalOpen(true)}
+                  title="Quick metadata editor"
+                >
+                  Edit Tags
+                </button>
                 <StreamActionRow items={streamItems} playLabel="Play album" />
                 {selectedCount > 0 && <span className={styles.count}>{selectedCount} selected</span>}
               </div>
@@ -237,37 +251,72 @@ const AlbumPreview = () => {
                 {preview.tracks.map((track, i) => {
                   const above = preview.tracks[i - 1];
                   const below = preview.tracks[i + 1];
+                  const isNewDisc =
+                    track.disc_number &&
+                    (!above || above.disc_number !== track.disc_number);
                   return (
-                    <AlbumTrackRow
-                      key={track.index}
-                      track={track}
-                      position={i}
-                      selected={selection.selected.has(track.index)}
-                      selectedAbove={!!above && selection.selected.has(above.index)}
-                      selectedBelow={!!below && selection.selected.has(below.index)}
-                      libraryState={libraryStates[track.url]}
-                      task={taskStates[track.url]}
-                      cover={preview.cover_url}
-                      onSelect={(e) =>
-                        selectTrack(track.index, { ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey })
-                      }
-                      onPlay={() => playTrack(track)}
-                      onDownload={() => void downloadTrack(track)}
-                      onChooseQuality={() =>
-                        openQualityMenu(previewDownloadParams(preview, [track.url], track.title), {
-                          start: (format) => void downloadTrack(track, format),
-                        })
-                      }
-                      onContextMenu={(e) =>
-                        openMenu(e, albumTrackToRemoteTrack(preview, track), {
-                          list: remoteList,
-                          downloadState: libraryStates[track.url] ?? "none",
-                        })
-                      }
-                    />
+                    <Fragment key={track.index}>
+                      {isNewDisc && (
+                        <li className={styles.discHeader}>
+                          Disc {track.disc_number}
+                        </li>
+                      )}
+                      <AlbumTrackRow
+                        key={track.index}
+                        track={track}
+                        position={i}
+                        selected={selection.selected.has(track.index)}
+                        selectedAbove={!!above && selection.selected.has(above.index)}
+                        selectedBelow={!!below && selection.selected.has(below.index)}
+                        libraryState={libraryStates[track.url]}
+                        task={taskStates[track.url]}
+                        cover={preview.cover_url}
+                        onSelect={(e) =>
+                          selectTrack(track.index, { ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey })
+                        }
+                        onPlay={() => playTrack(track)}
+                        onDownload={() => void downloadTrack(track)}
+                        onChooseQuality={() =>
+                          openQualityMenu(previewDownloadParams(preview, [track.url], track.title), {
+                            start: (format) => void downloadTrack(track, format),
+                          })
+                        }
+                        onSelectCandidate={(candIdx) => {
+                          const cand = track.candidates?.[candIdx];
+                          if (!cand) return;
+                          const nextTracks = [...preview.tracks];
+                          nextTracks[i] = {
+                            ...track,
+                            selected_candidate_idx: candIdx,
+                            url: cand.source.kind === "http_stream" ? cand.source.url : track.url,
+                          };
+                          useAlbumPreviewStore.setState({
+                            preview: { ...preview, tracks: nextTracks },
+                          });
+                        }}
+                        onContextMenu={(e) =>
+                          openMenu(e, albumTrackToRemoteTrack(preview, track), {
+                            list: remoteList,
+                            downloadState: libraryStates[track.url] ?? "none",
+                          })
+                        }
+                      />
+                    </Fragment>
                   );
                 })}
               </ul>
+              {preview && (
+                <MetadataEditModal
+                  preview={preview}
+                  isOpen={editModalOpen}
+                  onClose={() => setEditModalOpen(false)}
+                  onSave={(updated) => {
+                    useAlbumPreviewStore.setState({
+                      preview: applyMetadataPatch(preview, updated),
+                    });
+                  }}
+                />
+              )}
               <p className={styles.hint}>
                 Click a track to select it, Ctrl/Shift for several. Double click plays a preview.
               </p>

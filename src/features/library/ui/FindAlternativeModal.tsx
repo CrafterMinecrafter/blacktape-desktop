@@ -50,7 +50,7 @@ const FindAlternativeModal = ({ artist, title, excludePlatform, placement }: Fin
 
   useEffect(() => {
     let cancelled = false;
-    const platforms = (["youtube", "soundcloud"] as const).filter((p) => p !== excludePlatform);
+    const platforms = (["youtube", "soundcloud", "bandcamp"] as const).filter((p) => p !== excludePlatform);
     searchFull({ query: alternativeQuery(artist, title), kind: ItemType.Track, platforms: [...platforms] })
       .then((page) => {
         if (!cancelled) setResults(page.items.slice(0, 8));
@@ -73,7 +73,7 @@ const FindAlternativeModal = ({ artist, title, excludePlatform, placement }: Fin
       <h2 className={styles.title}>Find another source</h2>
       <span className={styles.text}>
         {results === null
-          ? `Looking for "${title}" on YouTube and SoundCloud...`
+          ? `Looking for "${title}" on other platforms...`
           : results.length > 0
             ? `"${title}" has no stream on its platform. Download it from:`
             : "Nothing was found."}

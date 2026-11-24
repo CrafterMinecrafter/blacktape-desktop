@@ -33,6 +33,7 @@ export interface AlbumTrackRowProps {
   onDownload: () => void;
   /** Opens the quality menu for this track. */
   onChooseQuality: () => void;
+  onSelectCandidate?: (candidateIdx: number) => void;
   onContextMenu: (e: MouseEvent) => void;
 }
 
@@ -50,6 +51,7 @@ export const AlbumTrackRow = ({
   onPlay,
   onDownload,
   onChooseQuality,
+  onSelectCandidate,
   onContextMenu,
 }: AlbumTrackRowProps) => {
   const currentSong = useAudioStore((s) => s.currentSong);
@@ -118,6 +120,29 @@ export const AlbumTrackRow = ({
       <div className={rowStyles.songRight}>
         {!track.available && track.note && (
           <div className={clsx(styles.note, "truncate")}>{track.note}</div>
+        )}
+        {track.candidates && track.candidates.length > 0 && (
+          <div
+            className={styles.candidateSelector}
+            onClick={(e) => e.stopPropagation()}
+            onDoubleClick={(e) => e.stopPropagation()}
+          >
+            <select
+              className={styles.candidateSelect}
+              value={track.selected_candidate_idx ?? 0}
+              onChange={(e) => {
+                const idx = Number(e.target.value);
+                onSelectCandidate?.(idx);
+              }}
+              title="Select audio source candidate"
+            >
+              {track.candidates.map((cand, cIdx) => (
+                <option key={cIdx} value={cIdx}>
+                  {cand.display_label} {cand.is_strict_match ? "✓" : "~"}
+                </option>
+              ))}
+            </select>
+          </div>
         )}
         <span className={styles.duration}>{formatTrackDuration(track.duration_ms)}</span>
         <div className={styles.rowAction}>

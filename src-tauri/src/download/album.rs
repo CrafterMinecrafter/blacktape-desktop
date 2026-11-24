@@ -47,6 +47,8 @@ pub fn without_owned(
             available: true,
             note: None,
             duration_ms: None,
+            candidates: Vec::new(),
+            selected_candidate_idx: 0,
         })
         .collect();
     let missing: Vec<String> = crate::library_index::sources::compute_missing(platform, album_artist, &infos, index)
@@ -131,19 +133,67 @@ pub async fn process_album_url(
 
     let mut skipped_note = None;
     let mut skipped_tracks: Vec<SkippedTrack> = Vec::new();
-    let mut album_info = match platform {
-        Platform::Bandcamp => bandcamp::parse_album(url).await?,
-        Platform::Youtube => youtube::parse_album(url).await?,
-        Platform::Soundcloud => {
-            let (album, skipped) = soundcloud::parse_album_with_skipped(url).await?;
-            if !skipped.is_empty() {
-                skipped_note = Some(soundcloud::describe_skipped(&skipped));
+    let mut album_info = if url.starts_with("canonical:") {
+        let mbid = url.trim_start_matches("canonical:");
+        let cache_dir = app_handle.path().app_cache_dir().ok();
+        let client = crate::metadata::MusicBrainzClient::new(cache_dir);
+        let canonical = client.fetch_canonical_release(mbid).await?;
+
+        let mut track_downloads = Vec::new();
+        for disc in &canonical.discs {
+            for t in &disc.tracks {
+                let candidates = crate::resolver::resolve_candidates_for_track(
+                    t.artists.first().map(|s| s.as_str()).unwrap_or(&canonical.album_artist),
+                    &t.title,
+                    t.duration_ms,
+                ).await;
+
+                let primary_url = candidates
+                    .first()
+                    .map(|c| c.source.primary_url().to_string())
+                    .unwrap_or_default();
+
+                track_downloads.push(crate::download::TrackDownload {
+                    url: primary_url,
+                    file_name: String::new(),
+                    title: t.title.clone(),
+                    artists: t.artists.clone(),
+                    album_artist: canonical.album_artist.clone(),
+                    album: canonical.title.clone(),
+                    track_number: Some(t.track_number as i32),
+                    disc_number: Some(disc.disc_number as i32),
+                    genres: None,
+                    release_year: canonical.release_year.map(|y| y as i32),
+                    source_item_id: None,
+                    duration_ms: Some(t.duration_ms),
+                });
             }
-            skipped_tracks = skipped;
-            album
         }
-        Platform::Local => {
-            return Err("Local files cannot be processed via remote URL pipelines.".into());
+
+        AlbumDownload {
+            title: canonical.title,
+            artists: vec![canonical.album_artist.clone()],
+            album_artist: canonical.album_artist,
+            tracks: track_downloads,
+            genres: None,
+            release_year: canonical.release_year.map(|y| y as i32),
+            external_cover_url: canonical.cover_url,
+        }
+    } else {
+        match platform {
+            Platform::Bandcamp => bandcamp::parse_album(url).await?,
+            Platform::Youtube => youtube::parse_album(url).await?,
+            Platform::Soundcloud => {
+                let (album, skipped) = soundcloud::parse_album_with_skipped(url).await?;
+                if !skipped.is_empty() {
+                    skipped_note = Some(soundcloud::describe_skipped(&skipped));
+                }
+                skipped_tracks = skipped;
+                album
+            }
+            Platform::Local => {
+                return Err("Local files cannot be processed via remote URL pipelines.".into());
+            }
         }
     };
 

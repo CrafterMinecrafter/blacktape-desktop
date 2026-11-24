@@ -1,5 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { Album, ArtistSummary, RepeatMode, Song } from "@/shared/types";
+import {
+  CanonicalRelease,
+  CanonicalReleaseSummary,
+  CanonicalTrack,
+} from "@/shared/types/canonical";
 
 export const scanMusic = (dir: string): Promise<Song[]> =>
   invoke<Song[]>("scan_music", { dir });
@@ -144,4 +149,26 @@ export const addFavorites = (songIds: number[]): Promise<void> =>
 
 export const removeFavorites = (songIds: number[]): Promise<void> =>
   invoke("remove_favorites", { songIds });
+
+export const searchCanonicalReleases = (
+  query: string,
+): Promise<CanonicalReleaseSummary[]> =>
+  invoke<CanonicalReleaseSummary[]>("search_canonical_releases", { query });
+
+export const getCanonicalRelease = (id: string): Promise<CanonicalRelease> =>
+  invoke<CanonicalRelease>("get_canonical_release", { id });
+
+export const resolveCanonicalCandidates = (
+  track: CanonicalTrack,
+  fallbackArtist?: string,
+): Promise<CanonicalTrack> =>
+  invoke<CanonicalTrack>("resolve_canonical_candidates", {
+    track,
+    fallbackArtist,
+  });
+
+export const prewarmAlbumPreviews = (
+  items: Array<[string, string]>,
+): Promise<void> => invoke("prewarm_album_previews", { items });
+
 

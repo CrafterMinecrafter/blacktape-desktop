@@ -530,6 +530,8 @@ mod tests {
             available: true,
             note: None,
             duration_ms: Some(1000),
+            candidates: Vec::new(),
+            selected_candidate_idx: 0,
         }
     }
 
