@@ -863,6 +863,9 @@ pub async fn download_batch_streaming(
 
             if downloaded_file.is_none() && !track.fallback_urls.is_empty() {
                 for fallback_url in &track.fallback_urls {
+                    if !fallback_url.starts_with("http://") && !fallback_url.starts_with("https://") {
+                        continue;
+                    }
                     tracing::warn!(
                         session = %ctx.session_id,
                         track = track_num,
@@ -890,6 +893,7 @@ pub async fn download_batch_streaming(
 
             if let Some(ref path) = downloaded_file {
                 let current = completed.fetch_add(1, Ordering::SeqCst) + 1;
+                let emit_index = track.source_track_index.unwrap_or(index);
                 tracing::info!(
                     session = %ctx.session_id,
                     track = track_num,
@@ -912,7 +916,7 @@ pub async fn download_batch_streaming(
                     "download-track-progress",
                     serde_json::json!({
                         "task_id": task_id,
-                        "track_index": index,
+                        "track_index": emit_index,
                         "track_title": track.title.clone(),
                         "percent": 100,
                     }),
@@ -922,7 +926,7 @@ pub async fn download_batch_streaming(
                     app_handle.try_state::<crate::download::TaskRegistry>()
                 {
                     registry
-                        .update_track_progress(&task_id, index, &track.title, 100)
+                        .update_track_progress(&task_id, emit_index, &track.title, 100)
                         .await;
                     registry
                         .update_task_progress(
@@ -938,7 +942,7 @@ pub async fn download_batch_streaming(
                 }
 
                 if let Some(ref sender) = track_sender {
-                    let _ = sender.send((path.clone(), track.clone(), index)).await;
+                    let _ = sender.send((path.clone(), track.clone(), emit_index)).await;
                 }
 
                 Some((path.clone(), track))

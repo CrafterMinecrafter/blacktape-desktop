@@ -41,6 +41,16 @@ pub struct TrackProgressEvent {
     pub percent: i32,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TorrentTarget {
+    pub info_hash: String,
+    pub magnet_uri: String,
+    pub file_index: usize,
+    pub file_path: String,
+    pub file_size: u64,
+    pub quality_tier: crate::metadata::types::AudioQualityTier,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TrackDownload {
     pub url: String,
@@ -57,6 +67,8 @@ pub struct TrackDownload {
     /// Length in milliseconds when the platform page/API provides it (parsers fill it; None otherwise).
     pub duration_ms: Option<u64>,
     pub fallback_urls: Vec<String>,
+    pub torrent_target: Option<TorrentTarget>,
+    pub source_track_index: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +89,8 @@ pub struct TrackOverride {
     pub title: Option<String>,
     pub url: Option<String>,
     pub fallback_urls: Option<Vec<String>>,
+    pub candidates: Option<Vec<crate::metadata::types::AudioCandidate>>,
+    pub selected_candidate_idx: Option<usize>,
 }
 
 /// User-edited album metadata & per-track candidate choices passed to `download`.
@@ -163,6 +177,7 @@ mod placement_tests {
             source_item_id: None,
             duration_ms: None,
             fallback_urls: Vec::new(),
+            ..Default::default()
         }
     }
 

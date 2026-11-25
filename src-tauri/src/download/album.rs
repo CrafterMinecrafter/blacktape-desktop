@@ -122,7 +122,9 @@ async fn record_album_source(
 
 pub fn detect_platform_from_url(url: &str, fallback: Platform) -> Platform {
     let lower = url.to_ascii_lowercase();
-    if lower.contains("bandcamp.com") {
+    if lower.starts_with("magnet:") || lower.starts_with("torrent:") {
+        Platform::Local
+    } else if lower.contains("bandcamp.com") {
         Platform::Bandcamp
     } else if lower.contains("soundcloud.com") {
         Platform::Soundcloud
@@ -249,9 +251,91 @@ pub fn pick_candidate_urls_for_tier(
     }
 }
 
+pub(crate) fn apply_candidate_to_track(
+    track: &mut TrackDownload,
+    candidates: &[crate::metadata::types::AudioCandidate],
+    preferred_format: Option<&str>,
+    selected_idx: usize,
+) -> Option<crate::metadata::types::AudioQualityTier> {
+    use crate::metadata::types::AudioSource;
+
+    let (chosen_idx, _, _) = pick_candidate_entry_for_tier(candidates, preferred_format, selected_idx)?;
+    let chosen = &candidates[chosen_idx];
+    let http_urls: Vec<String> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| *idx != chosen_idx)
+        .filter_map(|(_, c)| match &c.source {
+            AudioSource::HttpStream { url, .. } if !url.trim().is_empty() => Some(url.clone()),
+            _ => None,
+        })
+        .collect();
+
+    match &chosen.source {
+        AudioSource::Torrent {
+            info_hash,
+            magnet_uri,
+            file_index,
+            file_path,
+            file_size,
+            ..
+        } => {
+            track.torrent_target = Some(crate::download::types::TorrentTarget {
+                info_hash: info_hash.clone(),
+                magnet_uri: magnet_uri.clone(),
+                file_index: *file_index,
+                file_path: file_path.clone(),
+                file_size: *file_size,
+                quality_tier: chosen.quality_tier,
+            });
+            // Keep HTTP identity URL if present so `select_tracks` stays intact while storing HTTP fallbacks.
+            let mut fallbacks = Vec::new();
+            if track.url.starts_with("http://") || track.url.starts_with("https://") {
+                fallbacks.push(track.url.clone());
+            } else if let Some(first_http) = http_urls.first() {
+                track.url = first_http.clone();
+            } else {
+                track.url = magnet_uri.clone();
+            }
+            for u in http_urls {
+                if !fallbacks.contains(&u) {
+                    fallbacks.push(u);
+                }
+            }
+            track.fallback_urls = fallbacks;
+        }
+        AudioSource::HttpStream { url, .. } => {
+            track.torrent_target = None;
+            if !url.trim().is_empty() {
+                track.url = url.clone();
+            }
+            let mut fallbacks = Vec::new();
+            for u in http_urls {
+                if u != track.url && !fallbacks.contains(&u) {
+                    fallbacks.push(u);
+                }
+            }
+            track.fallback_urls = fallbacks;
+        }
+        AudioSource::LocalFile { .. } => {
+            track.torrent_target = None;
+        }
+    }
+
+    Some(chosen.quality_tier)
+}
+
 pub fn apply_download_overrides(
     album_info: &mut AlbumDownload,
     overrides: &crate::download::types::DownloadOverrides,
+) {
+    apply_download_overrides_with_format(album_info, overrides, None);
+}
+
+pub fn apply_download_overrides_with_format(
+    album_info: &mut AlbumDownload,
+    overrides: &crate::download::types::DownloadOverrides,
+    effective_format: Option<&str>,
 ) {
     if let Some(ref title) = overrides.title {
         let trimmed = title.trim();
@@ -300,6 +384,16 @@ pub fn apply_download_overrides(
             }
             if let Some(ref fallbacks) = ov.fallback_urls {
                 track.fallback_urls = fallbacks.clone();
+            }
+            if let Some(ref cands) = ov.candidates {
+                if !cands.is_empty() {
+                    apply_candidate_to_track(
+                        track,
+                        cands,
+                        effective_format,
+                        ov.selected_candidate_idx.unwrap_or(0),
+                    );
+                }
             }
         }
     }
@@ -492,6 +586,7 @@ async fn build_bulk_upgrade_album(
     url: &str,
     selected: Option<&[String]>,
     effective_format: Option<&str>,
+    overrides: Option<&crate::download::types::DownloadOverrides>,
     fallback_output_dir: &Path,
 ) -> Result<(AlbumDownload, Option<PathBuf>), String> {
     use std::collections::HashSet;
@@ -540,14 +635,30 @@ async fn build_bulk_upgrade_album(
     );
 
     let per_song_candidates = resolve_upgrade_candidates_cached(&ordered_songs).await;
+    let override_by_idx: HashMap<usize, &crate::download::types::TrackOverride> = overrides
+        .and_then(|o| o.tracks.as_ref())
+        .map(|list| list.iter().filter_map(|ov| ov.index.map(|i| (i, ov))).collect())
+        .unwrap_or_default();
 
     let mut tracks = Vec::with_capacity(ordered_songs.len());
     let mut replace_ids = HashMap::new();
     let mut skipped_same_quality = 0usize;
     for (idx, song) in ordered_songs.into_iter().enumerate() {
-        let candidates = &per_song_candidates[idx];
+        let mut candidates = per_song_candidates[idx].clone();
+        if let Some(ov) = override_by_idx.get(&idx) {
+            if let Some(ref ov_cands) = ov.candidates {
+                for cand in ov_cands {
+                    let already = candidates.iter().any(|existing| existing.source == cand.source);
+                    if !already {
+                        candidates.push(cand.clone());
+                    }
+                }
+                crate::resolver::arbiter::rank_candidates(&mut candidates);
+            }
+        }
+
         let local_exists = Path::new(&song.path).exists();
-        let chosen = pick_candidate_entry_for_tier(candidates, effective_format, 0);
+        let chosen = pick_candidate_entry_for_tier(&candidates, effective_format, 0);
         if let Some((chosen_idx, _, _)) = &chosen {
             let cand_tier = candidates[*chosen_idx].quality_tier;
             if !candidate_improves_local(song.quality_tier, local_exists, cand_tier) {
@@ -566,28 +677,8 @@ async fn build_bulk_upgrade_album(
             continue;
         }
 
-        let (mut primary_url, mut fallback_urls) = match chosen {
-            Some((_, primary, fallbacks)) => (primary, fallbacks),
-            None => (String::new(), Vec::new()),
-        };
-        if let Some(ref orig_url) = song.source_url {
-            if orig_url.starts_with("http://") || orig_url.starts_with("https://") {
-                if primary_url.is_empty() {
-                    primary_url = orig_url.clone();
-                } else if orig_url != &primary_url && !fallback_urls.contains(orig_url) {
-                    fallback_urls.push(orig_url.clone());
-                }
-            }
-        }
-        if primary_url.is_empty() {
-            tracing::warn!(title = %song.title, "Skipping track without any resolved upgrade stream");
-            continue;
-        }
-        if let Some(old_id) = song.id {
-            replace_ids.insert(tracks.len(), old_id);
-        }
-        tracks.push(TrackDownload {
-            url: primary_url,
+        let mut track = TrackDownload {
+            url: String::new(),
             file_name: String::new(),
             title: song.title,
             artists: song.artists,
@@ -599,8 +690,28 @@ async fn build_bulk_upgrade_album(
             release_year: song.release_year,
             source_item_id: None,
             duration_ms: Some(song.duration_ms),
-            fallback_urls,
-        });
+            fallback_urls: Vec::new(),
+            ..Default::default()
+        };
+        let _ = apply_candidate_to_track(&mut track, &candidates, effective_format, 0);
+
+        if let Some(ref orig_url) = song.source_url {
+            if orig_url.starts_with("http://") || orig_url.starts_with("https://") {
+                if track.url.is_empty() {
+                    track.url = orig_url.clone();
+                } else if orig_url != &track.url && !track.fallback_urls.contains(orig_url) {
+                    track.fallback_urls.push(orig_url.clone());
+                }
+            }
+        }
+        if track.url.is_empty() && track.torrent_target.is_none() {
+            tracing::warn!(title = %track.title, "Skipping track without any resolved upgrade stream");
+            continue;
+        }
+        if let Some(old_id) = song.id {
+            replace_ids.insert(tracks.len(), old_id);
+        }
+        tracks.push(track);
     }
 
     if tracks.is_empty() && skipped_same_quality == 0 {
@@ -674,6 +785,7 @@ pub async fn process_album_url(
             url,
             selected,
             effective_format.as_deref(),
+            task_overrides.as_ref(),
             &root_library_dir,
         )
         .await?;
@@ -716,14 +828,8 @@ pub async fn process_album_url(
         let mut track_downloads = Vec::new();
         for disc in &canonical.discs {
             for t in &disc.tracks {
-                let (primary_url, fallback_urls) = pick_candidate_urls_for_tier(
-                    &t.candidates,
-                    effective_format.as_deref(),
-                    t.selected_candidate_idx,
-                );
-
-                track_downloads.push(crate::download::TrackDownload {
-                    url: primary_url,
+                let mut td = crate::download::TrackDownload {
+                    url: String::new(),
                     file_name: String::new(),
                     title: t.title.clone(),
                     artists: t.artists.clone(),
@@ -735,8 +841,16 @@ pub async fn process_album_url(
                     release_year: canonical.release_year.map(|y| y as i32),
                     source_item_id: None,
                     duration_ms: Some(t.duration_ms),
-                    fallback_urls,
-                });
+                    fallback_urls: Vec::new(),
+                    ..Default::default()
+                };
+                let _ = apply_candidate_to_track(
+                    &mut td,
+                    &t.candidates,
+                    effective_format.as_deref(),
+                    t.selected_candidate_idx,
+                );
+                track_downloads.push(td);
             }
         }
 
@@ -767,8 +881,31 @@ pub async fn process_album_url(
         }
     };
 
-    if let Some(ref overrides) = task_overrides {
-        apply_download_overrides(&mut album_info, overrides);
+    if !is_upgrade {
+        if let Some(ref overrides) = task_overrides {
+            apply_download_overrides_with_format(
+                &mut album_info,
+                overrides,
+                effective_format.as_deref(),
+            );
+        }
+    } else if let Some(ref overrides) = task_overrides {
+        if let Some(ref title) = overrides.title {
+            let trimmed = title.trim();
+            if !trimmed.is_empty() {
+                album_info.title = trimmed.to_string();
+            }
+        }
+        if let Some(ref artist) = overrides.artist {
+            let trimmed = artist.trim();
+            if !trimmed.is_empty() {
+                album_info.album_artist = trimmed.to_string();
+                album_info.artists = vec![trimmed.to_string()];
+            }
+        }
+        if let Some(year) = overrides.year {
+            album_info.release_year = Some(year);
+        }
     }
 
     let album_artist = album_info.album_artist.clone();
@@ -938,16 +1075,111 @@ pub async fn process_album_url(
         songs
     });
 
-    let download_res = ytdlp::download_batch_streaming(
-        app_handle,
-        &tracks,
-        output_dir,
-        task_id,
-        Some(tx),
-    )
-    .await;
+    for (idx, t) in tracks.iter_mut().enumerate() {
+        t.source_track_index = Some(idx);
+    }
+
+    let total_tracks = tracks.len();
+    let completed_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut torrent_groups: std::collections::BTreeMap<
+        String,
+        (String, Vec<crate::torrent::download::TorrentFileRequest>),
+    > = std::collections::BTreeMap::new();
+    let mut http_tracks: Vec<TrackDownload> = Vec::new();
+
+    for t in &tracks {
+        if let Some(ref target) = t.torrent_target {
+            let entry = torrent_groups
+                .entry(target.info_hash.clone())
+                .or_insert_with(|| (target.magnet_uri.clone(), Vec::new()));
+            entry.1.push(crate::torrent::download::TorrentFileRequest {
+                track_index: t.source_track_index.unwrap_or(0),
+                file_index: target.file_index,
+                file_size: target.file_size,
+                track: t.clone(),
+            });
+        } else {
+            http_tracks.push(t.clone());
+        }
+    }
+
+    let mut transfer_err: Option<String> = None;
+    for (_hash, (locator, requests)) in torrent_groups {
+        match crate::torrent::download::download_torrent_files(
+            app_handle,
+            task_id,
+            &root_library_dir,
+            &locator,
+            &requests,
+            total_tracks,
+            std::sync::Arc::clone(&completed_counter),
+            Some(tx.clone()),
+        )
+        .await
+        {
+            Ok(res) => {
+                for (_idx, mut failed) in res.failed_tracks {
+                    if let Some(http_url) = first_http_url(&failed) {
+                        failed.torrent_target = None;
+                        failed.url = http_url;
+                        http_tracks.push(failed);
+                    } else if transfer_err.is_none() {
+                        transfer_err = Some(format!(
+                            "Torrent track '{}' failed without an HTTP fallback.",
+                            failed.title
+                        ));
+                    }
+                }
+            }
+            Err(err) => {
+                if err == "Task cancelled" {
+                    transfer_err = Some(err);
+                    http_tracks.clear();
+                    break;
+                }
+                tracing::warn!(task_id, error = %err, "Torrent release transfer failed; checking HTTP fallbacks");
+                let mut had_no_fallback = false;
+                for req in requests {
+                    let mut track = req.track;
+                    if let Some(http_url) = first_http_url(&track) {
+                        track.torrent_target = None;
+                        track.url = http_url;
+                        http_tracks.push(track);
+                    } else {
+                        had_no_fallback = true;
+                    }
+                }
+                if had_no_fallback && transfer_err.is_none() {
+                    transfer_err = Some(err);
+                }
+            }
+        }
+    }
+
+    let download_res = if !http_tracks.is_empty() {
+        ytdlp::download_batch_streaming(
+            app_handle,
+            &http_tracks,
+            output_dir,
+            task_id,
+            Some(tx),
+        )
+        .await
+    } else {
+        drop(tx);
+        match transfer_err.as_ref() {
+            Some(err) => Err(err.clone()),
+            None => Ok(Vec::new()),
+        }
+    };
 
     let saved_songs = consumer.await.unwrap_or_default();
+
+    let torrent_staging = crate::torrent::download::torrent_cache_root(&root_library_dir);
+    let task_staging = crate::torrent::download::torrent_staging_dir(&torrent_staging, task_id);
+    if task_staging.exists() {
+        let _ = fs::remove_dir_all(&task_staging);
+    }
 
     match download_res {
         Ok(files) => {
@@ -956,9 +1188,17 @@ pub async fn process_album_url(
                     let _ = fs::remove_dir_all(parent);
                 }
             }
+            if saved_songs.is_empty() {
+                if let Some(err) = transfer_err {
+                    return Err(err);
+                }
+            }
             Ok((target_library_dir, Vec::new(), cover_path))
         }
         Err(err) => {
+            if !saved_songs.is_empty() {
+                return Ok((target_library_dir, Vec::new(), cover_path));
+            }
             if saved_songs.is_empty()
                 && folder_created
                 && target_library_dir.exists()
@@ -969,6 +1209,17 @@ pub async fn process_album_url(
             Err(err)
         }
     }
+}
+
+fn first_http_url(track: &TrackDownload) -> Option<String> {
+    if track.url.starts_with("http://") || track.url.starts_with("https://") {
+        return Some(track.url.clone());
+    }
+    track
+        .fallback_urls
+        .iter()
+        .find(|u| u.starts_with("http://") || u.starts_with("https://"))
+        .cloned()
 }
 
 pub async fn download_album_cover(url: &str, output_dir: &Path) -> Result<(), String> {
@@ -1210,6 +1461,7 @@ mod tests {
                 title: Some("Edited Track 2".into()),
                 url: Some("https://picked/2".into()),
                 fallback_urls: Some(vec!["https://fallback/2".into()]),
+                ..Default::default()
             }]),
         };
         apply_download_overrides(&mut album, &overrides);
@@ -1288,5 +1540,64 @@ mod tests {
             pick_candidate_entry_for_tier(&list, Some("high"), 0).unwrap();
         assert_eq!(idx_high, 1);
         assert_eq!(primary_high, "https://youtube.com/watch?v=1");
+    }
+
+    #[test]
+    fn apply_candidate_to_track_sets_torrent_target_while_keeping_http_fallbacks() {
+        use crate::metadata::types::{AudioCandidate, AudioQualityTier, AudioSource};
+
+        let mut td = track("https://youtube.com/watch?v=orig", 1);
+        let candidates = vec![
+            AudioCandidate {
+                source: AudioSource::Torrent {
+                    info_hash: "aaaa1111".into(),
+                    magnet_uri: "magnet:?xt=urn:btih:aaaa1111".into(),
+                    file_index: 3,
+                    file_path: "01 Track.flac".into(),
+                    file_size: 25_000_000,
+                    seeders: 10,
+                },
+                quality_tier: AudioQualityTier::Lossless,
+                codec: "FLAC".into(),
+                bitrate_kbps: None,
+                sample_rate_hz: None,
+                duration_ms: 180_000,
+                match_confidence: 1.0,
+                is_strict_match: true,
+                display_label: "Torrent · FLAC".into(),
+                matched_title: Some("t1".into()),
+                matched_artist: None,
+            },
+            AudioCandidate {
+                source: AudioSource::HttpStream {
+                    platform: "youtube".into(),
+                    url: "https://youtube.com/watch?v=orig".into(),
+                    format_id: None,
+                    direct_stream_url: None,
+                    expires_at: None,
+                },
+                quality_tier: AudioQualityTier::HighLossy,
+                codec: "Opus".into(),
+                bitrate_kbps: Some(160),
+                sample_rate_hz: Some(48_000),
+                duration_ms: 180_000,
+                match_confidence: 0.98,
+                is_strict_match: true,
+                display_label: "YouTube · Opus".into(),
+                matched_title: Some("t1".into()),
+                matched_artist: None,
+            },
+        ];
+
+        apply_candidate_to_track(&mut td, &candidates, Some("source:torrent:lossless"), 0);
+        assert_eq!(td.url, "https://youtube.com/watch?v=orig");
+        assert_eq!(td.fallback_urls, vec!["https://youtube.com/watch?v=orig".to_string()]);
+        let tt = td.torrent_target.as_ref().expect("torrent target set");
+        assert_eq!(tt.file_index, 3);
+        assert_eq!(tt.info_hash, "aaaa1111");
+
+        apply_candidate_to_track(&mut td, &candidates, Some("source:youtube:high"), 0);
+        assert!(td.torrent_target.is_none());
+        assert_eq!(td.url, "https://youtube.com/watch?v=orig");
     }
 }

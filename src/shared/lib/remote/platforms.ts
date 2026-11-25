@@ -24,8 +24,11 @@ const PLATFORM_LABELS: Record<Platform, string> = {
 };
 
 /** Human-readable platform name; unknown values are returned as-is. */
-export const platformLabel = (platform: Platform | string): string =>
-  PLATFORM_LABELS[platform.toLowerCase() as Platform] ?? platform;
+export const platformLabel = (platform: Platform | string): string => {
+  const lower = platform.toLowerCase();
+  if (lower === "torrent") return "Torrent";
+  return PLATFORM_LABELS[lower as Platform] ?? platform;
+};
 
 /** Label of a filter pill ("All" -> "All Platforms"). */
 export const platformFilterLabel = (filter: PlatformFilter): string =>

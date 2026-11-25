@@ -145,6 +145,7 @@ pub async fn parse_track(track_url: &str) -> Result<(TrackDownload, Option<Strin
         source_item_id,
         duration_ms,
         fallback_urls: Vec::new(),
+        ..Default::default()
     };
 
     Ok((track, meta.external_cover_url))
@@ -404,6 +405,7 @@ fn parse_tracks_from_html(html: &str, base_url: &str) -> Result<Vec<TrackDownloa
             source_item_id,
             duration_ms: duration_map.get(relative_path).copied(),
             fallback_urls: Vec::new(),
+            ..Default::default()
         });
 
         track_count += 1;

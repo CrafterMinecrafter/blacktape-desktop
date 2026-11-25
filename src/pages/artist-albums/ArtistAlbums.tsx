@@ -71,7 +71,7 @@ import {
 } from "./artistAlbumsDownloads.ts";
 
 const ArtistAlbums = () => {
-  const { selectedTab, tabs, albums, activeDownloads, cancelDownload, scrollToAlbum, setScrollToAlbum } =
+  const { selectedTab, tabs, albums, activeDownloads, cancelDownload, dismissDownload, scrollToAlbum, setScrollToAlbum } =
     useLibraryStore();
   const containerRef = useRef<HTMLDivElement>(null);
   const { startPlayback } = useAudioStore();
@@ -187,7 +187,7 @@ const ArtistAlbums = () => {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setSelection(EMPTY_SELECTION);
+      if (e.key === "Escape" && !useModalStore.getState().isOpen) setSelection(EMPTY_SELECTION);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -303,7 +303,7 @@ const ArtistAlbums = () => {
               trackUrls: songs.map((s) => `resolve:song:${s.id}`),
             },
             {
-              start: (format) => {
+              start: (format, overrides) => {
                 void useLibraryStore.getState().startDownload({
                   platform: "youtube",
                   downloadType: songs.length === 1 ? ItemType.Track : ItemType.Album,
@@ -323,6 +323,7 @@ const ArtistAlbums = () => {
                         }
                       : undefined,
                   format,
+                  overrides,
                 });
               },
             },
@@ -504,7 +505,7 @@ const ArtistAlbums = () => {
                 trackUrls: songs.map((s) => `resolve:song:${s.id}`),
               },
               {
-                start: (format) => {
+                start: (format, overrides) => {
                   void useLibraryStore.getState().startDownload({
                     platform: "youtube",
                     downloadType: songs.length === 1 ? ItemType.Track : ItemType.Album,
@@ -524,6 +525,7 @@ const ArtistAlbums = () => {
                           }
                         : undefined,
                     format,
+                    overrides,
                   });
                 },
               },
@@ -608,7 +610,7 @@ const ArtistAlbums = () => {
                     trackUrls: album.songs.map((s) => `resolve:song:${s.id}`),
                   },
                   {
-                    start: (format) => {
+                    start: (format, overrides) => {
                       void useLibraryStore.getState().startDownload({
                         platform: "youtube",
                         downloadType: ItemType.Album,
@@ -618,6 +620,7 @@ const ArtistAlbums = () => {
                         coverUrl: album.songs[0]?.cover_url ?? undefined,
                         trackUrls: album.songs.map((s) => `resolve:song:${s.id}`),
                         format,
+                        overrides,
                       });
                     },
                   },
@@ -640,7 +643,7 @@ const ArtistAlbums = () => {
               artistName: selectedTab,
               title: album.title,
             },
-            { start: (format) => void downloadMissing(album.title, format) },
+            { start: (format, overrides) => void downloadMissing(album.title, format, overrides) },
           );
         },
         find: () =>
@@ -746,6 +749,17 @@ const ArtistAlbums = () => {
     return map;
   }, [activeDownloads]);
 
+  const failedArtistDownloads = useMemo(() => {
+    if (!selectedTab) return [];
+    const normArtist = selectedTab.trim().toLowerCase();
+    const latestByUrl = new Map<string, (typeof activeDownloads)[string]>();
+    for (const d of Object.values(activeDownloads)) {
+      if (d.artistName.trim().toLowerCase() !== normArtist) continue;
+      latestByUrl.set(d.url, d);
+    }
+    return [...latestByUrl.values()].filter((d) => d.status === "failed");
+  }, [activeDownloads, selectedTab]);
+
   // A running download of a linked album shows its songs inside the library album: open that album's rows.
   useEffect(() => {
     if (!selectedTab || !missingReady) return;
@@ -847,6 +861,22 @@ const ArtistAlbums = () => {
       }}
     >
       <h1 className={clsx(styles.artistName, "truncate")}>{selectedTab}</h1>
+      {failedArtistDownloads.map((failed) => (
+        <div key={failed.id} className={styles.downloadErrorBanner} role="alert">
+          <span>
+            <strong>{decodeHtmlEntities(failed.albumTitle || "Download")}:</strong>{" "}
+            {failed.message || "Download failed."}
+          </span>
+          <button
+            type="button"
+            className={styles.downloadErrorDismiss}
+            onClick={() => dismissDownload(failed.id)}
+            aria-label="Dismiss error"
+          >
+            Dismiss
+          </button>
+        </div>
+      ))}
       <div className={styles.albums}>
         {/* Downloading Albums (rendered through the same albumBlock layout so transitioning at track 1 is seamless) */}
         {activeArtistDownloads.map((download) => {

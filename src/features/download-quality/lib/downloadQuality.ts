@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { TorrentTierResolution } from "@/shared/lib/audio.ts";
 import { audioTierRank, type AlbumTrackInfo } from "@/shared/lib/remote/albumPreview.ts";
 import type { Platform } from "@/shared/types.ts";
+import type { AudioCandidate } from "@/shared/types/canonical.ts";
 
 /** Mirrors the Rust `quality::AudioFormat` (snake_case on the wire). */
 export interface AudioFormat {
@@ -22,6 +24,8 @@ interface CanonicalQualityOption {
   isBest?: boolean;
   lossless?: boolean;
   upgradableCount?: number;
+  warning?: string | null;
+  disabled?: boolean;
 }
 
 export interface CanonicalQualityPlan {
@@ -146,13 +150,127 @@ export function extractResolveSongIds(
   return ids;
 }
 
+export function tierSuffixFor(tier: string): string {
+  switch (tier) {
+    case "lossless":
+      return ":lossless";
+    case "high_lossy":
+      return ":high";
+    case "standard_lossy":
+      return ":standard";
+    case "low":
+      return ":low";
+    default:
+      return "";
+  }
+}
+
+export function formatByteSize(bytes: number | null | undefined): string | null {
+  if (!bytes || bytes <= 0) return null;
+  const mb = bytes / (1024 * 1024);
+  if (mb >= 1024) {
+    return `~${(mb / 1024).toFixed(1)} GB`;
+  }
+  return `~${Math.max(1, Math.round(mb))} MB`;
+}
+
+function compareCandidates(a: AudioCandidate, b: AudioCandidate): number {
+  if (a.is_strict_match !== b.is_strict_match) {
+    return a.is_strict_match ? -1 : 1;
+  }
+  const rankDiff = audioTierRank(b.quality_tier) - audioTierRank(a.quality_tier);
+  if (rankDiff !== 0) return rankDiff;
+
+  // At equal lossless fidelity, prefer instant HTTP direct streams (e.g. Bandcamp free FLAC) over P2P torrents.
+  if (a.source.kind !== b.source.kind && a.quality_tier === "lossless") {
+    return a.source.kind === "http_stream" ? -1 : 1;
+  }
+
+  const bitrateDiff = (b.bitrate_kbps ?? 0) - (a.bitrate_kbps ?? 0);
+  if (bitrateDiff !== 0) return bitrateDiff;
+
+  return (b.match_confidence ?? 0) - (a.match_confidence ?? 0);
+}
+
+/** Merges matched candidates from resolved torrent releases onto tracks and ranks best sources first. Pure. */
+export function mergeTorrentResolutionsIntoTracks(
+  tracks: readonly AlbumTrackInfo[],
+  resolutions: readonly TorrentTierResolution[],
+): AlbumTrackInfo[] {
+  if (resolutions.length === 0) return [...tracks];
+
+  const byIndex = new Map<number, AudioCandidate[]>();
+  for (const res of resolutions) {
+    if (res.matched_count === 0) continue;
+    for (const entry of res.tracks) {
+      const list = byIndex.get(entry.expected_index) ?? [];
+      list.push(entry.candidate);
+      byIndex.set(entry.expected_index, list);
+    }
+  }
+  if (byIndex.size === 0) return [...tracks];
+
+  if (tracks.length === 0) {
+    const out: AlbumTrackInfo[] = [];
+    for (const [index, cands] of [...byIndex.entries()].sort((a, b) => a[0] - b[0])) {
+      const sorted = [...cands].sort(compareCandidates);
+      const top = sorted[0];
+      out.push({
+        index,
+        title: top?.matched_title ?? `Track ${index + 1}`,
+        artists: top?.matched_artist ? [top.matched_artist] : [],
+        track_number: index + 1,
+        url: top?.source.kind === "torrent" ? top.source.magnet_uri : "",
+        available: sorted.length > 0,
+        note: null,
+        candidates: sorted,
+        selected_candidate_idx: 0,
+      });
+    }
+    return out;
+  }
+
+  return tracks.map((track) => {
+    const incoming = byIndex.get(track.index);
+    if (!incoming || incoming.length === 0) return track;
+
+    const existing = track.candidates ?? [];
+    const merged: AudioCandidate[] = [...existing];
+    for (const cand of incoming) {
+      if (cand.source.kind === "torrent") {
+        const { info_hash, file_index } = cand.source;
+        const alreadyPresent = merged.some(
+          (m) =>
+            m.source.kind === "torrent" &&
+            m.source.info_hash === info_hash &&
+            m.source.file_index === file_index,
+        );
+        if (!alreadyPresent) merged.push(cand);
+      } else {
+        merged.push(cand);
+      }
+    }
+    merged.sort(compareCandidates);
+    const top = merged[0];
+    const nextUrl =
+      track.url || (top?.source.kind === "http_stream" ? top.source.url : top?.source.kind === "torrent" ? top.source.magnet_uri : "");
+    return {
+      ...track,
+      available: track.available || merged.length > 0,
+      url: nextUrl,
+      candidates: merged,
+    };
+  });
+}
+
 /**
- * Builds the `Automatic Best Quality` card + discovered multi-source stream rows from `tracks`.
+ * Builds the `Automatic Best Quality` card + discovered multi-source stream & torrent rows from `tracks`.
  * Honest: never claims "lossless" unless an actual Lossless candidate was resolved. Pure.
  */
 export function buildCanonicalQualityPlan(
   tracks: readonly AlbumTrackInfo[],
   selectedUrls?: readonly string[],
+  torrentResolutions?: readonly TorrentTierResolution[],
 ): CanonicalQualityPlan {
   const activeTracks = tracks.filter((t) => {
     if (!t.available || !t.url) return false;
@@ -275,35 +393,64 @@ export function buildCanonicalQualityPlan(
     (a, b) => b.tierRank - a.tierRank || b.count - a.count || a.platform.localeCompare(b.platform),
   );
 
+  const torrentByBucket = new Map<string, TorrentTierResolution>();
+  for (const res of torrentResolutions ?? []) {
+    torrentByBucket.set(`torrent::${res.tier}`, res);
+  }
+
   const options: CanonicalQualityOption[] = sortedSources.map((src) => {
-    const tierSuffix =
-      src.tier === "lossless"
-        ? ":lossless"
-        : src.tier === "standard_lossy"
-          ? ":standard"
-          : src.tier === "high_lossy"
-            ? ":high"
-            : "";
+    const tierSuffix = tierSuffixFor(src.tier);
+    const torrentRes = src.platform === "torrent" ? torrentByBucket.get(`torrent::${src.tier}`) : undefined;
     const coverage =
       totalCount > 1 ? `${src.count}/${totalCount} tracks` : "Verified candidate";
-    const details = anyHasLocalTier
-      ? src.upgradableCount === 0
-        ? `${coverage} · Already at equal or higher quality`
-        : src.upgradableCount < totalCount
-          ? `Upgrades ${src.upgradableCount}/${totalCount} tracks (${totalCount - src.upgradableCount} skipped)`
-          : totalCount > 1
-            ? `Upgrades ${src.upgradableCount}/${totalCount} tracks`
-            : "Upgrades existing file"
-      : coverage;
+    const metaParts: string[] = [];
+    if (anyHasLocalTier) {
+      metaParts.push(
+        src.upgradableCount === 0
+          ? `${coverage} · Already at equal or higher quality`
+          : src.upgradableCount < totalCount
+            ? `Upgrades ${src.upgradableCount}/${totalCount} tracks (${totalCount - src.upgradableCount} skipped)`
+            : totalCount > 1
+              ? `Upgrades ${src.upgradableCount}/${totalCount} tracks`
+              : "Upgrades existing file",
+      );
+    } else {
+      metaParts.push(coverage);
+    }
+    if (torrentRes) {
+      const size = formatByteSize(torrentRes.total_matched_bytes);
+      if (size) metaParts.push(size);
+      if (torrentRes.seeders != null) {
+        metaParts.push(`${torrentRes.seeders} seeder${torrentRes.seeders === 1 ? "" : "s"}`);
+      } else {
+        metaParts.push(torrentRes.provider);
+      }
+    }
     return {
       id: `source:${src.platform}${tierSuffix}`,
-      label: tierDisplayLabel(src.codec, src.tier, src.bitrate),
-      details,
+      label: torrentRes?.display_label ?? tierDisplayLabel(src.codec, src.tier, src.bitrate),
+      details: metaParts.join(" · "),
       platform: src.platform,
       lossless: src.tier === "lossless",
       upgradableCount: anyHasLocalTier ? src.upgradableCount : undefined,
+      warning: torrentRes?.layout_warning ?? null,
     };
   });
+
+  // Include unsplit CUE-image notices at the end of options as informational disabled cards.
+  for (const res of torrentResolutions ?? []) {
+    if (res.matched_count === 0 && res.layout_warning) {
+      options.push({
+        id: `torrent-notice:${res.info_hash}`,
+        label: res.display_label,
+        details: `${res.provider}${res.seeders != null ? ` · ${res.seeders} seeders` : ""}`,
+        platform: "torrent",
+        lossless: res.tier === "lossless",
+        warning: res.layout_warning,
+        disabled: true,
+      });
+    }
+  }
 
   const bestDetails = anyHasLocalTier
     ? bestUpgradableCount === 0

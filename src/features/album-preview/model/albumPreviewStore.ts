@@ -160,20 +160,18 @@ export function buildDownloadOverrides(preview: AlbumPreview): DownloadOverrides
           : 0;
       const chosen = cands[chosenIdx];
       const chosenUrl =
-        chosen?.source.kind === "http_stream"
-          ? chosen.source.url
-          : chosen?.source.kind === "torrent"
-            ? chosen.source.magnet_uri
-            : track.url;
+        chosen?.source.kind === "http_stream" ? chosen.source.url : track.url;
       const fallbacks = cands
         .filter((_, idx) => idx !== chosenIdx)
-        .map((c) => (c.source.kind === "http_stream" ? c.source.url : c.source.kind === "torrent" ? c.source.magnet_uri : ""))
+        .map((c) => (c.source.kind === "http_stream" ? c.source.url : ""))
         .filter((u) => u !== "" && u !== chosenUrl);
       return {
         index: track.index,
         title: track.title,
         url: chosenUrl || track.url,
         fallback_urls: fallbacks,
+        candidates: cands.length > 0 ? cands : undefined,
+        selected_candidate_idx: cands.length > 0 ? chosenIdx : undefined,
       };
     }),
   };

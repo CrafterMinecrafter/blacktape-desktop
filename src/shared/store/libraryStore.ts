@@ -6,6 +6,7 @@ import { createLatestGuard } from "@/shared/lib/search/searchGuard.ts";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { Album, ArtistSummary, Platform } from "@/shared/types.ts";
+import type { AudioCandidate } from "@/shared/types/canonical.ts";
 import { findDownload, isRunning } from "@/shared/lib/library/downloadMatch.ts";
 import {
   captureFrontendError,
@@ -57,6 +58,8 @@ interface TrackOverride {
   title?: string;
   url?: string;
   fallback_urls?: string[];
+  candidates?: AudioCandidate[];
+  selected_candidate_idx?: number;
 }
 
 export interface DownloadOverrides {
@@ -177,6 +180,7 @@ interface LibraryState {
     url?: string,
   ) => Promise<void>;
   cancelDownload: (taskId: string) => Promise<void>;
+  dismissDownload: (taskId: string) => void;
 }
 
 // Only the most recently started search or artist-tab load may commit results.
@@ -774,6 +778,15 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       captureFrontendError(e, "libraryStore.cancelDownload");
     }
     set((state) => {
+      const activeDownloads = { ...state.activeDownloads };
+      delete activeDownloads[taskId];
+      return { activeDownloads };
+    });
+  },
+
+  dismissDownload: (taskId: string) => {
+    set((state) => {
+      if (!state.activeDownloads[taskId]) return {};
       const activeDownloads = { ...state.activeDownloads };
       delete activeDownloads[taskId];
       return { activeDownloads };

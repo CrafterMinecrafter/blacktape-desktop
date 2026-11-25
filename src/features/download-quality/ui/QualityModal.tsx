@@ -2,9 +2,16 @@ import { useEffect, useMemo, useState } from "react";
 import clsx from "clsx";
 import { MdCheck, MdHelpOutline } from "react-icons/md";
 import { useModalStore } from "@/shared/store/modalStore.ts";
-import { ItemType, useLibraryStore, type StartDownloadParams } from "@/shared/store/libraryStore.ts";
+import { ItemType, useLibraryStore, type DownloadOverrides, type StartDownloadParams } from "@/shared/store/libraryStore.ts";
 import { useAlbumPreviewStore } from "@/features/album-preview/model/albumPreviewStore.ts";
-import { probeUpgradeCandidates } from "@/shared/lib/audio.ts";
+import {
+  cancelTorrentInspection,
+  probeUpgradeCandidates,
+  resolveTorrentAlbum,
+  type ExpectedTorrentTrackInput,
+  type TorrentTierEstimate,
+  type TorrentTierResolution,
+} from "@/shared/lib/audio.ts";
 import type { AlbumTrackInfo } from "@/shared/lib/remote/albumPreview.ts";
 import { platformLabel } from "@/shared/lib/remote/platforms.ts";
 import { PlatformBadge } from "@/shared/ui/platform-badge/PlatformBadge.tsx";
@@ -14,8 +21,11 @@ import {
   buildCanonicalQualityPlan,
   downloadButtonLabel,
   extractResolveSongIds,
+  formatByteSize,
   formatDetails,
+  mergeTorrentResolutionsIntoTracks,
   probeAudioFormats,
+  tierSuffixFor,
   type AudioFormat,
 } from "@/features/download-quality/lib/downloadQuality.ts";
 import styles from "./quality-modal.module.css";
@@ -24,7 +34,7 @@ export interface QualityMenuOptions {
   /** Called once the download was started (e.g. the fly-to-library animation of the caller). */
   onStarted?: () => void;
   /** Starts the download in `format` instead of `startDownload({...params, format})` (album preview rows). */
-  start?: (format: string | undefined) => void;
+  start?: (format: string | undefined, overrides?: DownloadOverrides) => void;
 }
 
 interface QualityModalProps extends QualityMenuOptions {
@@ -51,6 +61,7 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
   const [picked, setPicked] = useState<string | null>(null);
   const [hintOpen, setHintOpen] = useState(false);
   const previewState = useAlbumPreviewStore((s) => s.preview);
+  const localAlbums = useLibraryStore((s) => s.albums);
   const album = isAlbumDownload(params);
   const platform = String(params.platform).toLowerCase();
 
@@ -64,14 +75,178 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
   const waitingUpgradeProbe =
     isResolveUpgrade && resolveSongIds.length > 0 && resolvedUpgradeTracks === null;
 
+  const [torrentPhase, setTorrentPhase] = useState<"idle" | "searching" | "estimated" | "done">("idle");
+  const [torrentEstimates, setTorrentEstimates] = useState<TorrentTierEstimate[]>([]);
+  const [torrentResolutions, setTorrentResolutions] = useState<TorrentTierResolution[]>([]);
+
+  const torrentScope = useMemo<{
+    artist: string;
+    title: string;
+    expected: ExpectedTorrentTrackInput[];
+  } | null>(() => {
+    if (isResolveUpgrade) {
+      const songById = new Map(localAlbums.flatMap((a) => a.songs).map((s) => [s.id, s]));
+      const matchedSongs = resolveSongIds
+        .map((id) => songById.get(id))
+        .filter((s): s is NonNullable<typeof s> => s !== undefined);
+      if (matchedSongs.length === 0) return null;
+      const distinctAlbums = new Set(
+        matchedSongs.map((s) => `${s.album_artist.toLowerCase()}::${s.album.toLowerCase()}`),
+      );
+      if (distinctAlbums.size > 1) return null;
+      const first = matchedSongs[0];
+      const searchTitle = first.album.trim() || first.title.trim();
+      const searchArtist = (first.album_artist.trim() || first.artists[0]?.trim() || "").trim();
+      if (!searchArtist || !searchTitle) return null;
+      return {
+        artist: searchArtist,
+        title: searchTitle,
+        expected: matchedSongs.map((song, idx) => ({
+          index: idx,
+          title: song.title,
+          artist: song.artists[0] ?? song.album_artist,
+          disc_number: song.disc_number ?? null,
+          track_number: song.track_number ?? null,
+          duration_ms: song.duration_ms > 0 ? song.duration_ms : null,
+        })),
+      };
+    }
+
+    if (previewState && previewState.url === params.url) {
+      const selectedSet = params.trackUrls?.length ? new Set(params.trackUrls) : null;
+      const tracks = previewState.tracks.filter(
+        (t) => t.available && (!selectedSet || selectedSet.has(t.url)),
+      );
+      if (!previewState.artist.trim() || !previewState.title.trim()) return null;
+      return {
+        artist: previewState.artist,
+        title: previewState.title,
+        expected: tracks.map((t) => ({
+          index: t.index,
+          title: t.title,
+          artist: t.artists[0] ?? previewState.artist,
+          disc_number: t.disc_number ?? null,
+          track_number: t.track_number ?? null,
+          duration_ms: t.duration_ms ?? null,
+        })),
+      };
+    }
+
+    const artist = (params.artistName ?? "").trim();
+    const title = (params.title ?? params.placement?.title ?? "").trim();
+    if (!artist || !title) return null;
+    return {
+      artist,
+      title,
+      expected:
+        album && !params.placement
+          ? []
+          : [
+              {
+                index: 0,
+                title: params.placement?.title ?? title,
+                artist,
+                track_number: params.placement?.track_number ?? null,
+              },
+            ],
+    };
+  }, [isResolveUpgrade, resolveSongIds, localAlbums, previewState, params, album]);
+
+  const torrentScopeKey = useMemo(
+    () =>
+      torrentScope
+        ? JSON.stringify([
+            torrentScope.artist,
+            torrentScope.title,
+            torrentScope.expected.map((e) => [e.index, e.title, e.disc_number, e.track_number]),
+          ])
+        : "",
+    [torrentScope],
+  );
+
+  useEffect(() => {
+    if (!torrentScope) {
+      setTorrentPhase("idle");
+      setTorrentEstimates([]);
+      setTorrentResolutions([]);
+      return;
+    }
+
+    let cancelled = false;
+    const requestId = crypto.randomUUID();
+    setTorrentPhase("searching");
+    setTorrentEstimates([]);
+    setTorrentResolutions([]);
+
+    void resolveTorrentAlbum(
+      torrentScope.artist,
+      torrentScope.title,
+      torrentScope.expected,
+      requestId,
+      (ev) => {
+        if (cancelled) return;
+        if (ev.kind === "searching") {
+          setTorrentPhase("searching");
+        } else if (ev.kind === "estimated") {
+          setTorrentEstimates(ev.estimates);
+          setTorrentPhase("estimated");
+        } else if (ev.kind === "resolved") {
+          setTorrentResolutions(ev.resolutions);
+          setTorrentPhase("done");
+        }
+      },
+    )
+      .then(([resolutions]) => {
+        if (cancelled) return;
+        setTorrentResolutions(resolutions);
+        setTorrentPhase("done");
+        if (previewState && previewState.url === params.url && resolutions.some((r) => r.matched_count > 0)) {
+          useAlbumPreviewStore.setState((state) => {
+            if (!state.preview || state.preview.url !== params.url) return state;
+            return {
+              preview: {
+                ...state.preview,
+                tracks: mergeTorrentResolutionsIntoTracks(state.preview.tracks, resolutions),
+              },
+            };
+          });
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setTorrentResolutions([]);
+          setTorrentPhase("done");
+        }
+      });
+
+    return () => {
+      cancelled = true;
+      void cancelTorrentInspection(requestId).catch(() => {});
+    };
+  }, [torrentScopeKey, params.url]);
+
   const canonicalPlan = useMemo(() => {
     if (!isMultiSource) return null;
-    if (isResolveUpgrade) {
-      return buildCanonicalQualityPlan(resolvedUpgradeTracks ?? []);
-    }
-    const tracks = previewState && previewState.url === params.url ? previewState.tracks : [];
-    return buildCanonicalQualityPlan(tracks, params.trackUrls);
-  }, [isMultiSource, isResolveUpgrade, resolvedUpgradeTracks, previewState, params.url, params.trackUrls]);
+    const baseTracks = isResolveUpgrade
+      ? (resolvedUpgradeTracks ?? [])
+      : previewState && previewState.url === params.url
+        ? previewState.tracks
+        : [];
+    const mergedTracks = mergeTorrentResolutionsIntoTracks(baseTracks, torrentResolutions);
+    return buildCanonicalQualityPlan(
+      mergedTracks,
+      isResolveUpgrade ? undefined : params.trackUrls,
+      torrentResolutions,
+    );
+  }, [
+    isMultiSource,
+    isResolveUpgrade,
+    resolvedUpgradeTracks,
+    previewState,
+    params.url,
+    params.trackUrls,
+    torrentResolutions,
+  ]);
 
   const pickedCanonicalOption = useMemo(() => {
     if (!isMultiSource || !canonicalPlan) return null;
@@ -97,6 +272,7 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
         .catch(() => {
           if (!cancelled) setResolvedUpgradeTracks([]);
         });
+
       return () => {
         cancelled = true;
       };
@@ -114,6 +290,7 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
         setError(String(e));
         setFormats([]);
       });
+
     return () => {
       cancelled = true;
     };
@@ -121,14 +298,98 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
 
   const download = () => {
     const format = picked ?? undefined;
-    if (start) start(format);
-    else void startDownload({ ...params, format });
+    let overrides: DownloadOverrides | undefined = params.overrides;
+    if (torrentResolutions.some((r) => r.matched_count > 0)) {
+      if (isResolveUpgrade) {
+        const merged = mergeTorrentResolutionsIntoTracks(resolvedUpgradeTracks ?? [], torrentResolutions);
+        overrides = {
+          ...params.overrides,
+          tracks: merged.map((t) => ({
+            index: t.index,
+            title: t.title,
+            candidates: t.candidates,
+            selected_candidate_idx: t.selected_candidate_idx ?? 0,
+          })),
+        };
+      } else if (previewState && previewState.url === params.url) {
+        const merged = mergeTorrentResolutionsIntoTracks(previewState.tracks, torrentResolutions);
+        overrides = {
+          ...params.overrides,
+          title: previewState.title,
+          artist: previewState.artist,
+          year: previewState.year ?? null,
+          tracks: merged.map((t) => ({
+            index: t.index,
+            title: t.title,
+            candidates: t.candidates,
+            selected_candidate_idx: t.selected_candidate_idx ?? 0,
+          })),
+        };
+      } else {
+        const byIndex = new Map<number, NonNullable<DownloadOverrides["tracks"]>[number]>();
+        for (const res of torrentResolutions) {
+          if (res.matched_count === 0) continue;
+          for (const entry of res.tracks) {
+            const cur = byIndex.get(entry.expected_index) ?? {
+              index: entry.expected_index,
+              candidates: [],
+              selected_candidate_idx: 0,
+            };
+            cur.candidates = [...(cur.candidates ?? []), entry.candidate];
+            byIndex.set(entry.expected_index, cur);
+          }
+        }
+        if (byIndex.size > 0) {
+          overrides = { ...params.overrides, tracks: [...byIndex.values()] };
+        }
+      }
+    }
+
+    if (start) start(format, overrides);
+    else void startDownload({ ...params, format, overrides });
     onStarted?.();
     closeModal();
   };
 
   const onlyLossy = formats !== null && formats.length > 0 && !formats.some((f) => f.lossless);
   const showBandcampHint = !isMultiSource && platform === "bandcamp" && (onlyLossy || error !== null);
+
+  const torrentPendingBlock =
+    torrentPhase === "searching" ? (
+      <div className={clsx(styles.option, styles.optionDisabled)} role="status">
+        <span className={styles.miniSpinner} aria-hidden="true" />
+        <span className={styles.optionText}>
+          <span className={styles.optionLabel}>
+            <PlatformBadge platform="torrent" />
+            <span>Lossless / MP3 320 kbps</span>
+          </span>
+          <span className={styles.muted}>Searching torrent sources and matching tracks…</span>
+        </span>
+      </div>
+    ) : torrentPhase === "estimated" && torrentEstimates.length > 0 ? (
+      <>
+        {torrentEstimates.map((est) => {
+          const size = formatByteSize(est.size_bytes);
+          const metaParts = [
+            "Matching files…",
+            size,
+            est.seeders != null ? `${est.seeders} seeder${est.seeders === 1 ? "" : "s"}` : est.provider,
+          ].filter(Boolean);
+          return (
+            <div key={`${est.tier}:${est.release_title}`} className={clsx(styles.option, styles.optionDisabled)} role="status">
+              <span className={styles.miniSpinner} aria-hidden="true" />
+              <span className={styles.optionText}>
+                <span className={styles.optionLabel}>
+                  <PlatformBadge platform="torrent" />
+                  <span>{est.label}</span>
+                </span>
+                <span className={styles.muted}>{metaParts.join(" · ")}</span>
+              </span>
+            </div>
+          );
+        })}
+      </>
+    ) : null;
 
   return (
     <div className={styles.container}>
@@ -173,12 +434,12 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
             </span>
           </button>
 
-          {canonicalPlan.options.length > 0 && (
+          {(canonicalPlan.options.length > 0 || torrentPendingBlock !== null) && (
             <>
               <div className={styles.sectionDivider}>
                 <span>
                   {canonicalPlan.hasDiscoveredCandidates
-                    ? "Discovered streams by platform"
+                    ? "Discovered sources by platform"
                     : "Quality presets"}
                 </span>
               </div>
@@ -188,8 +449,15 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
                   type="button"
                   role="radio"
                   aria-checked={picked === opt.id}
-                  className={clsx(styles.option, picked === opt.id && styles.picked)}
-                  onClick={() => setPicked(opt.id)}
+                  disabled={opt.disabled}
+                  className={clsx(
+                    styles.option,
+                    picked === opt.id && styles.picked,
+                    opt.disabled && styles.optionDisabled,
+                  )}
+                  onClick={() => {
+                    if (!opt.disabled) setPicked(opt.id);
+                  }}
                 >
                   <span className={styles.radio} aria-hidden="true">
                     {picked === opt.id && <MdCheck />}
@@ -200,9 +468,11 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
                       <span>{opt.label}</span>
                     </span>
                     {opt.details && <span className={styles.muted}>{opt.details}</span>}
+                    {opt.warning && <span className={styles.optionWarn}>{opt.warning}</span>}
                   </span>
                 </button>
               ))}
+              {torrentPendingBlock}
             </>
           )}
         </div>
@@ -214,7 +484,7 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
             <span className={styles.muted}>{PROBE_WAIT_TEXT}</span>
           </span>
         </div>
-      ) : formats.length > 0 ? (
+      ) : formats.length > 0 || torrentResolutions.length > 0 || torrentPendingBlock !== null ? (
         <div className={styles.list} role="radiogroup" aria-label="Formats">
           {formats.map((format, i) => (
             <button
@@ -242,6 +512,60 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
               </span>
             </button>
           ))}
+          {(torrentResolutions.length > 0 || torrentPendingBlock !== null) && (
+            <>
+              <div className={styles.sectionDivider}>
+                <span>Torrents</span>
+              </div>
+              {torrentResolutions.map((res) => {
+                const isCueOnly = res.matched_count === 0 && !!res.layout_warning;
+                const optId = isCueOnly
+                  ? `torrent-notice:${res.info_hash}`
+                  : `source:torrent${tierSuffixFor(res.tier)}`;
+                const metaParts = [
+                  res.total_expected > 1
+                    ? `${res.matched_count}/${res.total_expected} tracks`
+                    : res.matched_count > 0
+                      ? "Verified match"
+                      : null,
+                  formatByteSize(res.total_matched_bytes),
+                  res.seeders != null
+                    ? `${res.seeders} seeder${res.seeders === 1 ? "" : "s"}`
+                    : res.provider,
+                ].filter(Boolean);
+                return (
+                  <button
+                    key={optId}
+                    type="button"
+                    role="radio"
+                    aria-checked={picked === optId}
+                    disabled={isCueOnly}
+                    className={clsx(
+                      styles.option,
+                      picked === optId && styles.picked,
+                      isCueOnly && styles.optionDisabled,
+                    )}
+                    onClick={() => {
+                      if (!isCueOnly) setPicked(optId);
+                    }}
+                  >
+                    <span className={styles.radio} aria-hidden="true">
+                      {picked === optId && <MdCheck />}
+                    </span>
+                    <span className={styles.optionText}>
+                      <span className={styles.optionLabel}>
+                        <PlatformBadge platform="torrent" />
+                        <span>{res.display_label}</span>
+                      </span>
+                      {metaParts.length > 0 && <span className={styles.muted}>{metaParts.join(" · ")}</span>}
+                      {res.layout_warning && <span className={styles.optionWarn}>{res.layout_warning}</span>}
+                    </span>
+                  </button>
+                );
+              })}
+              {torrentPendingBlock}
+            </>
+          )}
         </div>
       ) : (
         <span className={styles.error}>

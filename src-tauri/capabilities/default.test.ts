@@ -11,3 +11,15 @@ describe("Tauri default capabilities", () => {
     expect(json.permissions).toContain("core:window:allow-show");
   });
 });
+
+describe("torrent capability", () => {
+  it("grants the main window only the metadata commands used by the frontend bridge", () => {
+    const capability = JSON.parse(fs.readFileSync(path.resolve(__dirname, "torrent.json"), "utf8"));
+    const bridge = fs.readFileSync(path.resolve(__dirname, "../../src/shared/lib/audio.ts"), "utf8");
+    const invokes = [...bridge.matchAll(/invoke\("plugin:torrent\|([a-z_]+)"/g)]
+      .map(([, command]) => `torrent:allow-${command.replaceAll("_", "-")}`);
+    expect(capability.windows).toEqual(["main"]);
+    expect(invokes).toHaveLength(4);
+    expect(capability.permissions).toEqual(invokes);
+  });
+});

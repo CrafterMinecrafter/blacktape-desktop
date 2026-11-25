@@ -204,7 +204,7 @@ const MissingTrackRow = ({
               onChooseQuality={() =>
                 openQualityMenu(
                   { ...missingDownloadParams(missing, [track.url]), title },
-                  { start: (format) => void downloadOne(album, track, format) },
+                  { start: (format, overrides) => void downloadOne(album, track, format, overrides) },
                 )
               }
             />

@@ -524,6 +524,8 @@ describe("download formats", () => {
           title: "Edited Track",
           url: "https://bc/1",
           fallback_urls: ["https://yt/1"],
+          candidates: preview.tracks[0].candidates,
+          selected_candidate_idx: 1,
         },
       ],
     });

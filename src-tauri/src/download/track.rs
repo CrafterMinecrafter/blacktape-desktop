@@ -28,6 +28,10 @@ pub async fn process_track_url(
         Some(r) => r.format(task_id).await,
         None => None,
     };
+    let task_overrides = match &registry {
+        Some(r) => r.overrides(task_id).await,
+        None => None,
+    };
     let replace_song_id = match &registry {
         Some(r) => r.replace_song_id(task_id).await,
         None => None,
@@ -60,12 +64,24 @@ pub async fn process_track_url(
             .cloned()
             .unwrap_or_else(|| existing_song.album_artist.clone());
 
-        let candidates = crate::resolver::resolve_candidates_for_track(
+        let mut candidates = crate::resolver::resolve_candidates_for_track(
             &search_artist,
             &existing_song.title,
             existing_song.duration_ms,
         )
         .await;
+        if let Some(ref ov_list) = task_overrides.as_ref().and_then(|o| o.tracks.as_ref()) {
+            if let Some(ov) = ov_list.first() {
+                if let Some(ref ov_cands) = ov.candidates {
+                    for cand in ov_cands {
+                        if !candidates.iter().any(|c| c.source == cand.source) {
+                            candidates.push(cand.clone());
+                        }
+                    }
+                    crate::resolver::arbiter::rank_candidates(&mut candidates);
+                }
+            }
+        }
 
         let local_exists = std::path::Path::new(&existing_song.path).exists();
         let chosen = crate::download::album::pick_candidate_entry_for_tier(
@@ -101,30 +117,8 @@ pub async fn process_track_url(
             return Ok((PathBuf::from(output_dir), Vec::new(), None));
         }
 
-        let (mut primary_url, mut fallback_urls) = match chosen {
-            Some((_, primary, fallbacks)) => (primary, fallbacks),
-            None => (String::new(), Vec::new()),
-        };
-
-        if let Some(ref orig_url) = existing_song.source_url {
-            if orig_url.starts_with("http://") || orig_url.starts_with("https://") {
-                if primary_url.is_empty() {
-                    primary_url = orig_url.clone();
-                } else if orig_url != &primary_url && !fallback_urls.contains(orig_url) {
-                    fallback_urls.push(orig_url.clone());
-                }
-            }
-        }
-
-        if primary_url.is_empty() {
-            return Err(format!(
-                "Could not find a matching stream on YouTube, Bandcamp, or SoundCloud for '{}'.",
-                existing_song.title
-            ));
-        }
-
-        let td = crate::download::types::TrackDownload {
-            url: primary_url,
+        let mut td = crate::download::types::TrackDownload {
+            url: String::new(),
             file_name: String::new(),
             title: existing_song.title.clone(),
             artists: existing_song.artists.clone(),
@@ -139,18 +133,59 @@ pub async fn process_track_url(
             release_year: existing_song.release_year,
             source_item_id: None,
             duration_ms: Some(existing_song.duration_ms),
-            fallback_urls,
+            fallback_urls: Vec::new(),
+            ..Default::default()
         };
+
+        let _ = crate::download::album::apply_candidate_to_track(
+            &mut td,
+            &candidates,
+            effective_format.as_deref(),
+            0,
+        );
+
+        if let Some(ref orig_url) = existing_song.source_url {
+            if orig_url.starts_with("http://") || orig_url.starts_with("https://") {
+                if td.url.is_empty() {
+                    td.url = orig_url.clone();
+                } else if orig_url != &td.url && !td.fallback_urls.contains(orig_url) {
+                    td.fallback_urls.push(orig_url.clone());
+                }
+            }
+        }
+
+        if td.url.is_empty() && td.torrent_target.is_none() {
+            return Err(format!(
+                "Could not find a matching stream on YouTube, Bandcamp, or SoundCloud for '{}'.",
+                existing_song.title
+            ));
+        }
+
         (td, existing_song.external_cover_url)
     } else {
-        match platform {
+        let mut parsed = match platform {
             Platform::Bandcamp => bandcamp::parse_track(url).await?,
             Platform::Youtube => youtube::parse_track(url).await?,
             Platform::Soundcloud => soundcloud::parse_track(url).await?,
             Platform::Local => {
                 return Err("Local files cannot be processed via remote URL pipelines.".into());
             }
+        };
+        if let Some(ref ov_list) = task_overrides.as_ref().and_then(|o| o.tracks.as_ref()) {
+            if let Some(ov) = ov_list.first() {
+                if let Some(ref ov_cands) = ov.candidates {
+                    if !ov_cands.is_empty() {
+                        let _ = crate::download::album::apply_candidate_to_track(
+                            &mut parsed.0,
+                            ov_cands,
+                            effective_format.as_deref(),
+                            ov.selected_candidate_idx.unwrap_or(0),
+                        );
+                    }
+                }
+            }
         }
+        parsed
     };
 
     // The library already has the album of this track (e.g. downloaded from another platform): file it there.
@@ -205,8 +240,45 @@ pub async fn process_track_url(
         },
     );
 
-    let (temp_file_path, downloaded_track) =
-        ytdlp::download_single(app_handle, &track_info, output_dir, task_id).await?;
+    let (temp_file_path, downloaded_track) = if let Some(ref target) = track_info.torrent_target {
+        let req = crate::torrent::download::TorrentFileRequest {
+            track_index: 0,
+            file_index: target.file_index,
+            file_size: target.file_size,
+            track: track_info.clone(),
+        };
+        let completed_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        match crate::torrent::download::download_torrent_files(
+            app_handle,
+            task_id,
+            std::path::Path::new(output_dir),
+            &target.magnet_uri,
+            &[req],
+            1,
+            completed_counter,
+            None,
+        )
+        .await
+        {
+            Ok(mut res) if !res.completed.is_empty() => {
+                let (path, track, _) = res.completed.remove(0);
+                (path, track)
+            }
+            Ok(_) | Err(_) if track_info.url.starts_with("http://") || track_info.url.starts_with("https://") => {
+                track_info.torrent_target = None;
+                ytdlp::download_single(app_handle, &track_info, output_dir, task_id).await?
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "Torrent transfer failed for '{}'.",
+                    track_info.title
+                ));
+            }
+            Err(err) => return Err(err),
+        }
+    } else {
+        ytdlp::download_single(app_handle, &track_info, output_dir, task_id).await?
+    };
 
     let mut cover_path = None;
     if let Some(cover_url) = external_cover_url {

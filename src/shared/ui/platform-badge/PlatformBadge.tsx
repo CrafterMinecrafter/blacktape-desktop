@@ -21,6 +21,7 @@ export const PlatformBadge = ({
             platform === "youtube" && styles.youtube,
             platform === "bandcamp" && styles.bandcamp,
             platform === "soundcloud" && styles.soundcloud,
+            platform === "torrent" && styles.torrent,
           ],
       className,
     )}

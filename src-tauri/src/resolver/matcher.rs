@@ -658,6 +658,7 @@ mod tests {
                 source_item_id: None,
                 duration_ms: Some(*cand_duration),
                 fallback_urls: Vec::new(),
+                ..Default::default()
             };
 
             let candidate_slice = vec![platform_track];
@@ -780,6 +781,7 @@ mod tests {
             source_item_id: None,
             duration_ms: Some(180_000),
             fallback_urls: Vec::new(),
+            ..Default::default()
         };
         let tracks = vec![
             track_proto(1, 1, "Intro", "https://u/d1t1"),

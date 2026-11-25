@@ -7,6 +7,7 @@ import {
   extractResolveSongIds,
   formatDetails,
   getExpectedQuality,
+  mergeTorrentResolutionsIntoTracks,
   probeAudioFormats,
   type AudioFormat,
 } from "./downloadQuality.ts";
@@ -282,6 +283,226 @@ describe("buildCanonicalQualityPlan", () => {
     expect(allHighPlan.best.upgradableCount).toBe(0);
     expect(allHighPlan.best.details).toBe("Already at equal or higher quality (no upgrade needed)");
     expect(allHighPlan.options[0].upgradableCount).toBe(0);
+  });
+
+  it("renders separate torrent tier cards and falls back to HTTP for missing torrent tracks in best", () => {
+    const baseTracks = [
+      {
+        index: 0,
+        title: "Track One",
+        artists: ["Artist"],
+        track_number: 1,
+        url: "https://youtube.com/watch?v=1",
+        available: true,
+        note: null,
+        selected_candidate_idx: 0,
+        candidates: [
+          {
+            source: { kind: "http_stream" as const, platform: "youtube", url: "https://youtube.com/watch?v=1" },
+            quality_tier: "high_lossy" as const,
+            codec: "Opus",
+            bitrate_kbps: 160,
+            duration_ms: 180_000,
+            match_confidence: 0.99,
+            is_strict_match: true,
+            display_label: "YouTube · Opus 160 kbps",
+          },
+        ],
+      },
+      {
+        index: 1,
+        title: "Track Two",
+        artists: ["Artist"],
+        track_number: 2,
+        url: "https://youtube.com/watch?v=2",
+        available: true,
+        note: null,
+        selected_candidate_idx: 0,
+        candidates: [
+          {
+            source: { kind: "http_stream" as const, platform: "youtube", url: "https://youtube.com/watch?v=2" },
+            quality_tier: "high_lossy" as const,
+            codec: "Opus",
+            bitrate_kbps: 160,
+            duration_ms: 180_000,
+            match_confidence: 0.99,
+            is_strict_match: true,
+            display_label: "YouTube · Opus 160 kbps",
+          },
+        ],
+      },
+    ];
+
+    const resolutions = [
+      {
+        tier: "lossless" as const,
+        info_hash: "aaaa1111",
+        magnet_uri: "magnet:?xt=urn:btih:aaaa1111",
+        release_title: "Artist - Album [FLAC]",
+        provider: "ApiBay",
+        seeders: 12,
+        codec: "FLAC",
+        bitrate_kbps: null,
+        display_label: "FLAC (Lossless)",
+        matched_count: 1,
+        total_expected: 2,
+        total_matched_bytes: 32_000_000,
+        missing_titles: ["Track Two"],
+        ambiguous_titles: [],
+        layout_warning: "Matched 1/2 tracks · 1 missing",
+        tracks: [
+          {
+            expected_index: 0,
+            candidate: {
+              source: {
+                kind: "torrent" as const,
+                info_hash: "aaaa1111",
+                magnet_uri: "magnet:?xt=urn:btih:aaaa1111",
+                file_index: 0,
+                file_path: "01 Track One.flac",
+                file_size: 32_000_000,
+                seeders: 12,
+              },
+              quality_tier: "lossless" as const,
+              codec: "FLAC",
+              duration_ms: 180_000,
+              match_confidence: 1.0,
+              is_strict_match: true,
+              display_label: "Torrent · FLAC (Lossless)",
+            },
+          },
+        ],
+      },
+      {
+        tier: "high_lossy" as const,
+        info_hash: "bbbb2222",
+        magnet_uri: "magnet:?xt=urn:btih:bbbb2222",
+        release_title: "Artist - Album [MP3 320]",
+        provider: "ApiBay",
+        seeders: 8,
+        codec: "MP3",
+        bitrate_kbps: 320,
+        display_label: "MP3 320 kbps",
+        matched_count: 2,
+        total_expected: 2,
+        total_matched_bytes: 14_000_000,
+        missing_titles: [],
+        ambiguous_titles: [],
+        layout_warning: null,
+        tracks: [
+          {
+            expected_index: 0,
+            candidate: {
+              source: {
+                kind: "torrent" as const,
+                info_hash: "bbbb2222",
+                magnet_uri: "magnet:?xt=urn:btih:bbbb2222",
+                file_index: 0,
+                file_path: "01 Track One.mp3",
+                file_size: 7_000_000,
+                seeders: 8,
+              },
+              quality_tier: "high_lossy" as const,
+              codec: "MP3",
+              bitrate_kbps: 320,
+              duration_ms: 180_000,
+              match_confidence: 1.0,
+              is_strict_match: true,
+              display_label: "Torrent · MP3 320 kbps",
+            },
+          },
+          {
+            expected_index: 1,
+            candidate: {
+              source: {
+                kind: "torrent" as const,
+                info_hash: "bbbb2222",
+                magnet_uri: "magnet:?xt=urn:btih:bbbb2222",
+                file_index: 1,
+                file_path: "02 Track Two.mp3",
+                file_size: 7_000_000,
+                seeders: 8,
+              },
+              quality_tier: "high_lossy" as const,
+              codec: "MP3",
+              bitrate_kbps: 320,
+              duration_ms: 180_000,
+              match_confidence: 1.0,
+              is_strict_match: true,
+              display_label: "Torrent · MP3 320 kbps",
+            },
+          },
+        ],
+      },
+    ];
+
+    const merged = mergeTorrentResolutionsIntoTracks(baseTracks, resolutions);
+    const plan = buildCanonicalQualityPlan(merged, undefined, resolutions);
+
+    expect(plan.best.lossless).toBe(true);
+    expect(plan.best.details).toContain("1× FLAC (Lossless) (TORRENT)");
+    expect(plan.best.details).toContain("1× MP3 320 kbps (TORRENT)");
+    expect(plan.options.map((o) => o.id)).toEqual([
+      "source:torrent:lossless",
+      "source:torrent:high",
+      "source:youtube:high",
+    ]);
+    expect(plan.options[0].warning).toContain("Matched 1/2 tracks");
+    expect(plan.options[0].details).toContain("12 seeders");
+    expect(plan.options[1].details).toContain("8 seeders");
+  });
+
+  it("synthesizes track entries for matched torrent files when baseTracks is empty", () => {
+    const merged = mergeTorrentResolutionsIntoTracks([], [
+      {
+        tier: "lossless" as const,
+        info_hash: "abc123",
+        magnet_uri: "magnet:?xt=urn:btih:abc123",
+        release_title: "The Doors - The Doors [FLAC]",
+        provider: "Archive.org",
+        seeders: 10,
+        codec: "FLAC",
+        bitrate_kbps: null,
+        display_label: "FLAC (Lossless)",
+        matched_count: 1,
+        total_expected: 1,
+        total_matched_bytes: 25_000_000,
+        missing_titles: [],
+        ambiguous_titles: [],
+        layout_warning: null,
+        tracks: [
+          {
+            expected_index: 0,
+            candidate: {
+              source: {
+                kind: "torrent" as const,
+                info_hash: "abc123",
+                magnet_uri: "magnet:?xt=urn:btih:abc123",
+                file_index: 0,
+                file_path: "01 Break On Through.flac",
+                file_size: 25_000_000,
+                seeders: 10,
+              },
+              quality_tier: "lossless" as const,
+              codec: "FLAC",
+              bitrate_kbps: undefined,
+              duration_ms: 148_000,
+              match_confidence: 0.95,
+              is_strict_match: true,
+              display_label: "Torrent · FLAC (Lossless)",
+              matched_title: "Break On Through",
+              matched_artist: "The Doors",
+            },
+          },
+        ],
+      },
+    ]);
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0].url).toBe("magnet:?xt=urn:btih:abc123");
+    expect(merged[0].candidates).toHaveLength(1);
+    expect(merged[0].candidates?.[0]?.source.kind).toBe("torrent");
+    expect(merged[0].candidates?.[0]?.quality_tier).toBe("lossless");
   });
 });
 

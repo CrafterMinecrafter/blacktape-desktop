@@ -1,11 +1,133 @@
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { Album, ArtistSummary, RepeatMode, Song } from "@/shared/types";
 import {
+  AudioCandidate,
+  AudioQualityTier,
   CanonicalRelease,
   CanonicalReleaseSummary,
   CanonicalTrack,
   ReleaseEditionOption,
 } from "@/shared/types/canonical";
+
+export interface TorrentTrack {
+  file_index: number;
+  file_path: string;
+  title: string;
+  codec: string;
+  size_bytes: number;
+  disc_number: number | null;
+  track_number: number | null;
+  is_sample?: boolean;
+}
+
+export interface TorrentReleaseHit {
+  id: string;
+  title: string;
+  input: string;
+  provider: string;
+  seeders: number | null;
+  size_bytes: number | null;
+  rank: number;
+}
+
+export interface TorrentProviderReport {
+  provider: string;
+  hits: TorrentReleaseHit[];
+  error: string | null;
+}
+
+export interface TorrentSearchReport {
+  providers: TorrentProviderReport[];
+  hits: TorrentReleaseHit[];
+}
+
+export interface InspectedTorrentRelease {
+  info_hash: string;
+  name: string;
+  layout: string;
+  tracks: TorrentTrack[];
+}
+
+export function searchTorrentReleases(
+  artist: string,
+  title: string,
+  onProvider: (report: TorrentProviderReport) => void,
+): Promise<TorrentSearchReport> {
+  const progress = new Channel<TorrentProviderReport>(onProvider);
+  return invoke("plugin:torrent|search_torrent_releases", { artist, title, progress });
+}
+
+export interface ExpectedTorrentTrackInput {
+  index: number;
+  title: string;
+  artist?: string | null;
+  disc_number?: number | null;
+  track_number?: number | null;
+  duration_ms?: number | null;
+}
+
+export interface TorrentTierEstimate {
+  tier: AudioQualityTier;
+  codec: string;
+  bitrate_kbps: number | null;
+  label: string;
+  release_title: string;
+  provider: string;
+  seeders: number | null;
+  size_bytes: number | null;
+}
+
+interface MatchedTorrentTrack {
+  expected_index: number;
+  candidate: AudioCandidate;
+}
+
+export interface TorrentTierResolution {
+  tier: AudioQualityTier;
+  info_hash: string;
+  magnet_uri: string;
+  release_title: string;
+  provider: string;
+  seeders: number | null;
+  codec: string;
+  bitrate_kbps: number | null;
+  display_label: string;
+  matched_count: number;
+  total_expected: number;
+  total_matched_bytes: number;
+  missing_titles: string[];
+  ambiguous_titles: string[];
+  layout_warning: string | null;
+  tracks: MatchedTorrentTrack[];
+}
+
+export type TorrentResolveEvent =
+  | { kind: "searching" }
+  | { kind: "estimated"; estimates: TorrentTierEstimate[] }
+  | { kind: "resolved"; resolutions: TorrentTierResolution[]; unavailable_providers: string[] };
+
+export const inspectTorrentRelease = (input: string, requestId: string): Promise<InspectedTorrentRelease> =>
+  invoke("plugin:torrent|inspect_torrent_release", { input, requestId });
+
+export function resolveTorrentAlbum(
+  artist: string,
+  title: string,
+  expected: ExpectedTorrentTrackInput[],
+  requestId: string,
+  onEvent: (event: TorrentResolveEvent) => void,
+): Promise<[TorrentTierResolution[], string[]]> {
+  const progress = new Channel<TorrentResolveEvent>(onEvent);
+  return invoke("plugin:torrent|resolve_torrent_album", {
+    artist,
+    title,
+    expected,
+    requestId,
+    progress,
+  });
+}
+
+export const cancelTorrentInspection = (requestId: string): Promise<void> =>
+  invoke("plugin:torrent|cancel_torrent_inspection", { requestId });
 
 export const scanMusic = (dir: string): Promise<Song[]> =>
   invoke<Song[]>("scan_music", { dir });

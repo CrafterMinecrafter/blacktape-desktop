@@ -8,7 +8,7 @@ import {
 import { explainFailure } from "@/features/library/model/downloadFailure.ts";
 import { sameUrl } from "@/shared/lib/remote/urlKey.ts";
 import FindAlternativeModal from "@/features/library/ui/FindAlternativeModal.tsx";
-import { useMissingTracksStore } from "@/features/library/model/missingTracksStore.ts";
+import { sourceOfAlbum, useMissingTracksStore } from "@/features/library/model/missingTracksStore.ts";
 import { ExpectedQualityBadge } from "@/features/download-quality/ui/ExpectedQualityBadge.tsx";
 import { PlatformBadge } from "@/shared/ui/platform-badge/PlatformBadge.tsx";
 import { candidateMeta } from "@/features/library/ui/missing-track-row/missingTrackRow.ts";
@@ -41,7 +41,7 @@ const FindMissingModal = ({ albumArtist, album, excludeUrl, failedSong }: FindMi
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   // the platform album the library album is linked to now (Change linked album)
-  const linked = useMissingTracksStore((s) => s.sources[album]);
+  const linked = useMissingTracksStore((s) => sourceOfAlbum(s.sources, album));
 
   const explained = failedSong
     ? explainFailure(failedSong.message ?? "no output file", failedSong.platform)

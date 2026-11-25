@@ -107,5 +107,8 @@ describe("startDownload format", () => {
     expect(entries).toHaveLength(1);
     expect(entries[0].status).toBe("failed");
     expect(entries[0].message).toBe("auth_window_closed");
+
+    useLibraryStore.getState().dismissDownload(entries[0].id);
+    expect(Object.values(useLibraryStore.getState().activeDownloads)).toHaveLength(0);
   });
 });

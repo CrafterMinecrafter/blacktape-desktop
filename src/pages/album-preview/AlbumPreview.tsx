@@ -81,6 +81,7 @@ const AlbumPreview = () => {
     downloadTrack,
   } = useAlbumPreviewStore.getState();
   const activeDownloads = useLibraryStore((s) => s.activeDownloads);
+  const dismissDownload = useLibraryStore((s) => s.dismissDownload);
   const albums = useLibraryStore((s) => s.albums);
   const playStream = useStreamStore((s) => s.play);
   const { openMenu } = useRemoteTrackMenu();
@@ -116,7 +117,7 @@ const AlbumPreview = () => {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") clearSelection();
+      if (e.key === "Escape" && !useModalStore.getState().isOpen) clearSelection();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -297,6 +298,12 @@ const AlbumPreview = () => {
         : false,
     [activeDownloads, preview],
   );
+  const failedDownload = useMemo(() => {
+    if (!preview || running) return undefined;
+    const matches = Object.values(activeDownloads).filter((d) => d.url === preview.url);
+    const latest = matches[matches.length - 1];
+    return latest?.status === "failed" ? latest : undefined;
+  }, [activeDownloads, preview, running]);
 
   const title = preview?.title ?? item?.name ?? "";
   const artist = preview?.artist ?? item?.band_name ?? "";
@@ -668,7 +675,9 @@ const AlbumPreview = () => {
                     }}
                   >
                     {running ? (
-                      `Downloading ${running.overallPercent}%`
+                      running.overallPercent > 0
+                        ? `Downloading ${running.overallPercent}%`
+                        : running.message || "Downloading 0%"
                     ) : (
                       <>
                         {action?.kind === "go-to-album" ? <BiRightArrowAlt size={20} /> : <BiDownload size={18} />}
@@ -689,9 +698,10 @@ const AlbumPreview = () => {
                           action.kind === "download-missing" ? action.urls : selectedUrls(preview, selection.selected);
                         openQualityMenu(previewDownloadParams(preview, urls), {
                           start: (format) => {
+                            const latestPreview = useAlbumPreviewStore.getState().preview ?? preview;
                             if (action.kind === "download-missing") {
                               confirmDownloadWithWarnings(
-                                preview,
+                                latestPreview,
                                 action.urls,
                                 () => void downloadUrls(action.urls, format),
                                 (verified) => void downloadUrls(verified, format),
@@ -700,7 +710,7 @@ const AlbumPreview = () => {
                               const scopeUrls =
                                 urls.length > 0 && urls.length < selectable.length ? urls : undefined;
                               confirmDownloadWithWarnings(
-                                preview,
+                                latestPreview,
                                 scopeUrls,
                                 () => clearSelectionAfter(() => download(format)),
                                 (verified) =>
@@ -788,6 +798,20 @@ const AlbumPreview = () => {
                 {selectedCount > 0 && <span className={styles.count}>{selectedCount} selected</span>}
               </div>
 
+              {failedDownload && (
+                <div className={styles.downloadErrorBanner} role="alert">
+                  <span>{failedDownload.message || "Download failed."}</span>
+                  <button
+                    type="button"
+                    className={styles.downloadErrorDismiss}
+                    onClick={() => dismissDownload(failedDownload.id)}
+                    aria-label="Dismiss error"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
+
               {switchingRelease ? (
                 renderSkeletonRows(8)
               ) : (
@@ -834,12 +858,15 @@ const AlbumPreview = () => {
                             }
                             onChooseQuality={() =>
                               openQualityMenu(previewDownloadParams(preview, [track.url], track.title), {
-                                start: (format) =>
+                                start: (format) => {
+                                  const latestPreview = useAlbumPreviewStore.getState().preview ?? preview;
+                                  const latestTrack = latestPreview.tracks.find((t) => t.index === track.index) ?? track;
                                   confirmDownloadWithWarnings(
-                                    preview,
-                                    [track.url],
-                                    () => void downloadTrack(track, format),
-                                  ),
+                                    latestPreview,
+                                    [latestTrack.url],
+                                    () => void downloadTrack(latestTrack, format),
+                                  );
+                                },
                               })
                             }
                             onSelectCandidate={(candIdx) => {

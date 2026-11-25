@@ -25,6 +25,11 @@
     color: rgba(255, 150, 80, 0.8);
 }
 
+.torrent {
+    background-color: rgba(139, 92, 246, 0.16);
+    color: rgba(196, 181, 253, 0.9);
+}
+
 .canonical {
     background-color: rgba(92, 107, 255, 0.16);
     color: rgba(160, 172, 255, 0.92);

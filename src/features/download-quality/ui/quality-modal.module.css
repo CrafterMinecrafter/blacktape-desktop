@@ -148,6 +148,31 @@
     }
 }
 
+.optionDisabled {
+    opacity: 0.65;
+    cursor: default;
+
+    &:hover {
+        background-color: transparent;
+    }
+}
+
+.miniSpinner {
+    flex-shrink: 0;
+    width: 12px;
+    height: 12px;
+    border: 2px solid rgba(255, 255, 255, 0.2);
+    border-top-color: var(--color-text);
+    border-radius: 50%;
+    animation: qualitySpin 700ms linear infinite;
+}
+
+.optionWarn {
+    color: #f5b942;
+    font-size: var(--font-sm, 12px);
+    line-height: 1.35;
+}
+
 .note {
     margin-top: 12px;
     font-size: var(--font-sm, 12px);

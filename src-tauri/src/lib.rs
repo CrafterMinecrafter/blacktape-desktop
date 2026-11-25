@@ -19,6 +19,7 @@ pub mod source_tag;
 pub mod tags;
 pub mod telemetry;
 mod thumbs;
+mod torrent;
 pub mod trash;
 pub mod types;
 pub mod utils;
@@ -1061,6 +1062,16 @@ pub fn run() {
             });
         })
         .manage(Mutex::new(None::<discord_presence::DiscordRpcClient>))
+        .plugin(
+            tauri::plugin::Builder::<_, ()>::new("torrent")
+                .invoke_handler(generate_handler![
+                    torrent::commands::search_torrent_releases,
+                    torrent::commands::inspect_torrent_release,
+                    torrent::commands::resolve_torrent_album,
+                    torrent::commands::cancel_torrent_inspection,
+                ])
+                .build(),
+        )
         .on_window_event(|window, event| {
             if quits_app(window.label(), event) {
                 window.app_handle().exit(0);
@@ -1140,6 +1151,7 @@ pub fn run() {
             }
 
             app.manage(TaskRegistry::default());
+            app.manage(torrent::commands::Inspections::default());
             let tx = download::init_queue_worker(app.handle().clone());
             app.manage(DownloadQueue { tx });
 
