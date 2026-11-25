@@ -187,6 +187,23 @@ export const resolveCanonicalCandidates = (
     fallbackArtist,
   });
 
+export const probeUpgradeCandidates = (
+  songIds: number[],
+): Promise<Array<{
+  index: number;
+  title: string;
+  artists: string[];
+  track_number: number | null;
+  disc_number?: number | null;
+  url: string;
+  available: boolean;
+  note: string | null;
+  duration_ms?: number | null;
+  candidates?: import("@/shared/types/canonical.ts").AudioCandidate[];
+  selected_candidate_idx?: number;
+}>> =>
+  invoke("probe_upgrade_candidates", { songIds });
+
 export const prewarmAlbumPreviews = (
   items: Array<[string, string]>,
 ): Promise<void> => invoke("prewarm_album_previews", { items });

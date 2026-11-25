@@ -800,7 +800,7 @@ async fn get_album_preview(
     };
 
     // Check if we already have the fully resolved release in cache
-    let cache_key = format!("release_v5:{}", canonical.id);
+    let cache_key = format!("release_v7:{}", canonical.id);
     if let Some(cached_str) = client.read_cache(&cache_key).await {
         if let Ok(mut cached_release) =
             serde_json::from_str::<crate::metadata::types::CanonicalRelease>(&cached_str)
@@ -837,7 +837,7 @@ async fn get_album_preview(
         if let Ok(serialized) = serde_json::to_string(&canonical) {
             let client = crate::metadata::MusicBrainzClient::new(cache_dir);
             client
-                .write_cache(&format!("release_v5:{}", canonical.id), &serialized)
+                .write_cache(&format!("release_v7:{}", canonical.id), &serialized)
                 .await;
         }
         let _ = app_handle.emit(
@@ -1183,9 +1183,10 @@ pub fn run() {
             metadata::commands::get_release_group_releases,
             metadata::commands::resolve_canonical_candidates,
             metadata::commands::prewarm_album_previews,
+            download::album::probe_upgrade_candidates,
             // Library index (status of remote items, missing tracks)
             library_index::commands::get_download_status,
-            library_index::commands::get_library_track_ids,
+            library_index::commands::get_library_track_details,
             library_index::commands::get_album_status,
             library_index::commands::get_library_album,
             library_index::commands::get_artist_album_sources,

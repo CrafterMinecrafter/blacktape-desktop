@@ -108,31 +108,40 @@ pub fn album_statuses(
         .collect()
 }
 
-/// Resolves library song IDs matching remote track refs (by normalized URL/item ID first,
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LibraryTrackMatch {
+    pub id: i64,
+    pub quality_tier: crate::types::QualityTier,
+    pub path: String,
+}
+
+/// Resolves library song metadata matching remote track refs (by normalized URL/item ID first,
 /// then by canonical track slug scoped to `album` when given). Pure.
-pub fn resolve_library_track_ids(
+pub fn resolve_library_tracks(
     items: &[RemoteRef],
     songs: &[crate::Song],
-) -> HashMap<String, i64> {
+) -> HashMap<String, LibraryTrackMatch> {
     use crate::library_index::candidates::normalize_text;
     use crate::library_index::normalize::item_id_key;
     use crate::utils::make_canonical_slug;
 
-    let mut by_url_key: HashMap<String, i64> = HashMap::new();
-    let mut by_id_key: HashMap<String, i64> = HashMap::new();
-    let mut by_album_slug: HashMap<(String, String), i64> = HashMap::new();
-    let mut by_slug: HashMap<String, i64> = HashMap::new();
+    let mut by_url_key: HashMap<String, usize> = HashMap::new();
+    let mut by_id_key: HashMap<String, usize> = HashMap::new();
+    let mut by_album_slug: HashMap<(String, String), usize> = HashMap::new();
+    let mut by_slug: HashMap<String, usize> = HashMap::new();
 
-    for song in songs {
-        let Some(id) = song.id else { continue };
+    for (idx, song) in songs.iter().enumerate() {
+        if song.id.is_none() {
+            continue;
+        }
         if let Some(ref su) = song.source_url {
             if let Some(k) = normalize_url_key(su) {
-                by_url_key.entry(k).or_insert(id);
+                by_url_key.entry(k).or_insert(idx);
             }
         }
         if let Some(ref sid) = song.source_item_id {
             if let Some(k) = item_id_key(song.source.clone(), sid) {
-                by_id_key.entry(k).or_insert(id);
+                by_id_key.entry(k).or_insert(idx);
             }
         }
         let slug = if song.canonical_track_slug.is_empty() {
@@ -148,14 +157,14 @@ pub fn resolve_library_track_ids(
         if !slug.is_empty() {
             by_album_slug
                 .entry((normalize_text(&song.album), slug.clone()))
-                .or_insert(id);
-            by_slug.entry(slug).or_insert(id);
+                .or_insert(idx);
+            by_slug.entry(slug).or_insert(idx);
         }
     }
 
     let mut out = HashMap::new();
     for item in items {
-        let mut matched: Option<i64> = None;
+        let mut matched: Option<usize> = None;
         if let Some(key) = normalize_url_key(&item.url) {
             matched = by_url_key.get(&key).copied().or_else(|| {
                 if item.platform == Platform::Youtube {
@@ -178,24 +187,33 @@ pub fn resolve_library_track_ids(
                 }
             }
         }
-        if let Some(id) = matched {
-            out.insert(item.url.clone(), id);
+        if let Some(idx) = matched {
+            if let Some(id) = songs[idx].id {
+                out.insert(
+                    item.url.clone(),
+                    LibraryTrackMatch {
+                        id,
+                        quality_tier: songs[idx].quality_tier,
+                        path: songs[idx].path.clone(),
+                    },
+                );
+            }
         }
     }
     out
 }
 
-/// Library song IDs matching remote TRACK refs. Keyed by `item.url` as sent.
+/// Library song IDs and stored quality metadata matching remote TRACK refs. Keyed by `item.url` as sent.
 #[command]
-pub async fn get_library_track_ids(
+pub async fn get_library_track_details(
     db: State<'_, tokio::sync::Mutex<Database>>,
     items: Vec<RemoteRef>,
-) -> Result<HashMap<String, i64>, String> {
+) -> Result<HashMap<String, LibraryTrackMatch>, String> {
     let songs = {
         let guard = db.lock().await;
         guard.get_all_songs().await.map_err(db_error)?
     };
-    Ok(resolve_library_track_ids(&items, &songs))
+    Ok(resolve_library_tracks(&items, &songs))
 }
 
 /// Library state of remote TRACK urls. The answer is keyed by the url exactly as sent.
@@ -1102,7 +1120,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_library_track_ids_matches_by_url_and_scoped_slug() {
+    fn resolve_library_tracks_matches_by_url_and_scoped_slug() {
         use crate::Song;
         let songs = vec![
             Song {
@@ -1145,8 +1163,11 @@ mod tests {
                 album: Some("Drukqs".into()),
             },
         ];
-        let ids = resolve_library_track_ids(&refs, &songs);
-        assert_eq!(ids.get("https://youtube.com/watch?v=abc123").copied(), Some(11));
-        assert_eq!(ids.get("https://aphextwin.bandcamp.com/track/jynweythek").copied(), Some(11));
+        let details = resolve_library_tracks(&refs, &songs);
+        let yt = details.get("https://youtube.com/watch?v=abc123").expect("yt details");
+        assert_eq!(yt.id, 11);
+        assert_eq!(yt.quality_tier, crate::types::QualityTier::High);
+        assert_eq!(yt.path, "/m/11.opus");
+        assert_eq!(details.get("https://aphextwin.bandcamp.com/track/jynweythek").map(|d| d.id), Some(11));
     }
 }

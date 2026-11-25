@@ -74,8 +74,12 @@ pub struct AudioCandidate {
     pub sample_rate_hz: Option<u32>,
     pub duration_ms: u64,
     pub match_confidence: f32,     // 0.0 to 1.0 (title + duration delta)
-    pub is_strict_match: bool,     // duration delta <= 3s, explicit flags matched
+    pub is_strict_match: bool,     // duration delta <= 4s, no version/title mismatch
     pub display_label: String,     // e.g. "FLAC (Lossless) [Bandcamp]"
+    #[serde(default)]
+    pub matched_title: Option<String>,
+    #[serde(default)]
+    pub matched_artist: Option<String>,
 }
 
 /// A track in a canonical release.

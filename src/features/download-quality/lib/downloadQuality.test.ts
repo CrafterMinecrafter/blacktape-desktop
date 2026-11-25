@@ -4,6 +4,7 @@ import {
   buildCanonicalQualityPlan,
   downloadButtonLabel,
   expectedQualityOf,
+  extractResolveSongIds,
   formatDetails,
   getExpectedQuality,
   probeAudioFormats,
@@ -159,6 +160,138 @@ describe("buildCanonicalQualityPlan", () => {
     expect(plan.options.map((o) => o.id)).toEqual(["source:youtube:high", "source:bandcamp:standard"]);
     expect(plan.options[0].platform).toBe("youtube");
     expect(plan.options[1].platform).toBe("bandcamp");
+  });
+
+  it("marks discovered Bandcamp free lossless FLAC as best and includes source:bandcamp:lossless", () => {
+    const plan = buildCanonicalQualityPlan([
+      {
+        index: 0,
+        title: "In Absentia",
+        artists: ["Heaven Pierce Her"],
+        track_number: 1,
+        url: "https://heavenpierceher.bandcamp.com/track/in-absentia",
+        available: true,
+        note: null,
+        selected_candidate_idx: 0,
+        candidates: [
+          {
+            source: { kind: "http_stream", platform: "bandcamp", url: "https://heavenpierceher.bandcamp.com/track/in-absentia" },
+            quality_tier: "lossless",
+            codec: "FLAC",
+            duration_ms: 273_000,
+            match_confidence: 0.99,
+            is_strict_match: true,
+            display_label: "Bandcamp · FLAC (Lossless)",
+          },
+          {
+            source: { kind: "http_stream", platform: "youtube", url: "https://youtube.com/watch?v=1" },
+            quality_tier: "high_lossy",
+            codec: "Opus",
+            bitrate_kbps: 160,
+            duration_ms: 273_000,
+            match_confidence: 0.99,
+            is_strict_match: true,
+            display_label: "YouTube Music (Opus 160k)",
+          },
+        ],
+      },
+    ]);
+
+    expect(plan.best.lossless).toBe(true);
+    expect(plan.best.details).toContain("FLAC (Lossless) (BANDCAMP)");
+    expect(plan.options.map((o) => o.id)).toEqual(["source:bandcamp:lossless", "source:youtube:high"]);
+    expect(plan.options[0].lossless).toBe(true);
+  });
+
+  it("reports upgradableCount and skips redundant upgrades via local_tier notes", () => {
+    const plan = buildCanonicalQualityPlan([
+      {
+        index: 0,
+        title: "Already High",
+        artists: ["Artist"],
+        track_number: 1,
+        url: "resolve:song:1",
+        available: true,
+        note: "local_tier:high",
+        selected_candidate_idx: 0,
+        candidates: [
+          {
+            source: { kind: "http_stream", platform: "youtube", url: "https://youtube.com/watch?v=1" },
+            quality_tier: "high_lossy",
+            codec: "Opus",
+            bitrate_kbps: 160,
+            duration_ms: 180_000,
+            match_confidence: 0.99,
+            is_strict_match: true,
+            display_label: "YouTube · Opus 160 kbps",
+          },
+        ],
+      },
+      {
+        index: 1,
+        title: "Needs Upgrade",
+        artists: ["Artist"],
+        track_number: 2,
+        url: "resolve:song:2",
+        available: true,
+        note: "local_tier:low",
+        selected_candidate_idx: 0,
+        candidates: [
+          {
+            source: { kind: "http_stream", platform: "youtube", url: "https://youtube.com/watch?v=2" },
+            quality_tier: "high_lossy",
+            codec: "Opus",
+            bitrate_kbps: 160,
+            duration_ms: 180_000,
+            match_confidence: 0.99,
+            is_strict_match: true,
+            display_label: "YouTube · Opus 160 kbps",
+          },
+        ],
+      },
+    ]);
+
+    expect(plan.best.upgradableCount).toBe(1);
+    expect(plan.best.details).toContain("Upgrades 1/2:");
+
+    const allHighPlan = buildCanonicalQualityPlan([
+      {
+        index: 0,
+        title: "Already High",
+        artists: ["Artist"],
+        track_number: 1,
+        url: "resolve:song:1",
+        available: true,
+        note: "local_tier:high",
+        selected_candidate_idx: 0,
+        candidates: [
+          {
+            source: { kind: "http_stream", platform: "youtube", url: "https://youtube.com/watch?v=1" },
+            quality_tier: "high_lossy",
+            codec: "Opus",
+            bitrate_kbps: 160,
+            duration_ms: 180_000,
+            match_confidence: 0.99,
+            is_strict_match: true,
+            display_label: "YouTube · Opus 160 kbps",
+          },
+        ],
+      },
+    ]);
+
+    expect(allHighPlan.best.upgradableCount).toBe(0);
+    expect(allHighPlan.best.details).toBe("Already at equal or higher quality (no upgrade needed)");
+    expect(allHighPlan.options[0].upgradableCount).toBe(0);
+  });
+});
+
+describe("extractResolveSongIds", () => {
+  it("parses single, batch, and album resolve urls into deduplicated numeric ids", () => {
+    expect(extractResolveSongIds("resolve:song:42")).toEqual([42]);
+    expect(extractResolveSongIds("resolve:batch:10,20,10")).toEqual([10, 20]);
+    expect(
+      extractResolveSongIds("resolve:album:Artist::Album", ["resolve:song:5", "resolve:song:6", "resolve:song:5"]),
+    ).toEqual([5, 6]);
   });
 });
 

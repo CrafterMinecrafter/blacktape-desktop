@@ -33,7 +33,7 @@ pub struct StreamInfo {
 }
 
 const SOUNDCLOUD_TTL: Duration = Duration::from_secs(4 * 60);
-const BANDCAMP_TTL: Duration = Duration::from_secs(30 * 60);
+const BANDCAMP_TTL: Duration = Duration::from_secs(10 * 60);
 const YOUTUBE_TTL: Duration = Duration::from_secs(3 * 60 * 60);
 
 const USER_AGENT: &str =
@@ -69,12 +69,35 @@ fn slot_for(key: &str) -> Slot {
     map.entry(key.to_string()).or_default().clone()
 }
 
+/// Infers the actual host platform from `url` when the URL explicitly belongs to Bandcamp, SoundCloud, or YouTube.
+pub fn platform_for_stream_url(fallback: Platform, url: &str) -> Platform {
+    let Ok(parsed) = url::Url::parse(url.trim()) else {
+        return fallback;
+    };
+    let Some(host) = parsed.host_str().map(str::to_ascii_lowercase) else {
+        return fallback;
+    };
+    if host == "bandcamp.com" || host.ends_with(".bandcamp.com") {
+        Platform::Bandcamp
+    } else if host == "soundcloud.com" || host.ends_with(".soundcloud.com") {
+        Platform::Soundcloud
+    } else if host == "youtube.com"
+        || host.ends_with(".youtube.com")
+        || host == "youtu.be"
+    {
+        Platform::Youtube
+    } else {
+        fallback
+    }
+}
+
 /// Cached or freshly resolved stream of the track at `url`.
 pub async fn resolve(app: &AppHandle, platform: Platform, url: &str) -> Result<StreamInfo, String> {
     let url = url.trim();
     if url.is_empty() {
         return Err("empty track url".to_string());
     }
+    let platform = platform_for_stream_url(platform, url);
     let slot = slot_for(&cache_key(platform, url));
     let mut guard = slot.lock().await;
     if let Some((info, at)) = guard.as_ref() {
@@ -94,6 +117,7 @@ pub async fn resolve(app: &AppHandle, platform: Platform, url: &str) -> Result<S
 
 /// Drops a cached url (for example after the server answered 403 because it expired).
 pub async fn forget(platform: Platform, url: &str) {
+    let platform = platform_for_stream_url(platform, url);
     let slot = slot_for(&cache_key(platform, url));
     *slot.lock().await = None;
 }
@@ -211,28 +235,56 @@ pub(crate) async fn resolve_soundcloud(url: &str) -> Result<StreamInfo, String> 
 // Bandcamp
 // ---------------------------------------------------------------------------------------------
 
-/// `(stream url, duration ms)` of the first track in the `data-tralbum` blob of a Bandcamp page.
+fn extract_tralbum_value(html: &str) -> Option<serde_json::Value> {
+    for (prefix, quote) in [("data-tralbum=\"", '"'), ("data-tralbum='", '\'')] {
+        if let Some(pos) = html.find(prefix) {
+            let start = pos + prefix.len();
+            if let Some(rel_end) = html[start..].find(quote) {
+                let raw = &html[start..start + rel_end];
+                let decoded = html_escape::decode_html_entities(raw);
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&decoded) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn normalize_bandcamp_stream_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("//") {
+        Some(format!("https:{trimmed}"))
+    } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+/// `(stream url, duration ms)` of the first streamable track in the `data-tralbum` blob of a Bandcamp page.
 pub fn parse_bandcamp_stream(html: &str) -> Option<(String, Option<u64>)> {
-    let start = html.find("data-tralbum=\"")? + "data-tralbum=\"".len();
-    let end = html[start..].find('"')? + start;
-    let json = html_escape::decode_html_entities(&html[start..end]);
-    let value: serde_json::Value = serde_json::from_str(&json).ok()?;
+    let value = extract_tralbum_value(html)?;
     let track = value.get("trackinfo")?.as_array()?.iter().find(|t| {
         t.get("file")
             .and_then(|f| f.as_object())
-            .is_some_and(|f| !f.is_empty())
+            .is_some_and(|f| f.values().any(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())))
     })?;
     let files = track.get("file")?.as_object()?;
     // Highest bitrate first; Bandcamp usually only publishes "mp3-128" for streaming.
-    let url = ["mp3-v0", "mp3-320", "mp3-128"]
+    let raw_url = ["mp3-v0", "mp3-320", "mp3-128"]
         .iter()
         .find_map(|key| files.get(*key).and_then(|v| v.as_str()))
         .or_else(|| files.values().find_map(|v| v.as_str()))?;
+    let url = normalize_bandcamp_stream_url(raw_url)?;
     let duration_ms = track
         .get("duration")
         .and_then(|d| d.as_f64())
         .map(|secs| (secs * 1000.0).round() as u64);
-    Some((url.to_string(), duration_ms))
+    Some((url, duration_ms))
 }
 
 pub(crate) async fn resolve_bandcamp(url: &str) -> Result<StreamInfo, String> {
@@ -243,20 +295,47 @@ pub(crate) async fn resolve_bandcamp(url: &str) -> Result<StreamInfo, String> {
     if !host_ok {
         return Err("not a Bandcamp url".to_string());
     }
-    let html = http_client()
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("Bandcamp request failed: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("Bandcamp request failed: {e}"))?
-        .text()
-        .await
-        .map_err(|e| format!("Bandcamp page could not be read: {e}"))?;
-    let (url, duration_ms) =
+
+    let mut html_opt: Option<String> = None;
+    let mut last_err = String::new();
+    for attempt in 0..3usize {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(400 * attempt as u64)).await;
+        }
+        match http_client().get(url).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    match resp.text().await {
+                        Ok(body) => {
+                            html_opt = Some(body);
+                            break;
+                        }
+                        Err(e) => {
+                            last_err = format!("Bandcamp page could not be read: {e}");
+                            break;
+                        }
+                    }
+                }
+                last_err = format!("Bandcamp request failed: HTTP {status}");
+                if status != reqwest::StatusCode::TOO_MANY_REQUESTS && !status.is_server_error() {
+                    break;
+                }
+            }
+            Err(e) => {
+                last_err = format!("Bandcamp request failed: {e}");
+                if !e.is_timeout() && !e.is_connect() {
+                    break;
+                }
+            }
+        }
+    }
+
+    let html = html_opt.ok_or(last_err)?;
+    let (stream_url, duration_ms) =
         parse_bandcamp_stream(&html).ok_or("no streamable audio found on the Bandcamp page")?;
     Ok(StreamInfo {
-        url,
+        url: stream_url,
         duration_ms,
         headers: Vec::new(),
         hls: None,
@@ -529,6 +608,30 @@ mod tests {
         assert!(parse_bandcamp_stream("").is_none());
         assert!(parse_bandcamp_stream("data-tralbum=\"not json\"").is_none());
         assert!(parse_bandcamp_stream("data-tralbum=\"{&quot;trackinfo&quot;:[]}\"").is_none());
+    }
+
+    #[test]
+    fn bandcamp_handles_single_quotes_and_protocol_relative_urls() {
+        let html = r#"<div data-tralbum='{"trackinfo":[{"duration":90.5,"file":{"mp3-128":"//t4.bcbits.com/stream/abc"}}]}'></div>"#;
+        let (url, duration) = parse_bandcamp_stream(html).expect("stream");
+        assert_eq!(url, "https://t4.bcbits.com/stream/abc");
+        assert_eq!(duration, Some(90_500));
+    }
+
+    #[test]
+    fn platform_for_stream_url_routes_bandcamp_and_soundcloud_domains() {
+        assert_eq!(
+            platform_for_stream_url(Platform::Youtube, "https://heavenpierceher.bandcamp.com/track/the-fall"),
+            Platform::Bandcamp
+        );
+        assert_eq!(
+            platform_for_stream_url(Platform::Youtube, "https://soundcloud.com/a/b"),
+            Platform::Soundcloud
+        );
+        assert_eq!(
+            platform_for_stream_url(Platform::Bandcamp, "https://music.youtube.com/watch?v=123"),
+            Platform::Youtube
+        );
     }
 
     #[test]

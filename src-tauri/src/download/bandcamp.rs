@@ -9,6 +9,33 @@ pub async fn parse_album(album_url: &str) -> Result<AlbumDownload, String> {
     parse_album_with_free_flag(album_url).await.map(|(album, _)| album)
 }
 
+/// Checks whether a Bandcamp album or track page advertises a free download (lossless available).
+pub async fn page_has_free_download(page_url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(page_url.trim()) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str().map(str::to_ascii_lowercase) else {
+        return false;
+    };
+    if host != "bandcamp.com" && !host.ends_with(".bandcamp.com") {
+        return false;
+    }
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_millis(2500))
+        .build()
+        .unwrap_or_default();
+    let Ok(resp) = client.get(parsed).send().await else {
+        return false;
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    let Ok(html) = resp.text().await else {
+        return false;
+    };
+    crate::download::quality::bandcamp_has_free_download(&html)
+}
+
 pub async fn parse_album_with_free_flag(album_url: &str) -> Result<(AlbumDownload, bool), String> {
     let base_url = extract_base_url(album_url)?;
 

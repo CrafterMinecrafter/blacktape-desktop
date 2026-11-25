@@ -8,7 +8,7 @@ import {
   type DownloadState,
   type RemoteRef,
 } from "@/shared/lib/library/libraryIndex.ts";
-import { formatTotalDuration } from "@/shared/lib/library/trackDuration.ts";
+import { formatTotalDuration, formatTrackDuration } from "@/shared/lib/library/trackDuration.ts";
 import { sameUrl } from "@/shared/lib/remote/urlKey.ts";
 import { ItemType, type SearchSuggestion } from "@/shared/store/libraryStore.ts";
 import type { Platform } from "@/shared/types.ts";
@@ -304,6 +304,26 @@ export function albumInfoLine(
     .join(" · ");
 }
 
+/** Resolves the true streaming platform for an album preview track URL (avoiding YouTube fallback on Bandcamp/SoundCloud URLs). Pure. */
+export function platformForTrackUrl(
+  url: string,
+  fallback: Platform,
+  track?: Pick<AlbumTrackInfo, "candidates" | "selected_candidate_idx">,
+): Platform {
+  const lower = url.toLowerCase();
+  if (lower.includes("bandcamp.com")) return "bandcamp";
+  if (lower.includes("soundcloud.com")) return "soundcloud";
+  if (lower.includes("youtube.com") || lower.includes("youtu.be")) return "youtube";
+  if (track) {
+    const selected = selectedTrackCandidate(track);
+    if (selected?.source.kind === "http_stream") {
+      const p = selected.source.platform.toLowerCase();
+      if (p === "bandcamp" || p === "soundcloud" || p === "youtube") return p;
+    }
+  }
+  return fallback;
+}
+
 /** The track as a search item, so the stream button can play it (and queue the tracks after it). */
 export function trackAsStreamItem(
   preview: Pick<AlbumPreview, "platform" | "title" | "artist" | "cover_url"> & Partial<Pick<AlbumPreview, "url">>,
@@ -318,7 +338,7 @@ export function trackAsStreamItem(
     item_url_path: track.url,
     img: preview.cover_url ?? "",
     duration: typeof track.duration_ms === "number" ? Math.round(track.duration_ms / 1000) : undefined,
-    platform: preview.platform,
+    platform: platformForTrackUrl(track.url, preview.platform, track),
   };
 }
 
@@ -450,6 +470,102 @@ export function trackRowStatus(
   if (libraryState === "downloaded" || task?.phase === "done") return { kind: "downloaded" };
   if (task?.phase === "running") return { kind: "running", percent: task.percent };
   return { kind: "download" };
+}
+
+/** Selected candidate for a track row, falling back to candidate 0. Pure. */
+function selectedTrackCandidate(
+  track: Pick<AlbumTrackInfo, "candidates" | "selected_candidate_idx">,
+): AudioCandidate | undefined {
+  const cands = track.candidates ?? [];
+  if (cands.length === 0) return undefined;
+  const idx =
+    typeof track.selected_candidate_idx === "number" &&
+    track.selected_candidate_idx >= 0 &&
+    track.selected_candidate_idx < cands.length
+      ? track.selected_candidate_idx
+      : 0;
+  return cands[idx] ?? cands[0];
+}
+
+/** Human-readable mismatch summary when a candidate is not a strict match; null when strict. Pure. */
+export function candidateMatchWarning(
+  track: Pick<AlbumTrackInfo, "title" | "duration_ms">,
+  cand: Pick<AudioCandidate, "is_strict_match" | "matched_title" | "matched_artist" | "duration_ms">,
+): string | null {
+  if (cand.is_strict_match) return null;
+  const details: string[] = [];
+  if (cand.matched_title) {
+    const target = normalizeMatchText(track.title);
+    const matched = normalizeMatchText(cand.matched_title);
+    if (matched && matched !== target) {
+      details.push(`source "${cand.matched_title}"`);
+    }
+  }
+  if (track.duration_ms && track.duration_ms > 0 && cand.duration_ms > 0) {
+    const deltaSecs = Math.round(Math.abs(cand.duration_ms - track.duration_ms) / 1000);
+    if (deltaSecs >= 4) {
+      details.push(`${formatTrackDuration(cand.duration_ms)} vs ${formatTrackDuration(track.duration_ms)}`);
+    }
+  }
+  return details.length > 0
+    ? `Unverified match (${details.join(" · ")})`
+    : "Approximate title or duration match";
+}
+
+/** Numeric rank of a local QualityTier or AudioQualityTier (`0..3`). Pure. */
+export function audioTierRank(tier: string | null | undefined): number {
+  switch ((tier ?? "").toLowerCase()) {
+    case "lossless":
+      return 3;
+    case "high":
+    case "high_lossy":
+      return 2;
+    case "standard":
+    case "standard_lossy":
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+/** Downloaded tracks on `AlbumPreview` that have a strictly higher-quality resolved candidate. Pure. */
+export function upgradableAlbumTracks<
+  TLocal extends { id: number; quality_tier: string; path?: string },
+>(
+  preview: Pick<AlbumPreview, "tracks">,
+  localTracks: Readonly<Record<string, TLocal>>,
+): Array<{ track: AlbumTrackInfo; local: TLocal; candidate: AudioCandidate }> {
+  const out: Array<{ track: AlbumTrackInfo; local: TLocal; candidate: AudioCandidate }> = [];
+  for (const track of selectableTracks(preview)) {
+    const local = localTracks[track.url];
+    if (!local) continue;
+    const candidate = selectedTrackCandidate(track);
+    if (!candidate) continue;
+    if (audioTierRank(candidate.quality_tier) > audioTierRank(local.quality_tier)) {
+      out.push({ track, local, candidate });
+    }
+  }
+  return out;
+}
+
+/** Downloadable tracks whose selected audio candidate is non-strict (`!is_strict_match`). Pure. */
+export function unverifiedTracksForDownload(
+  preview: Pick<AlbumPreview, "tracks">,
+  targetUrls?: readonly string[],
+): Array<{ track: AlbumTrackInfo; candidate: AudioCandidate; warning: string }> {
+  const urlSet = targetUrls ? new Set(targetUrls) : null;
+  const out: Array<{ track: AlbumTrackInfo; candidate: AudioCandidate; warning: string }> = [];
+  for (const track of selectableTracks(preview)) {
+    if (urlSet && !urlSet.has(track.url)) continue;
+    const cand = selectedTrackCandidate(track);
+    if (!cand || cand.is_strict_match) continue;
+    out.push({
+      track,
+      candidate: cand,
+      warning: candidateMatchWarning(track, cand) ?? "Approximate match",
+    });
+  }
+  return out;
 }
 
 export interface PartitionedEditions {

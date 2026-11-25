@@ -4,7 +4,7 @@
  * contract of the library-sync wave 1 (see work/v3/PLAN.md): parts only add code, never change these shapes.
  */
 import { invoke } from "@tauri-apps/api/core";
-import type { Platform } from "@/shared/types.ts";
+import type { Platform, QualityTier } from "@/shared/types.ts";
 import type { AlbumTrackInfo } from "@/shared/lib/remote/albumPreview.ts";
 
 export type DownloadState = "none" | "partial" | "downloaded";
@@ -58,9 +58,16 @@ export interface MissingTracks {
 export const getDownloadStatus = (items: RemoteRef[]): Promise<Record<string, DownloadState>> =>
   invoke<Record<string, DownloadState>>("get_download_status", { items });
 
-/** Local library song IDs matching remote track refs. Keyed by `item.url` as sent. */
-export const getLibraryTrackIds = (items: RemoteRef[]): Promise<Record<string, number>> =>
-  invoke<Record<string, number>>("get_library_track_ids", { items });
+/** Local library song metadata matching a remote track ref. */
+export interface LibraryTrackDetails {
+  id: number;
+  quality_tier: QualityTier;
+  path: string;
+}
+
+/** Local library song IDs and stored quality metadata matching remote track refs. Keyed by `item.url` as sent. */
+export const getLibraryTrackDetails = (items: RemoteRef[]): Promise<Record<string, LibraryTrackDetails>> =>
+  invoke<Record<string, LibraryTrackDetails>>("get_library_track_details", { items });
 
 /** Library state of album urls (from the albums the app downloaded before). Keyed by the url as sent. */
 export const getAlbumStatus = (items: RemoteRef[]): Promise<Record<string, AlbumStatus>> =>

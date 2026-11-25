@@ -3,13 +3,14 @@ import clsx from "clsx";
 import { HiOutlineMusicNote } from "react-icons/hi";
 import { HiMiniPause } from "react-icons/hi2";
 import { DownloadSplitButton } from "@/shared/ui/download-split-button/DownloadSplitButton.tsx";
-import { MdKeyboardArrowDown, MdPause, MdPlayArrow } from "react-icons/md";
+import { MdKeyboardArrowDown, MdPause, MdPlayArrow, MdWarningAmber } from "react-icons/md";
 import { FiCheck } from "react-icons/fi";
 import rowStyles from "@/features/library/ui/song-list-item/song-list-item.module.css";
 import { useStreamStore } from "@/features/preview/model/streamStore.ts";
 import { DownloadStatusBadge } from "@/shared/ui/download-status-badge/DownloadStatusBadge.tsx";
 import { flyToLibrary } from "@/shared/lib/ui/flyAnimation.ts";
 import {
+  candidateMatchWarning,
   isTrackRowActive,
   trackRowStatus,
   type AlbumTrackInfo,
@@ -70,10 +71,12 @@ const candidateShortBadge = (cand: AudioCandidate) => {
 };
 
 const CandidateSelector = ({
+  track,
   candidates,
   selectedIdx,
   onSelect,
 }: {
+  track: Pick<AlbumTrackInfo, "title" | "duration_ms">;
   candidates: AudioCandidate[];
   selectedIdx: number;
   onSelect?: (idx: number) => void;
@@ -95,6 +98,12 @@ const CandidateSelector = ({
 
   if (!selected) return null;
 
+  const warningText = candidateMatchWarning(track, selected);
+  const canInspectMenu = candidates.length > 1 || Boolean(selected.matched_title) || warningText !== null;
+  const matchedSummary = selected.matched_title
+    ? `${selected.matched_title}${selected.matched_artist ? ` · ${selected.matched_artist}` : ""}`
+    : null;
+
   return (
     <div
       ref={ref}
@@ -104,23 +113,43 @@ const CandidateSelector = ({
     >
       <button
         type="button"
-        className={clsx(styles.candidateBadgeButton, tierClass(selected.quality_tier))}
-        onClick={() => setOpen((v) => !v)}
-        title={`Audio source: ${selected.display_label} (${candidates.length} candidate${candidates.length > 1 ? "s" : ""})`}
+        className={clsx(
+          styles.candidateBadgeButton,
+          tierClass(selected.quality_tier),
+          warningText && styles.warningBadge,
+        )}
+        onClick={() => canInspectMenu && setOpen((v) => !v)}
+        title={
+          warningText
+            ? `${warningText}. Click to inspect source.`
+            : matchedSummary
+              ? `Matched source: ${matchedSummary} (${selected.display_label})`
+              : `Audio source: ${selected.display_label} (${candidates.length} candidate${candidates.length > 1 ? "s" : ""})`
+        }
       >
+        {warningText && <MdWarningAmber className={styles.warningIcon} aria-label="Unverified match" />}
         <span>{candidateShortBadge(selected)}</span>
         {candidates.length > 1 && (
           <MdKeyboardArrowDown className={clsx(styles.arrowIcon, open && styles.arrowOpen)} />
         )}
       </button>
 
-      {open && candidates.length > 1 && (
+      {open && canInspectMenu && (
         <div className={styles.candidateMenu} role="menu">
           <div className={styles.candidateMenuHeader}>
-            Available Audio Sources ({candidates.length})
+            {candidates.length > 1 ? `Available Audio Sources (${candidates.length})` : "Matched Audio Source"}
           </div>
           {candidates.map((cand, idx) => {
             const isSelected = idx === selectedIdx;
+            const itemWarning = candidateMatchWarning(track, cand);
+            const itemDuration = cand.duration_ms > 0 ? formatTrackDuration(cand.duration_ms) : "";
+            const sourceDesc = [
+              cand.matched_title ?? "",
+              cand.matched_artist ?? "",
+              itemDuration,
+            ]
+              .filter(Boolean)
+              .join(" · ");
             return (
               <button
                 key={idx}
@@ -139,9 +168,17 @@ const CandidateSelector = ({
                   {cand.codec.toUpperCase()}
                 </span>
                 <div className={styles.candidateDetails}>
-                  <span className={styles.candidateTitle}>{cand.display_label}</span>
-                  <span className={styles.candidateMeta}>
-                    {cand.is_strict_match ? "Strict duration match" : "Similar title"}
+                  <span className={styles.candidateTitle}>
+                    {cand.display_label}
+                    {itemWarning && <MdWarningAmber className={styles.menuWarningIcon} title={itemWarning} />}
+                  </span>
+                  {sourceDesc && (
+                    <span className={clsx(styles.candidateMatchedInfo, itemWarning && styles.candidateMetaWarn)}>
+                      {sourceDesc}
+                    </span>
+                  )}
+                  <span className={clsx(styles.candidateMeta, itemWarning && styles.candidateMetaWarn)}>
+                    {itemWarning ?? "Exact match"}
                     {cand.bitrate_kbps ? ` · ${cand.bitrate_kbps} kbps` : ""}
                   </span>
                 </div>
@@ -213,6 +250,13 @@ export const AlbumTrackRow = ({
   const playing = active && isPlaying && !(isStreaming && streamLoading);
   const loading = track.available && (loadingUrl === track.url || (active && isStreaming && streamLoading));
   const status = trackRowStatus(track, libraryState, task);
+  const canPlay = track.available && (localSongId !== undefined || track.url !== "");
+  const noSourceFound =
+    track.available &&
+    !resolving &&
+    track.url === "" &&
+    localSongId === undefined &&
+    (!track.candidates || track.candidates.length === 0);
 
   return (
     <div
@@ -222,17 +266,23 @@ export const AlbumTrackRow = ({
         [rowStyles.selected]: selected,
         [rowStyles.selectedTop]: selected && !selectedAbove,
         [rowStyles.selectedBottom]: selected && !selectedBelow,
-        [styles.unavailable]: !track.available,
+        [styles.unavailable]: !canPlay,
       })}
       data-song-row
       aria-selected={selected}
-      aria-disabled={!track.available}
-      title={track.available ? undefined : (track.note ?? "Not available")}
+      aria-disabled={!canPlay}
+      title={
+        !track.available
+          ? (track.note ?? "Not available")
+          : noSourceFound
+            ? "No verified audio source found for this track"
+            : undefined
+      }
       role="button"
       tabIndex={0}
-      onClick={(e) => track.available && onSelect(e)}
-      onDoubleClick={() => track.available && !editing && onPlay()}
-      onContextMenu={track.available ? onContextMenu : undefined}
+      onClick={(e) => canPlay && onSelect(e)}
+      onDoubleClick={() => canPlay && !editing && onPlay()}
+      onContextMenu={canPlay ? onContextMenu : undefined}
     >
       <div className={rowStyles.songLeft}>
         <div className={rowStyles.numSlot}>
@@ -249,7 +299,7 @@ export const AlbumTrackRow = ({
               </div>
             )}
           </div>
-          {track.available && (
+          {canPlay && (
             <button
               className={clsx(rowStyles.rowPlayButton, loading && styles.alwaysShown)}
               title={playing ? "Pause" : localSongId !== undefined ? "Play" : "Play preview"}
@@ -297,11 +347,14 @@ export const AlbumTrackRow = ({
         )}
       </div>
       <div className={rowStyles.songRight}>
-        {!track.available && track.note && (
-          <div className={clsx(styles.note, "truncate")}>{track.note}</div>
-        )}
+        {(!track.available && track.note) || noSourceFound ? (
+          <div className={clsx(styles.note, "truncate")}>
+            {!track.available && track.note ? track.note : "No verified source"}
+          </div>
+        ) : null}
         {track.candidates && track.candidates.length > 0 ? (
           <CandidateSelector
+            track={track}
             candidates={track.candidates}
             selectedIdx={track.selected_candidate_idx ?? 0}
             onSelect={onSelectCandidate}

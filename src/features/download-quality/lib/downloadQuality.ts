@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AlbumTrackInfo } from "@/shared/lib/remote/albumPreview.ts";
+import { audioTierRank, type AlbumTrackInfo } from "@/shared/lib/remote/albumPreview.ts";
 import type { Platform } from "@/shared/types.ts";
 
 /** Mirrors the Rust `quality::AudioFormat` (snake_case on the wire). */
@@ -21,6 +21,7 @@ interface CanonicalQualityOption {
   platform?: string;
   isBest?: boolean;
   lossless?: boolean;
+  upgradableCount?: number;
 }
 
 export interface CanonicalQualityPlan {
@@ -116,6 +117,35 @@ function tierDisplayLabel(
   return displayCodec;
 }
 
+/** Extracts unique numeric song IDs from `resolve:` URLs (`resolve:song:42`, `resolve:batch:...`, `resolve:album:...`). Pure. */
+export function extractResolveSongIds(
+  url: string,
+  trackUrls?: readonly string[],
+): number[] {
+  const ids: number[] = [];
+  const push = (id: number) => {
+    if (Number.isInteger(id) && id > 0 && !ids.includes(id)) ids.push(id);
+  };
+  const scan = (raw: string) => {
+    const songMatch = /^resolve:song:(\d+)$/.exec(raw.trim());
+    if (songMatch) {
+      push(Number(songMatch[1]));
+      return;
+    }
+    const batchMatch = /^resolve:batch:([\d,]+)$/.exec(raw.trim());
+    if (batchMatch) {
+      for (const part of batchMatch[1].split(",")) {
+        if (part) push(Number(part));
+      }
+    }
+  };
+  if (trackUrls) {
+    for (const u of trackUrls) scan(u);
+  }
+  scan(url);
+  return ids;
+}
+
 /**
  * Builds the `Automatic Best Quality` card + discovered multi-source stream rows from `tracks`.
  * Honest: never claims "lossless" unless an actual Lossless candidate was resolved. Pure.
@@ -139,34 +169,46 @@ export function buildCanonicalQualityPlan(
       codec: string;
       bitrate: number | null;
       count: number;
+      upgradableCount: number;
       tierRank: number;
     }
   >();
 
   let tracksWithCandidates = 0;
   let anyLossless = false;
+  let anyHasLocalTier = false;
+  let bestUpgradableCount = 0;
 
-  const tierRankOf = (tier: string) =>
-    tier === "lossless" ? 3 : tier === "high_lossy" ? 2 : tier === "standard_lossy" ? 1 : 0;
+  const parseLocalTierRank = (note: string | null | undefined): number | null => {
+    if (!note || !note.startsWith("local_tier:")) return null;
+    return audioTierRank(note.slice("local_tier:".length));
+  };
 
   for (const track of activeTracks) {
     const cands = track.candidates ?? [];
     if (cands.length === 0) continue;
     tracksWithCandidates += 1;
 
+    const localRank = parseLocalTierRank(track.note);
+    if (localRank !== null) anyHasLocalTier = true;
+
     const top = cands[0];
     if (top.quality_tier === "lossless") anyLossless = true;
-    const topPlat = candidatePlatformName(top);
-    const topCodec = tierDisplayLabel(top.codec, top.quality_tier, top.bitrate_kbps);
-    const topKey = `${topPlat}::${topCodec}`;
-    const prevTop = bestSummaryCounts.get(topKey);
-    if (prevTop) prevTop.count += 1;
-    else {
-      bestSummaryCounts.set(topKey, {
-        label: `${topCodec} (${topPlat.toUpperCase()})`,
-        count: 1,
-        lossless: top.quality_tier === "lossless",
-      });
+    const topImproves = localRank === null || audioTierRank(top.quality_tier) > localRank;
+    if (topImproves) {
+      bestUpgradableCount += 1;
+      const topPlat = candidatePlatformName(top);
+      const topCodec = tierDisplayLabel(top.codec, top.quality_tier, top.bitrate_kbps);
+      const topKey = `${topPlat}::${topCodec}`;
+      const prevTop = bestSummaryCounts.get(topKey);
+      if (prevTop) prevTop.count += 1;
+      else {
+        bestSummaryCounts.set(topKey, {
+          label: `${topCodec} (${topPlat.toUpperCase()})`,
+          count: 1,
+          lossless: top.quality_tier === "lossless",
+        });
+      }
     }
 
     const seenInTrack = new Set<string>();
@@ -175,9 +217,11 @@ export function buildCanonicalQualityPlan(
       const bucket = `${plat}::${c.quality_tier}`;
       if (seenInTrack.has(bucket)) continue;
       seenInTrack.add(bucket);
+      const improves = localRank === null || audioTierRank(c.quality_tier) > localRank;
       const existing = sourceGroups.get(bucket);
       if (existing) {
         existing.count += 1;
+        if (improves) existing.upgradableCount += 1;
       } else {
         sourceGroups.set(bucket, {
           platform: plat,
@@ -185,7 +229,8 @@ export function buildCanonicalQualityPlan(
           codec: c.codec,
           bitrate: c.bitrate_kbps ?? null,
           count: 1,
-          tierRank: tierRankOf(c.quality_tier),
+          upgradableCount: improves ? 1 : 0,
+          tierRank: audioTierRank(c.quality_tier),
         });
       }
     }
@@ -232,28 +277,54 @@ export function buildCanonicalQualityPlan(
 
   const options: CanonicalQualityOption[] = sortedSources.map((src) => {
     const tierSuffix =
-      src.tier === "standard_lossy" ? ":standard" : src.tier === "high_lossy" ? ":high" : "";
+      src.tier === "lossless"
+        ? ":lossless"
+        : src.tier === "standard_lossy"
+          ? ":standard"
+          : src.tier === "high_lossy"
+            ? ":high"
+            : "";
     const coverage =
       totalCount > 1 ? `${src.count}/${totalCount} tracks` : "Verified candidate";
+    const details = anyHasLocalTier
+      ? src.upgradableCount === 0
+        ? `${coverage} · Already at equal or higher quality`
+        : src.upgradableCount < totalCount
+          ? `Upgrades ${src.upgradableCount}/${totalCount} tracks (${totalCount - src.upgradableCount} skipped)`
+          : totalCount > 1
+            ? `Upgrades ${src.upgradableCount}/${totalCount} tracks`
+            : "Upgrades existing file"
+      : coverage;
     return {
       id: `source:${src.platform}${tierSuffix}`,
       label: tierDisplayLabel(src.codec, src.tier, src.bitrate),
-      details: coverage,
+      details,
       platform: src.platform,
       lossless: src.tier === "lossless",
+      upgradableCount: anyHasLocalTier ? src.upgradableCount : undefined,
     };
   });
+
+  const bestDetails = anyHasLocalTier
+    ? bestUpgradableCount === 0
+      ? "Already at equal or higher quality (no upgrade needed)"
+      : bestUpgradableCount < totalCount
+        ? `Upgrades ${bestUpgradableCount}/${totalCount}: ${bestParts.join(", ")}`
+        : bestParts.length > 0
+          ? `Upgrades to ${bestParts.join(", ")}`
+          : "Picks highest quality per track"
+    : bestParts.length > 0
+      ? `Expected: ${bestParts.join(", ")}`
+      : "Picks highest quality per track";
 
   return {
     best: {
       id: "best",
       label: "Automatic Best Quality",
-      details:
-        bestParts.length > 0
-          ? `Expected: ${bestParts.join(", ")}`
-          : "Picks highest quality per track",
+      details: bestDetails,
       isBest: true,
       lossless: anyLossless,
+      upgradableCount: anyHasLocalTier ? bestUpgradableCount : undefined,
     },
     options,
     hasDiscoveredCandidates: true,

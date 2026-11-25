@@ -37,6 +37,8 @@ export interface AudioCandidate {
   match_confidence: number;
   is_strict_match: boolean;
   display_label: string;
+  matched_title?: string | null;
+  matched_artist?: string | null;
 }
 
 export interface CanonicalTrack {

@@ -8,6 +8,7 @@ use crate::download::types::{
 use crate::library_index::sources::build_album_source;
 use crate::types::Platform;
 use crate::utils::{remove_empty_parents_up_to, sanitize_fs};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager};
@@ -132,14 +133,52 @@ pub fn detect_platform_from_url(url: &str, fallback: Platform) -> Platform {
     }
 }
 
-pub fn pick_candidate_urls_for_tier(
+fn local_tier_rank(tier: crate::types::QualityTier) -> u8 {
+    match tier {
+        crate::types::QualityTier::Low => 0,
+        crate::types::QualityTier::Standard => 1,
+        crate::types::QualityTier::High => 2,
+        crate::types::QualityTier::Lossless => 3,
+    }
+}
+
+fn candidate_tier_rank(tier: crate::metadata::types::AudioQualityTier) -> u8 {
+    match tier {
+        crate::metadata::types::AudioQualityTier::Low => 0,
+        crate::metadata::types::AudioQualityTier::StandardLossy => 1,
+        crate::metadata::types::AudioQualityTier::HighLossy => 2,
+        crate::metadata::types::AudioQualityTier::Lossless => 3,
+    }
+}
+
+/// True when downloading `cand_tier` would produce strictly better quality than `local_tier`,
+/// or when the local audio file is missing on disk. Pure.
+pub fn candidate_improves_local(
+    local_tier: crate::types::QualityTier,
+    local_file_exists: bool,
+    cand_tier: crate::metadata::types::AudioQualityTier,
+) -> bool {
+    !local_file_exists || candidate_tier_rank(cand_tier) > local_tier_rank(local_tier)
+}
+
+fn quality_tier_slug(tier: crate::types::QualityTier) -> &'static str {
+    match tier {
+        crate::types::QualityTier::Low => "low",
+        crate::types::QualityTier::Standard => "standard",
+        crate::types::QualityTier::High => "high",
+        crate::types::QualityTier::Lossless => "lossless",
+    }
+}
+
+/// Selects the matching candidate index along with its primary URL and fallback URLs. Pure.
+pub fn pick_candidate_entry_for_tier(
     candidates: &[crate::metadata::types::AudioCandidate],
     preferred_format: Option<&str>,
     selected_idx: usize,
-) -> (String, Vec<String>) {
+) -> Option<(usize, String, Vec<String>)> {
     use crate::metadata::types::AudioQualityTier;
     if candidates.is_empty() {
-        return (String::new(), Vec::new());
+        return None;
     }
 
     let fmt = preferred_format.map(str::trim).unwrap_or("");
@@ -196,7 +235,18 @@ pub fn pick_candidate_urls_for_tier(
             fallbacks.push(u);
         }
     }
-    (primary, fallbacks)
+    Some((chosen_pos, primary, fallbacks))
+}
+
+pub fn pick_candidate_urls_for_tier(
+    candidates: &[crate::metadata::types::AudioCandidate],
+    preferred_format: Option<&str>,
+    selected_idx: usize,
+) -> (String, Vec<String>) {
+    match pick_candidate_entry_for_tier(candidates, preferred_format, selected_idx) {
+        Some((_, primary, fallbacks)) => (primary, fallbacks),
+        None => (String::new(), Vec::new()),
+    }
 }
 
 pub fn apply_download_overrides(
@@ -255,48 +305,26 @@ pub fn apply_download_overrides(
     }
 }
 
-async fn build_bulk_upgrade_album(
-    app_handle: &AppHandle,
-    task_id: &str,
-    platform: Platform,
-    url: &str,
-    selected: Option<&[String]>,
-    effective_format: Option<&str>,
-    fallback_output_dir: &Path,
-) -> Result<(AlbumDownload, Option<PathBuf>), String> {
-    use crate::metadata::types::{AudioCandidate, AudioQualityTier, AudioSource};
-    use crate::resolver::{arbiter, matcher, provider};
-    use std::collections::{HashMap, HashSet};
+type UpgradeCacheMap = std::collections::HashMap<Vec<i64>, (Vec<Vec<crate::metadata::types::AudioCandidate>>, std::time::Instant)>;
 
-    let mut song_ids: Vec<i64> = Vec::new();
-    if let Some(items) = selected {
-        for raw in items {
-            if let Some(id_str) = raw.strip_prefix("resolve:song:") {
-                if let Ok(id) = id_str.parse::<i64>() {
-                    if !song_ids.contains(&id) {
-                        song_ids.push(id);
-                    }
-                }
-            }
-        }
-    }
-    if song_ids.is_empty() {
-        if let Some(id_str) = url.strip_prefix("resolve:song:") {
-            if let Ok(id) = id_str.parse::<i64>() {
-                song_ids.push(id);
-            }
-        }
-    }
+fn upgrade_candidate_cache() -> &'static std::sync::Mutex<UpgradeCacheMap> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<UpgradeCacheMap>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+async fn load_ordered_songs(
+    app_handle: &AppHandle,
+    song_ids: &[i64],
+) -> Result<Vec<crate::Song>, String> {
     if song_ids.is_empty() {
         return Err("No library tracks specified for bulk upgrade.".to_string());
     }
-
     let db_state = app_handle
         .try_state::<tokio::sync::Mutex<Database>>()
         .ok_or_else(|| "Database state unavailable for album upgrade".to_string())?;
     let fetched = {
         let db = db_state.lock().await;
-        db.get_songs_by_ids(&song_ids)
+        db.get_songs_by_ids(song_ids)
             .await
             .map_err(|e| format!("Failed reading tracks for upgrade: {e}"))?
     };
@@ -306,7 +334,7 @@ async fn build_bulk_upgrade_album(
         .filter_map(|s| s.id.map(|id| (id, s)))
         .collect();
     let mut ordered_songs: Vec<crate::Song> = Vec::with_capacity(song_ids.len());
-    for id in &song_ids {
+    for id in song_ids {
         if let Some(s) = by_id.get(id) {
             ordered_songs.push(s.clone());
         }
@@ -314,8 +342,27 @@ async fn build_bulk_upgrade_album(
     if ordered_songs.is_empty() {
         return Err("None of the selected tracks exist in the library anymore.".to_string());
     }
+    Ok(ordered_songs)
+}
 
-    let first = ordered_songs[0].clone();
+async fn resolve_upgrade_candidates_cached(
+    ordered_songs: &[crate::Song],
+) -> Vec<Vec<crate::metadata::types::AudioCandidate>> {
+    use crate::metadata::types::AudioCandidate;
+    use crate::resolver::arbiter;
+    use std::collections::HashSet;
+
+    let cache_key: Vec<i64> = ordered_songs.iter().filter_map(|s| s.id).collect();
+    if !cache_key.is_empty() {
+        let guard = upgrade_candidate_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached, at)) = guard.get(&cache_key) {
+            if at.elapsed() < std::time::Duration::from_secs(300) && cached.len() == ordered_songs.len() {
+                return cached.clone();
+            }
+        }
+    }
+
+    let first = &ordered_songs[0];
     let distinct_albums: HashSet<(String, String)> = ordered_songs
         .iter()
         .map(|s| (s.album_artist.to_lowercase(), s.album.to_lowercase()))
@@ -323,105 +370,34 @@ async fn build_bulk_upgrade_album(
     let album_title = if distinct_albums.len() == 1 && !first.album.is_empty() {
         first.album.clone()
     } else {
-        format!("Upgrading {} tracks", ordered_songs.len())
+        String::new()
     };
-    let album_artist = if distinct_albums.len() == 1 && !first.album_artist.is_empty() {
-        first.album_artist.clone()
-    } else {
-        first.album_artist.clone()
-    };
+    let album_artist = first.album_artist.clone();
 
-    let _ = app_handle.emit(
-        "download-task-progress",
-        ProgressEvent {
-            task_id: task_id.to_string(),
-            current: 0,
-            total: ordered_songs.len(),
-            track_title: "Resolving best sources in bulk...".into(),
-        },
-    );
-
-    // Step 1: When upgrading a single album, query all 3 platforms once concurrently (~1-2s total).
-    let (yt_album, bc_album, sc_album) =
+    let album_tracks =
         if distinct_albums.len() == 1 && !album_title.is_empty() && !album_artist.is_empty() {
-            tokio::join!(
-                provider::resolve_youtube_album_tracks(&album_artist, &album_title),
-                provider::resolve_bandcamp_album_tracks(&album_artist, &album_title),
-                provider::resolve_soundcloud_album_tracks(&album_artist, &album_title),
-            )
+            Some(crate::resolver::resolve_album_platform_tracks(&album_artist, &album_title).await)
         } else {
-            (Vec::new(), Vec::new(), Vec::new())
+            None
         };
 
     let mut per_song_candidates: Vec<Vec<AudioCandidate>> = vec![Vec::new(); ordered_songs.len()];
     let mut unresolved_indices: Vec<usize> = Vec::new();
 
     for (idx, song) in ordered_songs.iter().enumerate() {
-        let mut candidates = Vec::new();
         let track_num = song.track_number.map(|n| n.max(0) as u32).unwrap_or((idx + 1) as u32);
-        if let Some(yt_t) = matcher::find_matching_track(&song.title, song.duration_ms, track_num, &yt_album) {
-            let cand_duration = yt_t.duration_ms.unwrap_or(0);
-            let eval = matcher::evaluate_track_match(&song.title, song.duration_ms, &yt_t.title, cand_duration);
-            candidates.push(AudioCandidate {
-                source: AudioSource::HttpStream {
-                    platform: "youtube".into(),
-                    url: yt_t.url.clone(),
-                    format_id: None,
-                    direct_stream_url: None,
-                    expires_at: None,
-                },
-                quality_tier: AudioQualityTier::HighLossy,
-                codec: "Opus".into(),
-                bitrate_kbps: Some(160),
-                sample_rate_hz: Some(48000),
-                duration_ms: cand_duration,
-                match_confidence: eval.confidence,
-                is_strict_match: eval.is_strict_match,
-                display_label: "YouTube Music (Opus 160k)".into(),
-            });
-        }
-        if let Some(bc_t) = matcher::find_matching_track(&song.title, song.duration_ms, track_num, &bc_album) {
-            let cand_duration = bc_t.duration_ms.unwrap_or(0);
-            let eval = matcher::evaluate_track_match(&song.title, song.duration_ms, &bc_t.title, cand_duration);
-            candidates.push(AudioCandidate {
-                source: AudioSource::HttpStream {
-                    platform: "bandcamp".into(),
-                    url: bc_t.url.clone(),
-                    format_id: None,
-                    direct_stream_url: None,
-                    expires_at: None,
-                },
-                quality_tier: AudioQualityTier::StandardLossy,
-                codec: "MP3".into(),
-                bitrate_kbps: Some(128),
-                sample_rate_hz: Some(44100),
-                duration_ms: cand_duration,
-                match_confidence: eval.confidence,
-                is_strict_match: eval.is_strict_match,
-                display_label: "Bandcamp (MP3 128k)".into(),
-            });
-        }
-        if let Some(sc_t) = matcher::find_matching_track(&song.title, song.duration_ms, track_num, &sc_album) {
-            let cand_duration = sc_t.duration_ms.unwrap_or(0);
-            let eval = matcher::evaluate_track_match(&song.title, song.duration_ms, &sc_t.title, cand_duration);
-            candidates.push(AudioCandidate {
-                source: AudioSource::HttpStream {
-                    platform: "soundcloud".into(),
-                    url: sc_t.url.clone(),
-                    format_id: None,
-                    direct_stream_url: None,
-                    expires_at: None,
-                },
-                quality_tier: AudioQualityTier::StandardLossy,
-                codec: "MP3".into(),
-                bitrate_kbps: Some(128),
-                sample_rate_hz: Some(44100),
-                duration_ms: cand_duration,
-                match_confidence: eval.confidence,
-                is_strict_match: eval.is_strict_match,
-                display_label: "SoundCloud (MP3 128k)".into(),
-            });
-        }
+        let disc_num = song.disc_number.map(|n| n.max(1) as u32);
+        let mut candidates = if let Some(ref at) = album_tracks {
+            crate::resolver::match_album_platform_candidates(
+                &song.title,
+                song.duration_ms,
+                track_num,
+                disc_num,
+                at,
+            )
+        } else {
+            Vec::new()
+        };
 
         if candidates.is_empty() {
             unresolved_indices.push(idx);
@@ -431,7 +407,6 @@ async fn build_bulk_upgrade_album(
         }
     }
 
-    // Step 2: Concurrently resolve any tracks not matched in album-level searches (bounded 6-way).
     if !unresolved_indices.is_empty() {
         let mut set = tokio::task::JoinSet::new();
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(6));
@@ -462,12 +437,139 @@ async fn build_bulk_upgrade_album(
         }
     }
 
+    if !cache_key.is_empty() {
+        let mut guard = upgrade_candidate_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if guard.len() > 64 {
+            guard.clear();
+        }
+        guard.insert(cache_key, (per_song_candidates.clone(), std::time::Instant::now()));
+    }
+
+    per_song_candidates
+}
+
+/// Probes multi-source candidates for existing library songs (e.g. from Upgrade Quality modal).
+#[tauri::command]
+pub async fn probe_upgrade_candidates(
+    app: AppHandle,
+    song_ids: Vec<i64>,
+) -> Result<Vec<crate::download::album_preview::AlbumTrackInfo>, String> {
+    let ordered_songs = load_ordered_songs(&app, &song_ids).await?;
+    let per_song = resolve_upgrade_candidates_cached(&ordered_songs).await;
+    Ok(ordered_songs
+        .into_iter()
+        .enumerate()
+        .map(|(idx, song)| {
+            let candidates = per_song.get(idx).cloned().unwrap_or_default();
+            let primary_url = candidates
+                .first()
+                .map(|c| c.source.primary_url().to_string())
+                .or(song.source_url.clone())
+                .unwrap_or_default();
+            let file_exists = Path::new(&song.path).exists();
+            let note = file_exists.then(|| format!("local_tier:{}", quality_tier_slug(song.quality_tier)));
+            crate::download::album_preview::AlbumTrackInfo {
+                index: idx,
+                title: song.title,
+                artists: song.artists,
+                track_number: song.track_number,
+                disc_number: song.disc_number,
+                url: primary_url.clone(),
+                available: !primary_url.is_empty() || !candidates.is_empty(),
+                note,
+                duration_ms: (song.duration_ms > 0).then_some(song.duration_ms),
+                candidates,
+                selected_candidate_idx: 0,
+            }
+        })
+        .collect())
+}
+
+async fn build_bulk_upgrade_album(
+    app_handle: &AppHandle,
+    task_id: &str,
+    platform: Platform,
+    url: &str,
+    selected: Option<&[String]>,
+    effective_format: Option<&str>,
+    fallback_output_dir: &Path,
+) -> Result<(AlbumDownload, Option<PathBuf>), String> {
+    use std::collections::HashSet;
+
+    let mut song_ids: Vec<i64> = Vec::new();
+    if let Some(items) = selected {
+        for raw in items {
+            if let Some(id_str) = raw.strip_prefix("resolve:song:") {
+                if let Ok(id) = id_str.parse::<i64>() {
+                    if !song_ids.contains(&id) {
+                        song_ids.push(id);
+                    }
+                }
+            }
+        }
+    }
+    if song_ids.is_empty() {
+        if let Some(id_str) = url.strip_prefix("resolve:song:") {
+            if let Ok(id) = id_str.parse::<i64>() {
+                song_ids.push(id);
+            }
+        }
+    }
+    let ordered_songs = load_ordered_songs(app_handle, &song_ids).await?;
+
+    let first = ordered_songs[0].clone();
+    let distinct_albums: HashSet<(String, String)> = ordered_songs
+        .iter()
+        .map(|s| (s.album_artist.to_lowercase(), s.album.to_lowercase()))
+        .collect();
+    let album_title = if distinct_albums.len() == 1 && !first.album.is_empty() {
+        first.album.clone()
+    } else {
+        format!("Upgrading {} tracks", ordered_songs.len())
+    };
+    let album_artist = first.album_artist.clone();
+
+    let _ = app_handle.emit(
+        "download-task-progress",
+        ProgressEvent {
+            task_id: task_id.to_string(),
+            current: 0,
+            total: ordered_songs.len(),
+            track_title: "Resolving best sources in bulk...".into(),
+        },
+    );
+
+    let per_song_candidates = resolve_upgrade_candidates_cached(&ordered_songs).await;
+
     let mut tracks = Vec::with_capacity(ordered_songs.len());
     let mut replace_ids = HashMap::new();
+    let mut skipped_same_quality = 0usize;
     for (idx, song) in ordered_songs.into_iter().enumerate() {
         let candidates = &per_song_candidates[idx];
-        let (mut primary_url, mut fallback_urls) =
-            pick_candidate_urls_for_tier(candidates, effective_format, 0);
+        let local_exists = Path::new(&song.path).exists();
+        let chosen = pick_candidate_entry_for_tier(candidates, effective_format, 0);
+        if let Some((chosen_idx, _, _)) = &chosen {
+            let cand_tier = candidates[*chosen_idx].quality_tier;
+            if !candidate_improves_local(song.quality_tier, local_exists, cand_tier) {
+                tracing::info!(
+                    title = %song.title,
+                    local_tier = ?song.quality_tier,
+                    candidate_tier = ?cand_tier,
+                    "Skipping upgrade: local file already has equal or higher quality"
+                );
+                skipped_same_quality += 1;
+                continue;
+            }
+        } else if local_exists {
+            // No verified external candidate beats or replaces an existing local file cleanly.
+            skipped_same_quality += 1;
+            continue;
+        }
+
+        let (mut primary_url, mut fallback_urls) = match chosen {
+            Some((_, primary, fallbacks)) => (primary, fallbacks),
+            None => (String::new(), Vec::new()),
+        };
         if let Some(ref orig_url) = song.source_url {
             if orig_url.starts_with("http://") || orig_url.starts_with("https://") {
                 if primary_url.is_empty() {
@@ -501,7 +603,7 @@ async fn build_bulk_upgrade_album(
         });
     }
 
-    if tracks.is_empty() {
+    if tracks.is_empty() && skipped_same_quality == 0 {
         return Err("Could not find matching streams on YouTube, Bandcamp, or SoundCloud for upgrade.".to_string());
     }
 
@@ -606,7 +708,7 @@ pub async fn process_album_url(
             crate::resolver::resolve_release_candidates(&mut canonical, None, url).await;
             if let Ok(serialized) = serde_json::to_string(&canonical) {
                 client
-                    .write_cache(&format!("release_v5:{}", canonical.id), &serialized)
+                    .write_cache(&format!("release_v7:{}", canonical.id), &serialized)
                     .await;
             }
         }
@@ -719,6 +821,19 @@ pub async fn process_album_url(
             .join(sanitize_fs(&album_info.album_artist))
             .join(sanitize_fs(&album_info.title))
     });
+
+    if is_upgrade && tracks.is_empty() {
+        let _ = app_handle.emit(
+            "download-task-progress",
+            ProgressEvent {
+                task_id: task_id.to_string(),
+                current: 1,
+                total: 1,
+                track_title: "Already at the best available quality".into(),
+            },
+        );
+        return Ok((target_library_dir, Vec::new(), None));
+    }
 
     // Only a folder this download creates may be deleted again on cancel or failure: an existing album folder
     // holds songs of the library.
@@ -1067,6 +1182,8 @@ mod tests {
             match_confidence: 1.0,
             is_strict_match: true,
             display_label: plat.into(),
+            matched_title: Some("Song".into()),
+            matched_artist: Some("Artist".into()),
         };
         let list = vec![
             cand("bandcamp", "https://bc.bandcamp.com/track/1", AudioQualityTier::Lossless),
@@ -1111,5 +1228,65 @@ mod tests {
         assert_eq!(detect_platform_from_url("https://artist.bandcamp.com/track/x", Platform::Youtube), Platform::Bandcamp);
         assert_eq!(detect_platform_from_url("https://soundcloud.com/a/b", Platform::Youtube), Platform::Soundcloud);
         assert_eq!(detect_platform_from_url("https://youtu.be/abc", Platform::Bandcamp), Platform::Youtube);
+    }
+
+    #[test]
+    fn candidate_improves_local_checks_file_existence_and_strict_tier_increase() {
+        use crate::metadata::types::AudioQualityTier;
+        use crate::types::QualityTier;
+
+        // Missing local file should always be re-downloadable regardless of recorded tier.
+        assert!(candidate_improves_local(QualityTier::Lossless, false, AudioQualityTier::StandardLossy));
+
+        // Same or lower tier when local file exists should skip upgrade.
+        assert!(!candidate_improves_local(QualityTier::High, true, AudioQualityTier::HighLossy));
+        assert!(!candidate_improves_local(QualityTier::High, true, AudioQualityTier::StandardLossy));
+        assert!(!candidate_improves_local(QualityTier::Lossless, true, AudioQualityTier::HighLossy));
+        assert!(!candidate_improves_local(QualityTier::Lossless, true, AudioQualityTier::Lossless));
+
+        // Strictly higher tier improves the local file.
+        assert!(candidate_improves_local(QualityTier::Low, true, AudioQualityTier::StandardLossy));
+        assert!(candidate_improves_local(QualityTier::Standard, true, AudioQualityTier::HighLossy));
+        assert!(candidate_improves_local(QualityTier::High, true, AudioQualityTier::Lossless));
+    }
+
+    #[test]
+    fn pick_candidate_entry_for_tier_returns_chosen_index_alongside_urls() {
+        use crate::metadata::types::{AudioCandidate, AudioQualityTier, AudioSource};
+
+        let cand = |plat: &str, url: &str, tier: AudioQualityTier| AudioCandidate {
+            source: AudioSource::HttpStream {
+                platform: plat.into(),
+                url: url.into(),
+                format_id: None,
+                direct_stream_url: None,
+                expires_at: None,
+            },
+            quality_tier: tier,
+            codec: "Test".into(),
+            bitrate_kbps: None,
+            sample_rate_hz: None,
+            duration_ms: 180_000,
+            match_confidence: 1.0,
+            is_strict_match: true,
+            display_label: plat.into(),
+            matched_title: Some("Song".into()),
+            matched_artist: Some("Artist".into()),
+        };
+        let list = vec![
+            cand("bandcamp", "https://bc.bandcamp.com/track/1", AudioQualityTier::Lossless),
+            cand("youtube", "https://youtube.com/watch?v=1", AudioQualityTier::HighLossy),
+        ];
+
+        let (idx_best, primary_best, fallbacks_best) =
+            pick_candidate_entry_for_tier(&list, Some("best"), 0).unwrap();
+        assert_eq!(idx_best, 0);
+        assert_eq!(primary_best, "https://bc.bandcamp.com/track/1");
+        assert_eq!(fallbacks_best, vec!["https://youtube.com/watch?v=1"]);
+
+        let (idx_high, primary_high, _) =
+            pick_candidate_entry_for_tier(&list, Some("high"), 0).unwrap();
+        assert_eq!(idx_high, 1);
+        assert_eq!(primary_high, "https://youtube.com/watch?v=1");
     }
 }

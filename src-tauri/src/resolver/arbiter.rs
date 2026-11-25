@@ -64,6 +64,8 @@ mod tests {
             match_confidence: confidence,
             is_strict_match: strict,
             display_label: label.into(),
+            matched_title: Some(label.into()),
+            matched_artist: None,
         }
     }
 

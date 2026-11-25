@@ -8,6 +8,7 @@ import {
   albumLibraryState,
   albumMetadataSourceBadge,
   albumMetaLine,
+  candidateMatchWarning,
   downloadLabel,
   estimatedPlatformQuality,
   formatEditionSubtext,
@@ -22,6 +23,8 @@ import {
   trackRefs,
   trackRowStatus,
   trackTaskStates,
+  upgradableAlbumTracks,
+  unverifiedTracksForDownload,
   type AlbumPreview,
   type AlbumTrackInfo,
 } from "./albumPreview.ts";
@@ -237,6 +240,14 @@ describe("trackAsStreamItem", () => {
 
   it("leaves the duration out when the track has none", () => {
     expect(trackAsStreamItem(base, track(0, { duration_ms: null })).duration).toBeUndefined();
+  });
+
+  it("uses the track URL platform instead of preview.platform when playing Bandcamp or SoundCloud inside MusicBrainz albums", () => {
+    const bcTrack = track(0, { url: "https://heavenpierceher.bandcamp.com/track/the-fall" });
+    expect(trackAsStreamItem(base, bcTrack).platform).toBe("bandcamp");
+
+    const scTrack = track(1, { url: "https://soundcloud.com/artist/track" });
+    expect(trackAsStreamItem(base, scTrack).platform).toBe("soundcloud");
   });
 });
 
@@ -723,5 +734,78 @@ describe("formatEditionSubtext and isTrackRowActive", () => {
     const expanded = partitionEditions(editions, "orig", true);
     expect(expanded.visibleMb.map((e) => e.id)).toEqual(["orig", "mono", "4cd"]);
     expect(expanded.hiddenMbCount).toBe(1);
+  });
+
+  it("summarizes mismatch warnings only for non-strict candidates and flags unverified tracks for download", () => {
+    const strictCand = {
+      source: { kind: "http_stream" as const, platform: "youtube", url: "https://yt/exact" },
+      quality_tier: "high_lossy" as const,
+      codec: "Opus",
+      duration_ms: 156_000,
+      match_confidence: 0.99,
+      is_strict_match: true,
+      display_label: "YouTube (Opus 160k)",
+      matched_title: "Wild Child",
+      matched_artist: "The Doors",
+    };
+    const fuzzyCand = {
+      source: { kind: "http_stream" as const, platform: "youtube", url: "https://yt/edit" },
+      quality_tier: "high_lossy" as const,
+      codec: "Opus",
+      duration_ms: 170_000,
+      match_confidence: 0.72,
+      is_strict_match: false,
+      display_label: "YouTube (Opus 160k)",
+      matched_title: "Wild Child (Single Edit)",
+      matched_artist: "The Doors",
+    };
+
+    const t0 = track(0, { title: "Wild Child", duration_ms: 156_000, candidates: [strictCand], selected_candidate_idx: 0 });
+    const t1 = track(1, { title: "Touch Me", duration_ms: 192_000, candidates: [fuzzyCand], selected_candidate_idx: 0 });
+
+    expect(candidateMatchWarning(t0, strictCand)).toBeNull();
+    expect(candidateMatchWarning(t1, fuzzyCand)).toContain("Wild Child (Single Edit)");
+    expect(candidateMatchWarning(t1, fuzzyCand)).toContain("2:50 vs 3:12");
+
+    const p = preview([t0, t1]);
+    const unverified = unverifiedTracksForDownload(p);
+    expect(unverified).toHaveLength(1);
+    expect(unverified[0].track.index).toBe(1);
+    expect(unverifiedTracksForDownload(p, [t0.url])).toEqual([]);
+  });
+
+  it("finds only downloaded tracks whose resolved candidate strictly improves local quality", () => {
+    const losslessCand = {
+      source: { kind: "http_stream" as const, platform: "bandcamp", url: "https://bc.bandcamp.com/track/1" },
+      quality_tier: "lossless" as const,
+      codec: "FLAC",
+      duration_ms: 156_000,
+      match_confidence: 0.99,
+      is_strict_match: true,
+      display_label: "Bandcamp · FLAC",
+    };
+    const highCand = {
+      source: { kind: "http_stream" as const, platform: "youtube", url: "https://yt/exact" },
+      quality_tier: "high_lossy" as const,
+      codec: "Opus",
+      duration_ms: 156_000,
+      match_confidence: 0.99,
+      is_strict_match: true,
+      display_label: "YouTube · Opus 160k",
+    };
+
+    const t0 = track(0, { title: "Track 1", candidates: [losslessCand], selected_candidate_idx: 0 });
+    const t1 = track(1, { title: "Track 2", candidates: [highCand], selected_candidate_idx: 0 });
+    const t2 = track(2, { title: "Track 3", candidates: [losslessCand], selected_candidate_idx: 0 });
+
+    const localTracks = {
+      [t0.url]: { id: 101, quality_tier: "High" as const, path: "/m/1.opus" },
+      [t1.url]: { id: 102, quality_tier: "High" as const, path: "/m/2.opus" },
+      // t2 is not downloaded locally at all -> excluded from upgradableAlbumTracks
+    };
+
+    const upgradable = upgradableAlbumTracks(preview([t0, t1, t2]), localTracks);
+    expect(upgradable.map((x) => x.local.id)).toEqual([101]);
+    expect(upgradable[0].candidate.quality_tier).toBe("lossless");
   });
 });

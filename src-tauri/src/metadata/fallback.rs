@@ -97,6 +97,8 @@ pub fn synthesize_canonical_from_preview(preview: AlbumPreview) -> CanonicalRele
                 match_confidence: 1.0,
                 is_strict_match: true,
                 display_label,
+                matched_title: Some(track.title.clone()),
+                matched_artist: artists.first().cloned(),
             });
         }
 

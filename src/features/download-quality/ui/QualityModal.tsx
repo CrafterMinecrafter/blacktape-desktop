@@ -4,6 +4,8 @@ import { MdCheck, MdHelpOutline } from "react-icons/md";
 import { useModalStore } from "@/shared/store/modalStore.ts";
 import { ItemType, useLibraryStore, type StartDownloadParams } from "@/shared/store/libraryStore.ts";
 import { useAlbumPreviewStore } from "@/features/album-preview/model/albumPreviewStore.ts";
+import { probeUpgradeCandidates } from "@/shared/lib/audio.ts";
+import type { AlbumTrackInfo } from "@/shared/lib/remote/albumPreview.ts";
 import { platformLabel } from "@/shared/lib/remote/platforms.ts";
 import { PlatformBadge } from "@/shared/ui/platform-badge/PlatformBadge.tsx";
 import {
@@ -11,6 +13,7 @@ import {
   PROBE_WAIT_TEXT,
   buildCanonicalQualityPlan,
   downloadButtonLabel,
+  extractResolveSongIds,
   formatDetails,
   probeAudioFormats,
   type AudioFormat,
@@ -43,6 +46,7 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
   const canGoBack = useModalStore((s) => s.stack.length > 0);
   const startDownload = useLibraryStore((s) => s.startDownload);
   const [formats, setFormats] = useState<AudioFormat[] | null>(null);
+  const [resolvedUpgradeTracks, setResolvedUpgradeTracks] = useState<AlbumTrackInfo[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [picked, setPicked] = useState<string | null>(null);
   const [hintOpen, setHintOpen] = useState(false);
@@ -50,19 +54,52 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
   const album = isAlbumDownload(params);
   const platform = String(params.platform).toLowerCase();
 
-  const isMultiSource = params.url.startsWith("canonical:") || params.url.startsWith("resolve:");
+  const isResolveUpgrade = params.url.startsWith("resolve:");
+  const isMultiSource = params.url.startsWith("canonical:") || isResolveUpgrade;
+  const resolveSongIds = useMemo(
+    () => (isResolveUpgrade ? extractResolveSongIds(params.url, params.trackUrls) : []),
+    [isResolveUpgrade, params.url, params.trackUrls],
+  );
+  const resolveSongIdsKey = resolveSongIds.join(",");
+  const waitingUpgradeProbe =
+    isResolveUpgrade && resolveSongIds.length > 0 && resolvedUpgradeTracks === null;
 
   const canonicalPlan = useMemo(() => {
     if (!isMultiSource) return null;
+    if (isResolveUpgrade) {
+      return buildCanonicalQualityPlan(resolvedUpgradeTracks ?? []);
+    }
     const tracks = previewState && previewState.url === params.url ? previewState.tracks : [];
     return buildCanonicalQualityPlan(tracks, params.trackUrls);
-  }, [isMultiSource, previewState, params.url, params.trackUrls]);
+  }, [isMultiSource, isResolveUpgrade, resolvedUpgradeTracks, previewState, params.url, params.trackUrls]);
+
+  const pickedCanonicalOption = useMemo(() => {
+    if (!isMultiSource || !canonicalPlan) return null;
+    if (picked === canonicalPlan.best.id) return canonicalPlan.best;
+    return canonicalPlan.options.find((o) => o.id === picked) ?? null;
+  }, [isMultiSource, canonicalPlan, picked]);
+  const upgradeNotNeeded = pickedCanonicalOption?.upgradableCount === 0;
 
   useEffect(() => {
     if (isMultiSource) {
       setPicked("best");
       setFormats([]);
-      return;
+      if (!isResolveUpgrade || resolveSongIds.length === 0) {
+        setResolvedUpgradeTracks(null);
+        return;
+      }
+      let cancelled = false;
+      setResolvedUpgradeTracks(null);
+      probeUpgradeCandidates(resolveSongIds)
+        .then((tracks) => {
+          if (!cancelled) setResolvedUpgradeTracks(tracks);
+        })
+        .catch(() => {
+          if (!cancelled) setResolvedUpgradeTracks([]);
+        });
+      return () => {
+        cancelled = true;
+      };
     }
 
     let cancelled = false;
@@ -80,7 +117,7 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
     return () => {
       cancelled = true;
     };
-  }, [params.platform, params.url, params.trackUrls, album, isMultiSource]);
+  }, [params.platform, params.url, params.trackUrls, album, isMultiSource, isResolveUpgrade, resolveSongIdsKey]);
 
   const download = () => {
     const format = picked ?? undefined;
@@ -102,7 +139,15 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
         {!isMultiSource ? ` · ${platformLabel(params.platform)}` : ""}
       </span>
 
-      {isMultiSource && canonicalPlan ? (
+      {isMultiSource && waitingUpgradeProbe ? (
+        <div className={styles.waiting} role="status">
+          <span className={styles.spinner} aria-hidden="true" />
+          <span>
+            Discovering lossless &amp; platform sources…{" "}
+            <span className={styles.muted}>Checking YouTube, Bandcamp &amp; SoundCloud.</span>
+          </span>
+        </div>
+      ) : isMultiSource && canonicalPlan ? (
         <div className={styles.list} role="radiogroup" aria-label="Formats">
           <button
             key={canonicalPlan.best.id}
@@ -224,8 +269,15 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
         <button type="button" className={styles.secondary} onClick={canGoBack ? goBack : closeModal}>
           {canGoBack ? "Back" : "Cancel"}
         </button>
-        <button type="button" className={styles.primary} onClick={download} disabled={formats === null}>
-          {downloadButtonLabel(isMultiSource, picked, formats)}
+        <button
+          type="button"
+          className={styles.primary}
+          onClick={download}
+          disabled={formats === null || waitingUpgradeProbe || upgradeNotNeeded}
+        >
+          {upgradeNotNeeded
+            ? "Already up to date"
+            : downloadButtonLabel(isMultiSource, picked, formats)}
         </button>
       </div>
     </div>

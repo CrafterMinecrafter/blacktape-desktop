@@ -67,12 +67,44 @@ pub async fn process_track_url(
         )
         .await;
 
-        let (mut primary_url, mut fallback_urls) =
-            crate::download::album::pick_candidate_urls_for_tier(
-                &candidates,
-                effective_format.as_deref(),
-                0,
-            );
+        let local_exists = std::path::Path::new(&existing_song.path).exists();
+        let chosen = crate::download::album::pick_candidate_entry_for_tier(
+            &candidates,
+            effective_format.as_deref(),
+            0,
+        );
+        if let Some((chosen_idx, _, _)) = &chosen {
+            let cand_tier = candidates[*chosen_idx].quality_tier;
+            if !crate::download::album::candidate_improves_local(
+                existing_song.quality_tier,
+                local_exists,
+                cand_tier,
+            ) {
+                tracing::info!(
+                    title = %existing_song.title,
+                    local_tier = ?existing_song.quality_tier,
+                    candidate_tier = ?cand_tier,
+                    "Skipping single-track upgrade: local file already has equal or higher quality"
+                );
+                let _ = app_handle.emit(
+                    "download-task-progress",
+                    ProgressEvent {
+                        task_id: task_id.to_string(),
+                        current: 1,
+                        total: 1,
+                        track_title: "Already at the best available quality".into(),
+                    },
+                );
+                return Ok((PathBuf::from(output_dir), Vec::new(), None));
+            }
+        } else if local_exists {
+            return Ok((PathBuf::from(output_dir), Vec::new(), None));
+        }
+
+        let (mut primary_url, mut fallback_urls) = match chosen {
+            Some((_, primary, fallbacks)) => (primary, fallbacks),
+            None => (String::new(), Vec::new()),
+        };
 
         if let Some(ref orig_url) = existing_song.source_url {
             if orig_url.starts_with("http://") || orig_url.starts_with("https://") {

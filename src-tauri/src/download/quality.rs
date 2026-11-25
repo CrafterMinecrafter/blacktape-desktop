@@ -43,9 +43,14 @@ pub fn expected_quality(platform: Platform, lossless_available: bool) -> Expecte
 /// True when a Bandcamp album or track page offers a free download (free or "name your price"): its
 /// `data-tralbum` has a `freeDownloadPage` url instead of `null`. Pure.
 pub fn bandcamp_has_free_download(html: &str) -> bool {
-    ["freeDownloadPage&quot;:&quot;", "\"freeDownloadPage\":\"", "\"freeDownloadPage\": \""]
-        .iter()
-        .any(|needle| html.contains(needle))
+    [
+        "freeDownloadPage&quot;:&quot;",
+        "freeDownloadPage&quot;: &quot;",
+        "\"freeDownloadPage\":\"",
+        "\"freeDownloadPage\": \"",
+    ]
+    .iter()
+    .any(|needle| html.contains(needle))
 }
 
 /// True when the album is in the user's Bandcamp collection (bought). Bandcamp accounts are not supported yet, so

@@ -225,7 +225,7 @@ impl MusicBrainzClient {
     }
 
     async fn resolve_release_id_for_group(&self, rg_id: &str) -> Result<String, String> {
-        let map_key = format!("rg_release_v6:{rg_id}");
+        let map_key = format!("rg_release_v7:{rg_id}");
         if let Some(cached_id) = self.read_cache(&map_key).await {
             let trimmed = cached_id.trim();
             if !trimmed.is_empty() {
@@ -265,7 +265,7 @@ impl MusicBrainzClient {
     /// Accepts either a direct release MBID or `rg:<release-group-mbid>`.
     #[tracing::instrument(skip(self), fields(mbid = %mbid))]
     pub async fn fetch_canonical_release(&self, mbid: &str) -> Result<CanonicalRelease, String> {
-        let cache_key = format!("release_v5:{}", mbid);
+        let cache_key = format!("release_v7:{}", mbid);
         if let Some(cached) = self.read_cache(&cache_key).await {
             if let Ok(parsed) = serde_json::from_str::<CanonicalRelease>(&cached) {
                 tracing::debug!("Cache hit for MusicBrainz canonical release");
@@ -273,10 +273,10 @@ impl MusicBrainzClient {
             }
         }
         if let Some(rg_id) = mbid.strip_prefix("rg:") {
-            if let Some(rel_id) = self.read_cache(&format!("rg_release_v6:{rg_id}")).await {
+            if let Some(rel_id) = self.read_cache(&format!("rg_release_v7:{rg_id}")).await {
                 let rel_id = rel_id.trim();
                 if !rel_id.is_empty() {
-                    if let Some(cached) = self.read_cache(&format!("release_v5:{rel_id}")).await {
+                    if let Some(cached) = self.read_cache(&format!("release_v7:{rel_id}")).await {
                         if let Ok(mut parsed) = serde_json::from_str::<CanonicalRelease>(&cached) {
                             parsed.id = mbid.to_string();
                             if parsed.release_group_id.is_none() {
@@ -367,7 +367,7 @@ impl MusicBrainzClient {
 
         let grouped = group_releases_for_picker(&rg_title, &parsed.releases);
         if let Some(default_opt) = grouped.iter().find(|g| g.is_default) {
-            self.write_cache(&format!("rg_release_v6:{clean_rg}"), &default_opt.id)
+            self.write_cache(&format!("rg_release_v7:{clean_rg}"), &default_opt.id)
                 .await;
         }
         if let Ok(serialized) = serde_json::to_string(&grouped) {
@@ -404,13 +404,13 @@ impl MusicBrainzClient {
         };
 
         let rel_id = self
-            .read_cache(&format!("rg_release_v6:{rg_id}"))
+            .read_cache(&format!("rg_release_v7:{rg_id}"))
             .await
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
         if let Some(ref rid) = rel_id {
-            if let Some(cached_rel) = self.read_cache(&format!("release_v5:{rid}")).await {
+            if let Some(cached_rel) = self.read_cache(&format!("release_v7:{rid}")).await {
                 if let Ok(mut parsed) = serde_json::from_str::<CanonicalRelease>(&cached_rel) {
                     parsed.id = format!("rg:{rg_id}");
                     if parsed.release_group_id.is_none() {
@@ -420,7 +420,7 @@ impl MusicBrainzClient {
                 }
             }
         }
-        if let Some(cached_rg_rel) = self.read_cache(&format!("release_v5:rg:{rg_id}")).await {
+        if let Some(cached_rg_rel) = self.read_cache(&format!("release_v7:rg:{rg_id}")).await {
             if let Ok(parsed) = serde_json::from_str::<CanonicalRelease>(&cached_rg_rel) {
                 return Some(parsed);
             }
@@ -1186,10 +1186,11 @@ pub fn seed_candidates_from_preview(
 
     for disc in &mut release.discs {
         for track in &mut disc.tracks {
-            if let Some(pt) = crate::resolver::matcher::find_matching_track(
+            if let Some(pt) = crate::resolver::matcher::find_matching_track_for_disc(
                 &track.title,
                 track.duration_ms,
                 track.track_number,
+                Some(disc.disc_number),
                 &platform_tracks,
             ) {
                 let cand_dur = pt.duration_ms.unwrap_or(0);
@@ -1234,6 +1235,12 @@ pub fn seed_candidates_from_preview(
                             "YouTube Music (Opus 160k)",
                         ),
                     };
+                let matched_artist = pt
+                    .artists
+                    .first()
+                    .filter(|s| !s.trim().is_empty())
+                    .cloned()
+                    .or_else(|| (!pt.album_artist.trim().is_empty()).then(|| pt.album_artist.clone()));
                 track.candidates.push(AudioCandidate {
                     source: AudioSource::HttpStream {
                         platform: plat_str.to_string(),
@@ -1250,6 +1257,8 @@ pub fn seed_candidates_from_preview(
                     match_confidence: eval.confidence,
                     is_strict_match: eval.is_strict_match,
                     display_label: display_label.to_string(),
+                    matched_title: Some(pt.title.clone()),
+                    matched_artist,
                 });
                 crate::resolver::arbiter::rank_candidates(&mut track.candidates);
                 if track.duration_ms == 0 && cand_dur > 0 {
@@ -2137,11 +2146,11 @@ mod tests {
                 .write_cache("rg_match_v1:the doors::the soft parade", "rg-soft-parade")
                 .await;
             client
-                .write_cache("rg_release_v6:rg-soft-parade", "rel-soft-parade")
+                .write_cache("rg_release_v7:rg-soft-parade", "rel-soft-parade")
                 .await;
             client
                 .write_cache(
-                    "release_v5:rel-soft-parade",
+                    "release_v7:rel-soft-parade",
                     &serde_json::to_string(&cached_release).unwrap(),
                 )
                 .await;

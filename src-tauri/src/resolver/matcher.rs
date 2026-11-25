@@ -68,6 +68,8 @@ pub struct MatchEvaluation {
     pub is_strict_match: bool,
     pub duration_delta_secs: f64,
     pub title_similarity: f32,
+    pub has_version_mismatch: bool,
+    pub has_duration_mismatch: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +77,82 @@ pub enum ArtistMatch {
     Match,
     Neutral,
     Mismatch,
+}
+
+const ARTIST_STOPWORDS: &[&str] = &["the", "a", "an", "of", "and", "feat", "ft", "dj", "mc"];
+
+const VERSION_DERIVATIVE_WORDS: &[&str] = &[
+    "live",
+    "remix",
+    "remixed",
+    "cover",
+    "karaoke",
+    "instrumental",
+    "acoustic",
+    "unplugged",
+    "slowed",
+    "reverb",
+    "nightcore",
+    "8d",
+    "mashup",
+    "bootleg",
+    "tribute",
+    "demo",
+    "acapella",
+    "stripped",
+];
+
+const VERSION_DERIVATIVE_PHRASES: &[&[&str]] = &[
+    &["sped", "up"],
+    &["radio", "edit"],
+    &["tv", "size"],
+    &["chopped", "screwed"],
+    &["chopped", "and", "screwed"],
+    &["type", "beat"],
+];
+
+const TRIBUTE_ARTIST_KEYWORDS: &[&str] = &["tribute", "karaoke", "cover", "covers"];
+
+/// Returns true when `cand_title` introduces derivative version markers (e.g. live, cover, remix, slowed)
+/// that do not appear in `target_title`.
+pub fn has_unwanted_derivative(target_title: &str, cand_title: &str) -> bool {
+    let target_norm = crate::search::ranking::normalize(target_title);
+    let cand_norm = crate::search::ranking::normalize(cand_title);
+    let t_words: Vec<&str> = target_norm.split_whitespace().collect();
+    let c_words: Vec<&str> = cand_norm.split_whitespace().collect();
+    if c_words.is_empty() {
+        return false;
+    }
+
+    for kw in VERSION_DERIVATIVE_WORDS {
+        if *kw == "live" && contains_token_sequence(&c_words, &["live", "hardware"]) {
+            continue;
+        }
+        if c_words.contains(kw) && !t_words.contains(kw) {
+            return true;
+        }
+    }
+    for phrase in VERSION_DERIVATIVE_PHRASES {
+        if contains_token_sequence(&c_words, phrase) && !contains_token_sequence(&t_words, phrase) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Strips a leading `"<artist> - "` prefix from titles such as `"The Doors - Wild Child"`.
+pub fn strip_leading_artist_from_title(target_artist: &str, cand_title: &str) -> String {
+    let target_norm = strip_channel_suffix(target_artist);
+    if target_norm.is_empty() {
+        return cand_title.to_string();
+    }
+    if let Some((prefix, rest)) = cand_title.split_once(" - ") {
+        let prefix_norm = strip_channel_suffix(prefix);
+        if prefix_norm == target_norm || jaro_winkler(&prefix_norm, &target_norm) >= 0.88 {
+            return rest.trim().to_string();
+        }
+    }
+    cand_title.to_string()
 }
 
 fn strip_channel_suffix(raw: &str) -> String {
@@ -114,29 +192,44 @@ pub fn evaluate_artist_match(
 
     let cand_band_norm = strip_channel_suffix(cand_band_name);
     let target_words: Vec<&str> = target_norm.split_whitespace().collect();
+    let meaningful_target: Vec<&str> = target_words
+        .iter()
+        .copied()
+        .filter(|w| w.len() >= 2 && !ARTIST_STOPWORDS.contains(w))
+        .collect();
 
     if !cand_band_norm.is_empty()
         && cand_band_norm != "unknown artist"
         && cand_band_norm != "various artists"
     {
+        let cand_words: Vec<&str> = cand_band_norm.split_whitespace().collect();
+        if TRIBUTE_ARTIST_KEYWORDS
+            .iter()
+            .any(|kw| cand_words.contains(kw) && !target_words.contains(kw))
+        {
+            return ArtistMatch::Mismatch;
+        }
         if cand_band_norm == target_norm
-            || jaro_winkler(&target_norm, &cand_band_norm) >= 0.86
+            || jaro_winkler(&target_norm, &cand_band_norm) >= 0.88
         {
             return ArtistMatch::Match;
         }
-        let cand_words: Vec<&str> = cand_band_norm.split_whitespace().collect();
         if contains_token_sequence(&cand_words, &target_words)
             || contains_token_sequence(&target_words, &cand_words)
         {
             return ArtistMatch::Match;
         }
-        // Check significant multi-artist overlap (e.g. "Artist A, Artist B" vs "Artist A")
-        let shared = target_words
-            .iter()
-            .filter(|w| w.len() >= 2 && cand_words.contains(w))
-            .count();
-        if shared > 0 && shared * 2 >= target_words.len().max(1) {
-            return ArtistMatch::Match;
+        // Check significant multi-artist overlap while ignoring stopwords like "the"/"of"/"and"
+        if !meaningful_target.is_empty() {
+            let shared = meaningful_target
+                .iter()
+                .filter(|w| cand_words.contains(w))
+                .count();
+            if shared == meaningful_target.len()
+                || (shared >= 2 && shared * 2 >= meaningful_target.len())
+            {
+                return ArtistMatch::Match;
+            }
         }
     }
 
@@ -168,7 +261,38 @@ pub fn matches_album_listing(
         return false;
     }
     let eval = evaluate_track_match(target_album, 0, cand_title, 0);
-    eval.title_similarity >= 0.72
+    !eval.has_version_mismatch && eval.title_similarity >= 0.72
+}
+
+fn score_clean_title_pair(clean_target: &str, clean_cand: &str, cand_core: &str) -> f32 {
+    if clean_target.is_empty() || clean_cand.is_empty() {
+        return 0.0;
+    }
+    if clean_target == clean_cand {
+        return 1.0;
+    }
+    if !cand_core.is_empty() && cand_core == clean_target {
+        return 0.95;
+    }
+    let jw = jaro_winkler(clean_target, clean_cand) as f32;
+    let t_words: Vec<&str> = clean_target.split_whitespace().collect();
+    let c_words: Vec<&str> = clean_cand.split_whitespace().collect();
+    let shared = t_words.iter().filter(|tw| c_words.contains(tw)).count();
+    let max_len = t_words.len().max(c_words.len()).max(1);
+    let overlap_ratio = shared as f32 / max_len as f32;
+
+    if contains_token_sequence(&c_words, &t_words) || contains_token_sequence(&t_words, &c_words) {
+        if overlap_ratio >= 0.70 {
+            jw.max(0.92)
+        } else {
+            (jw * 0.55 + overlap_ratio * 0.45).min(0.79)
+        }
+    } else if shared == 0 && jw < 0.85 {
+        // Prevent completely unrelated strings that share a few letters (e.g. "cul de sac" vs "coelacanth")
+        jw * 0.35
+    } else {
+        jw
+    }
 }
 
 /// Evaluates how well a discovered candidate audio matches the target canonical track.
@@ -180,61 +304,73 @@ pub fn evaluate_track_match(
 ) -> MatchEvaluation {
     let clean_target = clean_title(target_title);
     let clean_cand = clean_title(cand_title);
+    let cand_core = cand_title
+        .split(['(', '['])
+        .next()
+        .map(clean_title)
+        .unwrap_or_default();
+    let has_version_mismatch = has_unwanted_derivative(target_title, cand_title);
 
-    let title_similarity = if clean_target.is_empty() || clean_cand.is_empty() {
-        0.0
-    } else if clean_target == clean_cand {
-        1.0
-    } else {
-        let jw = jaro_winkler(&clean_target, &clean_cand) as f32;
-        if clean_cand.contains(&clean_target) || clean_target.contains(&clean_cand) {
-            jw.max(0.92)
-        } else {
-            // Prevent completely unrelated strings that share a few letters (e.g. "cul de sac" vs "coelacanth")
-            // from scoring high enough via Jaro-Winkler alone when they share zero tokens.
-            let t_words: Vec<&str> = clean_target.split_whitespace().collect();
-            let c_words: Vec<&str> = clean_cand.split_whitespace().collect();
-            let has_token_overlap = t_words.iter().any(|tw| c_words.contains(tw));
-            if !has_token_overlap && jw < 0.85 {
-                jw * 0.35
-            } else {
-                jw
-            }
+    let mut title_similarity = score_clean_title_pair(&clean_target, &clean_cand, &cand_core);
+    if let Some((_, rest)) = cand_title.split_once(" - ") {
+        let rest_clean = clean_title(rest);
+        let rest_core = rest
+            .split(['(', '['])
+            .next()
+            .map(clean_title)
+            .unwrap_or_default();
+        let dash_sim = score_clean_title_pair(&clean_target, &rest_clean, &rest_core);
+        if dash_sim > title_similarity {
+            title_similarity = dash_sim;
         }
-    };
+    }
 
-    let (duration_delta_secs, duration_score, duration_strict) = if target_duration_ms == 0 {
-        // Target duration unknown; rely solely on title
-        (0.0, 0.8, true)
-    } else if cand_duration_ms == 0 {
-        // Candidate duration unknown
-        (0.0, 0.5, false)
-    } else {
-        let delta_ms = (cand_duration_ms as i64 - target_duration_ms as i64).abs();
-        let delta_secs = (delta_ms as f64) / 1000.0;
-        let score = if delta_secs <= 2.0 {
-            1.0
-        } else if delta_secs <= 3.5 {
-            0.95
-        } else if delta_secs <= 6.0 {
-            0.75
-        } else if delta_secs <= 12.0 {
-            0.40
+    let (duration_delta_secs, duration_score, duration_strict, has_duration_mismatch) =
+        if target_duration_ms == 0 {
+            // Target duration unknown; rely solely on title
+            (0.0, 0.8, true, false)
+        } else if cand_duration_ms == 0 {
+            // Candidate duration unknown
+            (0.0, 0.5, false, false)
         } else {
-            0.05
+            let target_secs = target_duration_ms as f64 / 1000.0;
+            let delta_ms = (cand_duration_ms as i64 - target_duration_ms as i64).abs();
+            let delta_secs = (delta_ms as f64) / 1000.0;
+            let max_allowed_delta = (target_secs * 0.18).max(15.0).min(90.0);
+            let out_of_bounds = delta_secs > max_allowed_delta;
+            let score = if out_of_bounds {
+                0.0
+            } else if delta_secs <= 2.5 {
+                1.0
+            } else if delta_secs <= 4.0 {
+                0.95
+            } else if delta_secs <= 8.0 {
+                0.70
+            } else {
+                0.35
+            };
+            let is_strict = delta_secs <= 4.0;
+            (delta_secs, score, is_strict, out_of_bounds)
         };
-        let is_strict = delta_secs <= 3.5;
-        (delta_secs, score, is_strict)
-    };
 
-    let confidence = (title_similarity * 0.65 + duration_score * 0.35).clamp(0.0, 1.0);
-    let is_strict_match = duration_strict && (title_similarity >= 0.82);
+    let raw_confidence = (title_similarity * 0.65 + duration_score * 0.35).clamp(0.0, 1.0);
+    let confidence = if has_version_mismatch {
+        (raw_confidence * 0.45).min(0.45)
+    } else if has_duration_mismatch {
+        (raw_confidence * 0.50).min(0.38)
+    } else {
+        raw_confidence
+    };
+    let is_strict_match =
+        !has_version_mismatch && !has_duration_mismatch && duration_strict && (title_similarity >= 0.82);
 
     MatchEvaluation {
         confidence,
         is_strict_match,
         duration_delta_secs,
         title_similarity,
+        has_version_mismatch,
+        has_duration_mismatch,
     }
 }
 
@@ -245,9 +381,35 @@ pub fn find_matching_track<'a>(
     target_track_number: u32,
     platform_tracks: &'a [crate::download::TrackDownload],
 ) -> Option<&'a crate::download::TrackDownload> {
-    // 1. Try matching by exact track number + duration tolerance (delta <= 3.5s)
+    find_matching_track_for_disc(
+        target_title,
+        target_duration_ms,
+        target_track_number,
+        None,
+        platform_tracks,
+    )
+}
+
+/// Disc-aware track matcher for platform album tracklists.
+pub fn find_matching_track_for_disc<'a>(
+    target_title: &str,
+    target_duration_ms: u64,
+    target_track_number: u32,
+    target_disc_number: Option<u32>,
+    platform_tracks: &'a [crate::download::TrackDownload],
+) -> Option<&'a crate::download::TrackDownload> {
+    let has_disc_info = platform_tracks.iter().any(|pt| pt.disc_number.is_some());
+
+    // 1. Try matching by exact track number (and disc number when present) + sanity checks
     let by_number = platform_tracks.iter().find(|pt| {
-        pt.track_number == Some(target_track_number as i32)
+        if pt.track_number != Some(target_track_number as i32) {
+            return false;
+        }
+        if let (Some(td), true) = (target_disc_number, has_disc_info) {
+            pt.disc_number.unwrap_or(1) == td as i32
+        } else {
+            true
+        }
     });
     if let Some(cand) = by_number {
         let eval = evaluate_track_match(
@@ -256,12 +418,16 @@ pub fn find_matching_track<'a>(
             &cand.title,
             cand.duration_ms.unwrap_or(0),
         );
-        if eval.is_strict_match || eval.confidence >= 0.70 {
+        if !eval.has_version_mismatch
+            && !eval.has_duration_mismatch
+            && eval.title_similarity >= 0.65
+            && (eval.is_strict_match || eval.confidence >= 0.72)
+        {
             return Some(cand);
         }
     }
 
-    // 2. Try best match by title + duration across all tracks
+    // 2. Try best match by title + duration across tracks (filtering out wrong versions/durations)
     let mut best: Option<(&'a crate::download::TrackDownload, f32)> = None;
     for cand in platform_tracks {
         let eval = evaluate_track_match(
@@ -270,13 +436,18 @@ pub fn find_matching_track<'a>(
             &cand.title,
             cand.duration_ms.unwrap_or(0),
         );
-        if eval.confidence >= 0.75 {
-            if let Some((_, best_score)) = best {
-                if eval.confidence > best_score {
-                    best = Some((cand, eval.confidence));
-                }
-            } else {
-                best = Some((cand, eval.confidence));
+        if !eval.has_version_mismatch
+            && !eval.has_duration_mismatch
+            && eval.title_similarity >= 0.75
+            && eval.confidence >= 0.76
+        {
+            let disc_bonus = match (target_disc_number, cand.disc_number) {
+                (Some(td), Some(cd)) if td as i32 == cd => 0.05,
+                _ => 0.0,
+            };
+            let score = eval.confidence + disc_bonus;
+            if best.map_or(true, |(_, best_score)| score > best_score) {
+                best = Some((cand, score));
             }
         }
     }
@@ -551,5 +722,70 @@ mod tests {
         assert!(matches_album_listing("Glass Beach", "Plastic Death", "Plastic Death", "Glass Beach"));
         assert!(!matches_album_listing("Glass Beach", "Plastic Death", "Plastic Death", "Rory Sweeney"));
         assert!(!matches_album_listing("Glass Beach", "Plastic Death", "The First Glass Beach Album", "Glass Beach"));
+        assert!(!matches_album_listing("The Doors", "Morrison Hotel", "Morrison Hotel (Live)", "The Doors"));
+    }
+
+    #[test]
+    fn rejects_derivative_versions_duration_outliers_and_stopword_artists() {
+        // Live / slowed / cover / instrumental must fail strict & cap confidence
+        let live = evaluate_track_match("Wild Child", 156_000, "Wild Child (Live at Aquarius)", 156_000);
+        assert!(live.has_version_mismatch);
+        assert!(!live.is_strict_match);
+        assert!(live.confidence < 0.50);
+
+        let slowed = evaluate_track_match("Wild Child", 156_000, "Wild Child (Slowed + Reverb)", 185_000);
+        assert!(slowed.has_version_mismatch);
+        assert!(!slowed.is_strict_match);
+
+        // When canonical title itself is Live, allow Live candidate
+        let intentional_live = evaluate_track_match("Light My Fire (Live)", 420_000, "Light My Fire (Live)", 420_000);
+        assert!(!intentional_live.has_version_mismatch);
+        assert!(intentional_live.is_strict_match);
+
+        // Hard duration bound rejects 3:00 studio vs 5:30 jam or 0:30 teaser
+        let jam = evaluate_track_match("The Crystal Ship", 155_000, "The Crystal Ship", 330_000);
+        assert!(jam.has_duration_mismatch);
+        assert!(!jam.is_strict_match);
+        assert!(jam.confidence < 0.45);
+
+        // Substring title containment with unrelated extra words shouldn't get boosted to 0.92
+        let end_vs_night = evaluate_track_match("The End", 0, "The End of the Night", 0);
+        assert!(end_vs_night.title_similarity < 0.85, "sim={}", end_vs_night.title_similarity);
+
+        // Stopword "the" must not cause "The Beatles" to match "The Doors"
+        assert_eq!(
+            evaluate_artist_match("The Doors", "The Beatles", "Come Together"),
+            ArtistMatch::Mismatch
+        );
+        // Tribute channels must be rejected
+        assert_eq!(
+            evaluate_artist_match("The Doors", "The Doors Tribute Band", "Wild Child"),
+            ArtistMatch::Mismatch
+        );
+    }
+
+    #[test]
+    fn find_matching_track_for_disc_keeps_discs_separate() {
+        let track_proto = |disc: i32, num: i32, title: &str, url: &str| crate::download::TrackDownload {
+            url: url.into(),
+            file_name: format!("{title}.mp3"),
+            title: title.into(),
+            artists: vec!["Artist".into()],
+            album_artist: "Artist".into(),
+            album: "Album".into(),
+            track_number: Some(num),
+            disc_number: Some(disc),
+            genres: None,
+            release_year: Some(2020),
+            source_item_id: None,
+            duration_ms: Some(180_000),
+            fallback_urls: Vec::new(),
+        };
+        let tracks = vec![
+            track_proto(1, 1, "Intro", "https://u/d1t1"),
+            track_proto(2, 1, "Intro (Reprise)", "https://u/d2t1"),
+        ];
+        let matched = find_matching_track_for_disc("Intro (Reprise)", 180_000, 1, Some(2), &tracks);
+        assert_eq!(matched.map(|t| t.url.as_str()), Some("https://u/d2t1"));
     }
 }

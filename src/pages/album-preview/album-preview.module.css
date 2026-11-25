@@ -399,6 +399,37 @@
     color: rgba(255, 255, 255, 0.4);
 }
 
+.candidateBadgeButton.warningBadge {
+    background-color: rgba(245, 158, 11, 0.16);
+    color: #fbbf24;
+    border: 1px solid rgba(245, 158, 11, 0.32);
+}
+
+.warningIcon {
+    font-size: 11px;
+    color: #fbbf24;
+    flex-shrink: 0;
+}
+
+.menuWarningIcon {
+    font-size: 12px;
+    color: #fbbf24;
+    margin-left: 4px;
+    vertical-align: text-bottom;
+}
+
+.candidateMatchedInfo {
+    font-size: 10px;
+    color: rgba(255, 255, 255, 0.72);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.candidateMetaWarn {
+    color: #fbbf24;
+}
+
 .arrowIcon {
     font-size: 10px;
     opacity: 0.6;
@@ -869,4 +900,66 @@
     height: 12px;
     margin-left: auto;
     flex-shrink: 0;
+}
+
+.confirmModal {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    width: 440px;
+    max-width: 100%;
+}
+
+.confirmTitle {
+    margin: 0;
+    font-size: var(--font-lg, 17px);
+    font-weight: 700;
+    color: var(--color-text);
+}
+
+.confirmSubtitle {
+    margin: 0;
+    font-size: var(--font-sm);
+    color: var(--color-muted);
+    line-height: 1.45;
+}
+
+.confirmList {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 220px;
+    overflow-y: auto;
+}
+
+.confirmListItem {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 8px 10px;
+    border-radius: var(--radius-xs);
+    background-color: rgba(245, 158, 11, 0.08);
+    border: 1px solid rgba(245, 158, 11, 0.22);
+}
+
+.confirmTrackName {
+    font-size: var(--font-sm);
+    font-weight: 600;
+    color: var(--color-text);
+}
+
+.confirmTrackWarn {
+    font-size: var(--font-xs);
+    color: #fbbf24;
+}
+
+.confirmActions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 4px;
 }

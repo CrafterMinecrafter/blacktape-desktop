@@ -1,9 +1,12 @@
 use crate::metadata::types::{AudioCandidate, AudioQualityTier, AudioSource};
 use crate::resolver::matcher::{
-    evaluate_artist_match, evaluate_track_match, matches_album_listing, ArtistMatch,
+    evaluate_artist_match, evaluate_track_match, matches_album_listing,
+    strip_leading_artist_from_title, ArtistMatch,
 };
 use crate::search::bandcamp::ItemType;
 use tracing::{debug, warn};
+
+const MAX_FALLBACK_CANDIDATES_PER_PLATFORM: usize = 2;
 
 fn accept_track_candidate(
     artist: &str,
@@ -18,15 +21,42 @@ fn accept_track_candidate(
         return None;
     }
 
-    let eval = evaluate_track_match(title, duration_ms, cand_name, cand_duration_ms);
-    if eval.title_similarity < 0.72 || eval.confidence < 0.50 {
+    let stripped_name = strip_leading_artist_from_title(artist, cand_name);
+    let raw_eval = evaluate_track_match(title, duration_ms, cand_name, cand_duration_ms);
+    let stripped_eval = evaluate_track_match(title, duration_ms, &stripped_name, cand_duration_ms);
+    let eval = if stripped_eval.confidence > raw_eval.confidence {
+        stripped_eval
+    } else {
+        raw_eval
+    };
+
+    if eval.has_version_mismatch || eval.has_duration_mismatch {
+        return None;
+    }
+    if artist_match == ArtistMatch::Neutral && (!eval.is_strict_match || eval.title_similarity < 0.90)
+    {
+        return None;
+    }
+    if eval.title_similarity < 0.78 || eval.confidence < 0.65 {
         return None;
     }
 
     let boost = if artist_match == ArtistMatch::Match { 0.04 } else { 0.0 };
     let confidence = (eval.confidence + boost).clamp(0.0, 1.0);
-    let is_strict = eval.is_strict_match && artist_match != ArtistMatch::Mismatch;
+    let is_strict = eval.is_strict_match && artist_match == ArtistMatch::Match;
     Some((confidence, is_strict))
+}
+
+fn keep_top_candidates(mut candidates: Vec<AudioCandidate>) -> Vec<AudioCandidate> {
+    candidates.sort_by(|a, b| {
+        b.is_strict_match.cmp(&a.is_strict_match).then_with(|| {
+            b.match_confidence
+                .partial_cmp(&a.match_confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+    candidates.truncate(MAX_FALLBACK_CANDIDATES_PER_PLATFORM);
+    candidates
 }
 
 /// Queries YouTube for candidate streams matching the target track.
@@ -61,6 +91,7 @@ pub async fn resolve_youtube_candidates(
             &item.band_name,
             cand_duration_ms,
         ) {
+            let matched_artist = (!item.band_name.trim().is_empty()).then(|| item.band_name.clone());
             candidates.push(AudioCandidate {
                 source: AudioSource::HttpStream {
                     platform: "youtube".into(),
@@ -77,17 +108,20 @@ pub async fn resolve_youtube_candidates(
                 match_confidence: confidence,
                 is_strict_match,
                 display_label: "YouTube (Opus 160k)".into(),
+                matched_title: Some(item.name),
+                matched_artist,
             });
         }
     }
 
+    let top = keep_top_candidates(candidates);
     debug!(
         "Resolved {} YouTube candidate(s) for '{} - {}'",
-        candidates.len(),
+        top.len(),
         artist,
         title
     );
-    candidates
+    top
 }
 
 /// Queries Bandcamp for candidate streams matching the target track.
@@ -122,6 +156,7 @@ pub async fn resolve_bandcamp_candidates(
             &item.band_name,
             cand_duration_ms,
         ) {
+            let matched_artist = (!item.band_name.trim().is_empty()).then(|| item.band_name.clone());
             candidates.push(AudioCandidate {
                 source: AudioSource::HttpStream {
                     platform: "bandcamp".into(),
@@ -138,17 +173,34 @@ pub async fn resolve_bandcamp_candidates(
                 match_confidence: confidence,
                 is_strict_match,
                 display_label: "Bandcamp (MP3 128k)".into(),
+                matched_title: Some(item.name),
+                matched_artist,
             });
         }
     }
 
+    let mut top = keep_top_candidates(candidates);
+    if !top.is_empty() {
+        let free_url = top.first().map(|c| c.source.primary_url().to_string());
+        if let Some(u) = free_url {
+            if crate::download::bandcamp::page_has_free_download(&u).await {
+                for cand in &mut top {
+                    cand.quality_tier = AudioQualityTier::Lossless;
+                    cand.codec = "FLAC".into();
+                    cand.bitrate_kbps = None;
+                    cand.sample_rate_hz = Some(44100);
+                    cand.display_label = "Bandcamp · FLAC (Lossless)".into();
+                }
+            }
+        }
+    }
     debug!(
         "Resolved {} Bandcamp candidate(s) for '{} - {}'",
-        candidates.len(),
+        top.len(),
         artist,
         title
     );
-    candidates
+    top
 }
 
 /// Queries SoundCloud for candidate streams matching the target track.
@@ -183,6 +235,7 @@ pub async fn resolve_soundcloud_candidates(
             &item.band_name,
             cand_duration_ms,
         ) {
+            let matched_artist = (!item.band_name.trim().is_empty()).then(|| item.band_name.clone());
             candidates.push(AudioCandidate {
                 source: AudioSource::HttpStream {
                     platform: "soundcloud".into(),
@@ -199,17 +252,20 @@ pub async fn resolve_soundcloud_candidates(
                 match_confidence: confidence,
                 is_strict_match,
                 display_label: "SoundCloud (MP3 128k)".into(),
+                matched_title: Some(item.name),
+                matched_artist,
             });
         }
     }
 
+    let top = keep_top_candidates(candidates);
     debug!(
         "Resolved {} SoundCloud candidate(s) for '{} - {}'",
-        candidates.len(),
+        top.len(),
         artist,
         title
     );
-    candidates
+    top
 }
 
 /// Placeholder for BitTorrent swarm provider (Milestone 2).
@@ -253,16 +309,16 @@ pub async fn resolve_youtube_album_tracks(
     Vec::new()
 }
 
-/// Queries Bandcamp for the full album matching `artist` and `album_title`.
+/// Queries Bandcamp for the full album matching `artist` and `album_title`, along with whether it offers free lossless downloads.
 pub async fn resolve_bandcamp_album_tracks(
     artist: &str,
     album_title: &str,
-) -> Vec<crate::download::TrackDownload> {
+) -> (Vec<crate::download::TrackDownload>, bool) {
     let query = format!("{} {}", artist, album_title);
     let search_res = crate::search::bandcamp::search(&query).await;
     let suggestions = match search_res {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), false),
     };
 
     for item in suggestions {
@@ -270,17 +326,20 @@ pub async fn resolve_bandcamp_album_tracks(
             && item.item_url_path.contains("/album/")
             && matches_album_listing(artist, album_title, &item.name, &item.band_name)
         {
-            if let Ok(album_download) = crate::download::bandcamp::parse_album(&item.item_url_path).await {
+            if let Ok((album_download, is_free_download)) =
+                crate::download::bandcamp::parse_album_with_free_flag(&item.item_url_path).await
+            {
                 debug!(
-                    "Resolved {} tracks from Bandcamp album '{}'",
+                    "Resolved {} tracks from Bandcamp album '{}' (free_lossless={})",
                     album_download.tracks.len(),
-                    item.item_url_path
+                    item.item_url_path,
+                    is_free_download
                 );
-                return album_download.tracks;
+                return (album_download.tracks, is_free_download);
             }
         }
     }
-    Vec::new()
+    (Vec::new(), false)
 }
 
 /// Queries SoundCloud for the full album / set matching `artist` and `album_title`.
@@ -418,6 +477,21 @@ mod tests {
         assert_eq!(
             accept_track_candidate("Glass Beach", "Cul-de-sac", 225_000, "Coelacanth", "Glass Beach", 394_000),
             None
+        );
+        assert_eq!(
+            accept_track_candidate("The Doors", "Wild Child", 156_000, "Wild Child (Live at Aquarius)", "The Doors", 156_000),
+            None
+        );
+        assert_eq!(
+            accept_track_candidate("The Doors", "Wild Child", 156_000, "Wild Child", "The Doors", 320_000),
+            None
+        );
+        assert_eq!(
+            accept_track_candidate("The Doors", "Wild Child", 156_000, "Wild Child", "The Beatles", 156_000),
+            None
+        );
+        assert!(
+            accept_track_candidate("The Doors", "Wild Child", 156_000, "The Doors - Wild Child", "ClassicRockChannel", 156_000).is_some()
         );
         assert!(
             accept_track_candidate(

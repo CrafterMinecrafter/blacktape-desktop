@@ -1,7 +1,7 @@
 import { coverSrc } from "@/shared/lib/remote/cover";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import clsx from "clsx";
-import { BiArrowBack, BiDownload, BiRightArrowAlt } from "react-icons/bi";
+import { BiArrowBack, BiDownload, BiRightArrowAlt, BiUpArrowAlt } from "react-icons/bi";
 import { FaCheckCircle } from "react-icons/fa";
 import { FiCheck } from "react-icons/fi";
 import { MdKeyboardArrowDown, MdSettings } from "react-icons/md";
@@ -16,7 +16,12 @@ import { DownloadStatusBadge } from "@/shared/ui/download-status-badge/DownloadS
 import { ItemType, useLibraryStore, type StartDownloadParams } from "@/shared/store/libraryStore.ts";
 import { useAudioStore } from "@/shared/store/audioStore.ts";
 import { openQualityMenu } from "@/features/download-quality/ui/QualityModal.tsx";
-import { getLibraryAlbum, getLibraryTrackIds } from "@/shared/lib/library/libraryIndex.ts";
+import { useModalStore } from "@/shared/store/modalStore.ts";
+import {
+  getLibraryAlbum,
+  getLibraryTrackDetails,
+  type LibraryTrackDetails,
+} from "@/shared/lib/library/libraryIndex.ts";
 import { AddToQueue } from "@/shared/lib/audio.ts";
 import { startMixedPlayback, streamAddToQueue, type MixedEntry } from "@/shared/lib/remote/stream.ts";
 import { sameUrl } from "@/shared/lib/remote/urlKey.ts";
@@ -35,6 +40,8 @@ import {
   trackAsStreamItem,
   trackRefs,
   trackTaskStates,
+  unverifiedTracksForDownload,
+  upgradableAlbumTracks,
   type AlbumPreview as AlbumPreviewData,
   type AlbumTrackInfo,
 } from "@/shared/lib/remote/albumPreview.ts";
@@ -77,7 +84,8 @@ const AlbumPreview = () => {
   const albums = useLibraryStore((s) => s.albums);
   const playStream = useStreamStore((s) => s.play);
   const { openMenu } = useRemoteTrackMenu();
-  const [localTrackIds, setLocalTrackIds] = useState<Record<string, number>>({});
+  const [localTracks, setLocalTracks] = useState<Record<string, LibraryTrackDetails>>({});
+  const [activeUpgradeUrl, setActiveUpgradeUrl] = useState<string | null>(null);
   const [editionsOpen, setEditionsOpen] = useState(false);
   const [showAllEditions, setShowAllEditions] = useState(false);
   const editionRef = useRef<HTMLDivElement>(null);
@@ -85,6 +93,7 @@ const AlbumPreview = () => {
   useEffect(() => {
     setEditionsOpen(false);
     setShowAllEditions(false);
+    setActiveUpgradeUrl(null);
   }, [preview?.url]);
 
   useEffect(() => {
@@ -137,21 +146,86 @@ const AlbumPreview = () => {
   );
   useEffect(() => {
     if (refs.length === 0) {
-      setLocalTrackIds({});
+      setLocalTracks({});
       return;
     }
     let cancelled = false;
-    getLibraryTrackIds(refs)
-      .then((ids) => {
-        if (!cancelled) setLocalTrackIds(ids);
+    getLibraryTrackDetails(refs)
+      .then((details) => {
+        if (!cancelled) setLocalTracks(details);
       })
       .catch(() => {
-        if (!cancelled) setLocalTrackIds({});
+        if (!cancelled) setLocalTracks({});
       });
     return () => {
       cancelled = true;
     };
   }, [refs, downloadedSignature, albums]);
+
+  const localTrackIds = useMemo(() => {
+    const out: Record<string, number> = {};
+    for (const [url, details] of Object.entries(localTracks)) {
+      out[url] = details.id;
+    }
+    return out;
+  }, [localTracks]);
+
+  const upgradableTracks = useMemo(
+    () => (preview ? upgradableAlbumTracks(preview, localTracks) : []),
+    [preview, localTracks],
+  );
+  const upgradeUrl = useMemo(() => {
+    if (upgradableTracks.length === 0) return null;
+    return upgradableTracks.length === 1
+      ? `resolve:song:${upgradableTracks[0].local.id}`
+      : `resolve:batch:${upgradableTracks.map((u) => u.local.id).join(",")}`;
+  }, [upgradableTracks]);
+  const runningUpgrade = useMemo(() => {
+    const matchIds = new Set(upgradableTracks.map((u) => u.local.id));
+    return Object.values(activeDownloads).find((d) => {
+      if (!isDownloadBusy(d) || d.status === "completed") return false;
+      if (activeUpgradeUrl && d.url === activeUpgradeUrl) return true;
+      if (upgradeUrl && d.url === upgradeUrl) return true;
+      if (d.url.startsWith("resolve:song:")) {
+        return matchIds.has(Number(d.url.slice("resolve:song:".length)));
+      }
+      if (d.url.startsWith("resolve:batch:")) {
+        return d.url
+          .slice("resolve:batch:".length)
+          .split(",")
+          .some((id) => matchIds.has(Number(id)));
+      }
+      return false;
+    });
+  }, [activeDownloads, activeUpgradeUrl, upgradeUrl, upgradableTracks]);
+
+  const startUpgrade = (items: typeof upgradableTracks) => {
+    if (!preview || items.length === 0) return;
+    const isSingle = items.length === 1;
+    const targetUrl = isSingle
+      ? `resolve:song:${items[0].local.id}`
+      : `resolve:batch:${items.map((u) => u.local.id).join(",")}`;
+    setActiveUpgradeUrl(targetUrl);
+    void useLibraryStore.getState().startDownload({
+      platform: preview.platform,
+      downloadType: isSingle ? ItemType.Track : ItemType.Album,
+      url: targetUrl,
+      artistName: preview.artist,
+      title: isSingle ? items[0].track.title : preview.title,
+      coverUrl: preview.cover_url ?? undefined,
+      trackUrls: isSingle ? undefined : items.map((u) => `resolve:song:${u.local.id}`),
+      replaceSongId: isSingle ? items[0].local.id : undefined,
+      placement: isSingle
+        ? {
+            album: preview.title,
+            album_artist: preview.artist,
+            title: items[0].track.title,
+            track_number: items[0].track.track_number ?? null,
+          }
+        : undefined,
+      format: "best",
+    });
+  };
 
   const taskStates = useMemo(
     () => trackTaskStates(trackTasks, activeDownloads, preview?.tracks, preview?.url),
@@ -572,8 +646,25 @@ const AlbumPreview = () => {
                     disabled={selectable.length === 0 || running !== undefined}
                     onClick={() => {
                       if (action?.kind === "go-to-album") void goToAlbum();
-                      else if (action?.kind === "download-missing") void downloadUrls(action.urls);
-                      else clearSelectionAfter(download);
+                      else if (action?.kind === "download-missing") {
+                        confirmDownloadWithWarnings(
+                          preview,
+                          action.urls,
+                          () => void downloadUrls(action.urls),
+                          (verified) => void downloadUrls(verified),
+                        );
+                      } else {
+                        const selUrls = selectedUrls(preview, selection.selected);
+                        const scopeUrls =
+                          selUrls.length > 0 && selUrls.length < selectable.length ? selUrls : undefined;
+                        confirmDownloadWithWarnings(
+                          preview,
+                          scopeUrls,
+                          () => clearSelectionAfter(download),
+                          (verified) =>
+                            clearSelectionAfter(() => downloadUrls(verified)),
+                        );
+                      }
                     }}
                   >
                     {running ? (
@@ -598,8 +689,24 @@ const AlbumPreview = () => {
                           action.kind === "download-missing" ? action.urls : selectedUrls(preview, selection.selected);
                         openQualityMenu(previewDownloadParams(preview, urls), {
                           start: (format) => {
-                            if (action.kind === "download-missing") void downloadUrls(action.urls, format);
-                            else clearSelectionAfter(() => download(format));
+                            if (action.kind === "download-missing") {
+                              confirmDownloadWithWarnings(
+                                preview,
+                                action.urls,
+                                () => void downloadUrls(action.urls, format),
+                                (verified) => void downloadUrls(verified, format),
+                              );
+                            } else {
+                              const scopeUrls =
+                                urls.length > 0 && urls.length < selectable.length ? urls : undefined;
+                              confirmDownloadWithWarnings(
+                                preview,
+                                scopeUrls,
+                                () => clearSelectionAfter(() => download(format)),
+                                (verified) =>
+                                  clearSelectionAfter(() => downloadUrls(verified, format)),
+                              );
+                            }
                           },
                         });
                       }}
@@ -608,6 +715,34 @@ const AlbumPreview = () => {
                     </button>
                   )}
                 </div>
+                {action?.kind === "go-to-album" && (upgradableTracks.length > 0 || runningUpgrade) && (
+                  <button
+                    type="button"
+                    className={styles.secondaryButton}
+                    disabled={runningUpgrade !== undefined}
+                    onClick={() => {
+                      const targetUrls = upgradableTracks.map((u) => u.track.url);
+                      confirmDownloadWithWarnings(
+                        preview,
+                        targetUrls,
+                        () => startUpgrade(upgradableTracks),
+                        (verified) => {
+                          const verifiedSet = new Set(verified);
+                          startUpgrade(upgradableTracks.filter((u) => verifiedSet.has(u.track.url)));
+                        },
+                      );
+                    }}
+                  >
+                    {runningUpgrade ? (
+                      `Upgrading ${runningUpgrade.overallPercent}%`
+                    ) : (
+                      <>
+                        <BiUpArrowAlt size={18} />
+                        Upgrade audio quality
+                      </>
+                    )}
+                  </button>
+                )}
                 {justCompleted && !running && action?.kind !== "go-to-album" && (
                   <span className={styles.done}>
                     <FaCheckCircle size={14} /> Downloaded
@@ -694,10 +829,17 @@ const AlbumPreview = () => {
                               selectTrack(track.index, { ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey })
                             }
                             onPlay={() => playTrack(track)}
-                            onDownload={() => void downloadTrack(track)}
+                            onDownload={() =>
+                              confirmDownloadWithWarnings(preview, [track.url], () => void downloadTrack(track))
+                            }
                             onChooseQuality={() =>
                               openQualityMenu(previewDownloadParams(preview, [track.url], track.title), {
-                                start: (format) => void downloadTrack(track, format),
+                                start: (format) =>
+                                  confirmDownloadWithWarnings(
+                                    preview,
+                                    [track.url],
+                                    () => void downloadTrack(track, format),
+                                  ),
                               })
                             }
                             onSelectCandidate={(candIdx) => {
@@ -748,6 +890,75 @@ function previewDownloadParams(preview: AlbumPreviewData, urls: string[], trackT
     coverUrl: preview.cover_url ?? undefined,
     trackUrls: urls.length > 0 ? urls : undefined,
   };
+}
+
+/** Confirms downloads when any target track has an unverified/non-strict candidate. */
+function confirmDownloadWithWarnings(
+  preview: AlbumPreviewData,
+  targetUrls: readonly string[] | undefined,
+  onProceedAll: () => void,
+  onProceedVerifiedOnly?: (verifiedUrls: string[]) => void,
+) {
+  const warnings = unverifiedTracksForDownload(preview, targetUrls);
+  if (warnings.length === 0) {
+    onProceedAll();
+    return;
+  }
+
+  const allScope = targetUrls && targetUrls.length > 0
+    ? targetUrls
+    : selectableTracks(preview).map((t) => t.url);
+  const warnedUrls = new Set(warnings.map((w) => w.track.url));
+  const verifiedOnly = allScope.filter((u) => !warnedUrls.has(u));
+  const { openModal, closeModal } = useModalStore.getState();
+
+  openModal(
+    <div className={styles.confirmModal}>
+      <h3 className={styles.confirmTitle}>
+        {warnings.length === 1
+          ? "1 track has an unverified source match"
+          : `${warnings.length} tracks have unverified source matches`}
+      </h3>
+      <p className={styles.confirmSubtitle}>
+        These audio sources differ slightly in title or duration from the canonical release and could be a different version:
+      </p>
+      <ul className={styles.confirmList}>
+        {warnings.map((w) => (
+          <li key={w.track.index} className={styles.confirmListItem}>
+            <span className={styles.confirmTrackName}>{w.track.title}</span>
+            <span className={styles.confirmTrackWarn}>{w.warning}</span>
+          </li>
+        ))}
+      </ul>
+      <div className={styles.confirmActions}>
+        <button type="button" className={styles.secondaryButton} onClick={closeModal}>
+          Cancel
+        </button>
+        {onProceedVerifiedOnly && verifiedOnly.length > 0 && (
+          <button
+            type="button"
+            className={styles.secondaryButton}
+            onClick={() => {
+              closeModal();
+              onProceedVerifiedOnly(verifiedOnly);
+            }}
+          >
+            Download verified only ({verifiedOnly.length})
+          </button>
+        )}
+        <button
+          type="button"
+          className={styles.primaryButton}
+          onClick={() => {
+            closeModal();
+            onProceedAll();
+          }}
+        >
+          Download anyway
+        </button>
+      </div>
+    </div>,
+  );
 }
 
 /** Starts the download and clears the selection: the queue shows what is downloading from here on. */
