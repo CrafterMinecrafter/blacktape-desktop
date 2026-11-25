@@ -1,3 +1,4 @@
+import { torrentStatusMessage } from "@/features/library/model/downloadStatusMessage.ts";
 import { coverSrc } from "@/shared/lib/remote/cover";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import clsx from "clsx";
@@ -16,6 +17,8 @@ import { DownloadStatusBadge } from "@/shared/ui/download-status-badge/DownloadS
 import { ItemType, useLibraryStore, type StartDownloadParams } from "@/shared/store/libraryStore.ts";
 import { useAudioStore } from "@/shared/store/audioStore.ts";
 import { openQualityMenu } from "@/features/download-quality/ui/QualityModal.tsx";
+import { mergeTorrentResolutionsIntoTracks } from "@/features/download-quality/lib/downloadQuality.ts";
+import { useTorrentDiscovery } from "@/features/download-quality/lib/useTorrentDiscovery.ts";
 import { useModalStore } from "@/shared/store/modalStore.ts";
 import {
   getLibraryAlbum,
@@ -50,6 +53,9 @@ import { EMPTY_SELECTION } from "@/shared/lib/ui/selection.ts";
 import { decodeHtmlEntities } from "@/shared/lib/ui/html.ts";
 import { isDownloadBusy } from "@/pages/search-results/searchResultsFormat.ts";
 import { AlbumTrackRow } from "./AlbumTrackRow.tsx";
+import { AlbumQualityPicker } from "@/pages/album-preview/AlbumQualityPicker.tsx";
+import { AlbumDiscoveryStatus } from "@/pages/album-preview/AlbumDiscoveryStatus.tsx";
+import { albumSourceOptions, applyAlbumSource } from "@/pages/album-preview/albumSourceSelection.ts";
 import styles from "./album-preview.module.css";
 
 const AlbumPreview = () => {
@@ -64,6 +70,7 @@ const AlbumPreview = () => {
     trackTasks,
     resolvingCandidates,
     editions,
+    loadingEditions,
     switchingRelease,
   } = useAlbumPreviewStore();
   const {
@@ -90,6 +97,32 @@ const AlbumPreview = () => {
   const [editionsOpen, setEditionsOpen] = useState(false);
   const [showAllEditions, setShowAllEditions] = useState(false);
   const editionRef = useRef<HTMLDivElement>(null);
+  const torrentScope = status === "ready" && !switchingRelease && !isEditingMetadata &&
+    preview?.artist.trim() && preview.title.trim() && preview.tracks.length > 0
+    ? {
+        artist: preview.artist,
+        title: preview.title,
+        expected: preview.tracks.map((track) => ({
+          index: track.index,
+          title: track.title,
+          artist: track.artists[0] ?? preview.artist,
+          disc_number: track.disc_number ?? null,
+          track_number: track.track_number ?? null,
+          duration_ms: track.duration_ms ?? null,
+        })),
+      }
+    : null;
+  const torrentDiscovery = useTorrentDiscovery(preview?.url, torrentScope);
+  const sourceOptions = useMemo(() => albumSourceOptions(preview?.tracks ?? []), [preview?.tracks]);
+  useEffect(() => {
+    if (!preview || resolvingCandidates || torrentDiscovery.phase !== "done") return;
+    const tracks = mergeTorrentResolutionsIntoTracks(preview.tracks, torrentDiscovery.resolutions);
+    if (tracks.every((track, index) => track === preview.tracks[index])) return;
+    useAlbumPreviewStore.setState((state) => {
+      if (state.preview !== preview) return state;
+      return { preview: { ...preview, tracks } };
+    });
+  }, [preview, resolvingCandidates, torrentDiscovery]);
 
   useEffect(() => {
     setEditionsOpen(false);
@@ -425,20 +458,31 @@ const AlbumPreview = () => {
           Back to results
         </button>
       </div>
-      {isEditingMetadata && preview ? (
-        <input
-          type="text"
-          className={styles.inlineArtistInput}
-          value={preview.artist}
-          onChange={(e) => updatePreviewMetadata({ artist: e.target.value })}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" || e.key === "Escape") e.currentTarget.blur();
-          }}
-          aria-label="Album artist"
-        />
-      ) : (
-        <h1 className={clsx(artistStyles.artistName, "truncate")}>{artist}</h1>
-      )}
+      <div className={styles.artistHeader}>
+        {isEditingMetadata && preview ? (
+          <input
+            type="text"
+            className={styles.inlineArtistInput}
+            value={preview.artist}
+            onChange={(e) => updatePreviewMetadata({ artist: e.target.value })}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === "Escape") e.currentTarget.blur();
+            }}
+            aria-label="Album artist"
+          />
+        ) : (
+          <h1 className={clsx(styles.artistName, "truncate")}>{artist}</h1>
+        )}
+        {status === "ready" && preview && (
+          <AlbumDiscoveryStatus
+            loadingEditions={loadingEditions}
+            switchingRelease={switchingRelease}
+            resolvingCandidates={resolvingCandidates}
+            tracks={preview.tracks}
+            torrent={torrentDiscovery}
+          />
+        )}
+      </div>
 
       <section className={artistStyles.albumBlock}>
         <div className={artistStyles.albumBlockLeft}>
@@ -473,13 +517,13 @@ const AlbumPreview = () => {
             ) : (
               <div className={styles.titleWithPicker}>
                 <h2 className={clsx(artistStyles.albumTitle, "truncate")}>{decodeHtmlEntities(title)}</h2>
-                {editions.length > 1 && (() => {
-                  const activeEditionObj =
-                    editions.find((e) =>
-                      preview?.selected_release_id
-                        ? e.id === preview.selected_release_id
-                        : e.is_default,
-                    ) ?? editions[0];
+                {editions.length > 0 && (() => {
+                  const activeEditionObj = editions.find((edition) =>
+                    preview?.selected_release_id
+                      ? edition.id === preview.selected_release_id
+                      : edition.source_kind === preview?.metadata_source &&
+                        Boolean(edition.url && item && sameUrl(edition.url, item.item_url_path)),
+                  );
                   const { visibleMb, hiddenMbCount, platformEditions } = partitionEditions(
                     editions,
                     preview?.selected_release_id,
@@ -487,9 +531,7 @@ const AlbumPreview = () => {
                   );
                   const chipCount = visibleMb.length + platformEditions.length;
                   const renderEditionItem = (edition: (typeof editions)[number]) => {
-                    const activeEdition = preview?.selected_release_id
-                      ? edition.id === preview.selected_release_id
-                      : edition.is_default;
+                    const activeEdition = edition.id === activeEditionObj?.id;
                     const platTag =
                       edition.source_kind === "youtube"
                         ? "YT"
@@ -645,6 +687,7 @@ const AlbumPreview = () => {
 
           {status === "ready" && preview && (
             <>
+              {error && <p className={styles.error} role="alert">{error}</p>}
               <div className={styles.toolbar}>
                 <div className={styles.primarySplit}>
                   <button
@@ -675,9 +718,9 @@ const AlbumPreview = () => {
                     }}
                   >
                     {running ? (
-                      running.overallPercent > 0
+                      torrentStatusMessage(running.message) ?? (running.overallPercent > 0
                         ? `Downloading ${running.overallPercent}%`
-                        : running.message || "Downloading 0%"
+                        : running.message || "Downloading 0%")
                     ) : (
                       <>
                         {action?.kind === "go-to-album" ? <BiRightArrowAlt size={20} /> : <BiDownload size={18} />}
@@ -766,6 +809,19 @@ const AlbumPreview = () => {
                 >
                   {selectedCount >= selectable.length && selectable.length > 0 ? "Clear selection" : "Select all"}
                 </button>
+                {!isEditingMetadata && (
+                  <AlbumQualityPicker
+                    key={preview.url}
+                    options={sourceOptions}
+                    trackCount={preview.tracks.length}
+                    onSelect={(option) => useAlbumPreviewStore.setState((state) => {
+                      if (state.preview?.url !== preview.url) return state;
+                      return {
+                        preview: { ...state.preview, tracks: applyAlbumSource(state.preview.tracks, option) },
+                      };
+                    })}
+                  />
+                )}
                 <StreamActionRow
                   items={streamItems}
                   playLabel="Play album"

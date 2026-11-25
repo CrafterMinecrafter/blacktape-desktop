@@ -35,20 +35,174 @@ fn structured_identity_distinguishes_numeric_titles_artists_and_versions() {
 }
 
 #[test]
+fn real_album_anniversary_titles_match_without_accepting_unrelated_versions() {
+    let doors = Query::new("The Doors", "The Soft Parade").unwrap();
+    assert_eq!(doors.identity("The Doors - The Soft Parade [50th Anniversary Deluxe] (2019) [FLAC 24-192]", &[]), Some(2));
+    assert_eq!(doors.identity("The Doors - The Soft Parade (50th Ann Deluxe Edition) [2019]", &[]), Some(2));
+    assert_eq!(doors.identity("The Doors - The Soft Parade 50th live", &[]), None);
+    assert_eq!(doors.identity("The Doors - The Soft Parade anniversary concert", &[]), None);
+    let radiohead = Query::new("Radiohead", "OK Computer").unwrap();
+    assert_eq!(radiohead.identity("Radiohead - OK Computer (20th Anniversary Edition) [FLAC]", &[]), Some(2));
+    assert_eq!(radiohead.identity("Radiohead - OK Computer 2nd album live", &[]), None);
+}
+
+#[test]
+fn recognizes_full_album_labels_and_the_reversed_ep_title() {
+    let glass_beach = Query::new("glass beach", "the first glass beach album").unwrap();
+    assert_eq!(glass_beach.identity("glass beach - the first glass beach album (full album)", &[]), Some(3));
+    for variant in ["demos", "stems", "full album instrumental"] {
+        assert_eq!(glass_beach.identity(&format!("glass beach - the first glass beach album ({variant})"), &[]), None);
+    }
+    let ep = Query::new("Car Seat Headrest", "Living While Starving").unwrap();
+    assert_eq!(ep.text(false), "Car Seat Headrest Starving While Living");
+    assert_eq!(ep.identity("Car Seat Headrest - Starving While Living [FLAC]", &[]), Some(3));
+    assert_eq!(Query::new("Another Artist", "Living While Starving").unwrap().title, "Living While Starving");
+}
+
+#[test]
+fn distinguishes_soundtrack_labels_from_candidates_that_need_a_tracklist() {
+    let mut query = Query::new("Chris Christodoulou", "DEADBOLT").unwrap();
+    for name in [
+        "Chris Christodoulou - DEADBOLT (Original Game Soundtrack) [FLAC]",
+        "DEADBOLT OST - Chris Christodoulou (2016)",
+        "[2016] DEADBOLT OST - Chris Christodoulou",
+    ] {
+        assert_eq!(query.identity(name, &[]), Some(2), "{name}");
+    }
+    assert_eq!(query.identity("DEADBOLT OST", &[]), None);
+    query.verify_tracklist = true;
+    assert_eq!(query.identity("DEADBOLT OST", &[]), Some(1));
+    assert_eq!(query.identity("Chris Christodoulou - DEADBOLT [BSR press]", &[]), Some(1));
+    for (name, creators) in [
+        ("DEADBOLT OST", &["Deadbolt"][..]),
+        ("DEADBOLT Discography", &[]),
+        ("Chris Christodoulou - DEADBOLT Cross-Section Stems", &[]),
+        ("Chris Christodoulou - DEADBOLT OST Live", &[]),
+        ("Deadbolt Zen - Weightless", &[]),
+        ("DEADBOLT 2 [FLAC]", &[]),
+    ] {
+        assert_eq!(query.identity(name, creators), None, "{name}");
+    }
+    let mut numeric = Query::new("Car Seat Headrest", "4").unwrap();
+    numeric.verify_tracklist = true;
+    assert!(!numeric.can_search_title_only());
+    assert_eq!(numeric.identity("4 [FLAC]", &[]), None);
+}
+
+#[tokio::test]
+#[ignore = "live provider diagnostic; results and availability change"]
+async fn live_requested_albums_and_comparisons() {
+    for (artist, title) in [
+        ("The Doors", "The Soft Parade"),
+        ("Aphex Twin", "drukqs"),
+        ("Radiohead", "OK Computer"),
+        ("Nirvana", "Nevermind"),
+    ] {
+        let report = search(artist, title, |_| {}).await.unwrap();
+        let providers: Vec<_> = report.providers.iter().map(|p| (&p.provider, p.hits.len(), &p.error)).collect();
+        let hits: Vec<_> = report.hits.iter().take(5).map(|h| (&h.title, &h.provider, h.seeders)).collect();
+        println!("{artist} / {title}: providers={providers:?}, hits={hits:?}");
+        assert!(!report.hits.is_empty(), "no verified provider results for {artist} / {title}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "live provider and metadata diagnostic; availability changes"]
+async fn live_search_inspection_and_cached_metadata() {
+    for (artist, title, track) in [
+        ("The Doors", "The Soft Parade", "touch me"),
+        ("Aphex Twin", "drukqs", "vordhosbn"),
+        ("Radiohead", "OK Computer", "paranoid android"),
+        ("Nirvana", "Nevermind", "smells like teen spirit"),
+    ] {
+        let report = search(artist, title, |_| {}).await.unwrap();
+        let mut found = false;
+        for hit in report.hits.iter().filter(|h| h.seeders.is_some_and(|n| n > 0)).take(3) {
+            match crate::torrent::inspect::inspect(&hit.input).await {
+                Ok(release) => {
+                    let matches = release.tracks.iter().any(|file| normalize(&file.title).contains(track));
+                    let cached = crate::torrent::inspect::cached_torrent_bytes(&hit.input).is_some();
+                    println!("{artist} / {title}: {} peers={:?} track={matches} cached={cached}", hit.provider, hit.seeders);
+                    if matches && cached { found = true; break; }
+                }
+                Err(error) => println!("{artist} / {title}: inspection failed: {error}"),
+            }
+        }
+        assert!(found, "no inspected seeded result with {track} for {artist} / {title}");
+    }
+}
+
+#[test]
 fn archive_search_escapes_lucene_and_http_parameters_once() {
     let query = Query::new("A+B", "One (Live) & Two").unwrap();
     let client = reqwest::Client::new();
-    let request = providers::archive::search_request(&client, &query)
+    let request = providers::archive::search_request(&client, &query, false)
         .build()
         .unwrap();
     let parameters = request.url().query_pairs().collect::<Vec<_>>();
     assert!(parameters.iter().any(|(key, value)| {
         key == "q"
-            && value == r#"mediatype:audio AND ((creator:"A\+B" AND title:"One \(Live\) & Two") OR title:"A\+B One \(Live\) & Two")"#
+            && value == r#"mediatype:audio AND ((creator:"A\+B" AND title:"One \(Live\) & Two") OR (title:"A\+B" AND title:"One \(Live\) & Two"))"#
     }));
     assert!(parameters
         .iter()
         .any(|(key, value)| key == "fl[]" && value == "identifier"));
+    let fallback = providers::archive::search_request(&client, &query, true).build().unwrap();
+    assert!(fallback.url().query_pairs().any(|(key, value)| {
+        key == "q" && value == r#"mediatype:audio AND title:"One \(Live\) & Two""#
+    }));
+}
+
+#[tokio::test]
+#[ignore = "live catalog and metadata coverage depend on public providers"]
+async fn live_requested_artist_catalog_coverage() {
+    let catalog: &[(&str, &[&str], &[&str])] = &[
+        ("Aphex Twin", &["Selected Ambient Works 85-92", "Selected Ambient Works Volume II", "I Care Because You Do", "Richard D. James Album", "drukqs", "Syro", "Classics"], &["Xtal", "4", "Vordhosbn", "Avril 14th"]),
+        ("The Doors", &["The Doors", "Strange Days", "Waiting for the Sun", "The Soft Parade", "Morrison Hotel", "L.A. Woman", "Other Voices", "Full Circle", "An American Prayer"], &["Light My Fire", "Touch Me", "The End"]),
+        ("The Beatles", &["Please Please Me", "With the Beatles", "A Hard Day’s Night", "Beatles for Sale", "Help!", "Rubber Soul", "Revolver", "Sgt. Pepper’s Lonely Hearts Club Band", "Magical Mystery Tour", "The Beatles", "Yellow Submarine", "Abbey Road", "Let It Be", "Past Masters", "1"], &["Yesterday", "Hey Jude", "The End"]),
+        ("glass beach", &["the first glass beach album", "plastic death"], &["classic j dies and goes to hell part 1", "bedroom community"]),
+        ("Car Seat Headrest", &["Twin Fantasy", "Teens of Style", "Teens of Denial", "Monomania", "Nervous Young Man", "How to Leave Town", "Making a Door Less Open"], &["Beach Life-in-Death", "Bodys", "Drunk Drivers/Killer Whales"]),
+        ("Sewerslvt", &["Drowning In The Sewer", "Draining Love Story", "The World Is Fvcked", "Skitzofrenia Simulation", "we had good times together, don't forget that"], &["Mr. Kill Myself", "MAKE-ME-SAD", "I Really Like You pt2"]),
+    ];
+    let mut summary = [0; 4];
+    let cases = catalog.iter().flat_map(|&(artist, albums, songs)| {
+        albums.iter().map(move |&title| (artist, title, true))
+            .chain(songs.iter().map(move |&title| (artist, title, false)))
+    }).collect::<Vec<_>>();
+    for batch in cases.chunks(4) {
+        let mut jobs = JoinSet::new();
+        for &(artist, title, is_album) in batch {
+            jobs.spawn(async move {
+            let report = search(artist, title, |_| {}).await.unwrap();
+            let seeded = report.hits.iter().filter(|hit| hit.seeders.is_some_and(|n| n > 0)).count();
+            let mut verified = 0;
+            let mut seeded_lossless = 0;
+            let mut hits: Vec<_> = report.hits.iter().filter(|hit| hit.seeders.is_some_and(|n| n > 0) || hit.provider == "Archive.org").collect();
+            hits.sort_by_key(|hit| !(normalize(&hit.title).split_whitespace().any(|word| matches!(word, "flac" | "alac" | "wav" | "lossless"))));
+            for hit in hits.into_iter().take(2) {
+                let inspection = tokio::time::timeout(Duration::from_secs(12), crate::torrent::inspect::inspect(&hit.input)).await;
+                let Ok(Ok(release)) = inspection else { continue };
+                let lossless = |track: &crate::torrent::release::InspectedTrack| {
+                    !track.is_sample && matches!(track.codec, "FLAC" | "ALAC" | "WAV" | "AIFF" | "APE" | "WAVPACK")
+                };
+                if (is_album && release.tracks.iter().filter(|track| lossless(track)).count() >= 2)
+                    || (!is_album && release.tracks.iter().any(|track| lossless(track) && normalize(&track.title) == normalize(title))) {
+                    verified += 1;
+                    seeded_lossless += usize::from(hit.seeders.is_some_and(|n| n > 0));
+                }
+            }
+            println!("{artist} / {title}: hits={}, seeded={seeded}, lossless_metadata={verified}, seeded_lossless={seeded_lossless}", report.hits.len());
+            [1, usize::from(seeded > 0), usize::from(verified > 0), usize::from(seeded_lossless > 0)]
+            });
+        }
+        while let Some(result) = jobs.join_next().await {
+            for (total, count) in summary.iter_mut().zip(result.unwrap()) {
+                *total += count;
+            }
+        }
+    }
+    println!("CATALOG: {} cases, {} with reported seeders, {} with lossless file metadata, {} with both on the same release", summary[0], summary[1], summary[2], summary[3]);
+    assert!(summary[2] > 0, "live catalog returned no inspectable lossless files");
 }
 
 #[test]
@@ -80,6 +234,58 @@ fn archive_verifies_the_exact_torrent_and_keeps_popularity_separate() {
         providers::archive::has_torrent(&json!({"error":"some upstream failure"}), "x-los-angeles"),
         Err(ProviderError::Unavailable)
     ));
+}
+
+#[tokio::test]
+#[ignore = "live index and torrent metadata diagnostic"]
+async fn live_release_label_and_tracklist_coverage() {
+    use crate::torrent::matcher::{resolve_album_torrents, ExpectedTrackInput, TorrentResolveEvent};
+    for (artist, title, tracks) in [
+        ("Chris Christodoulou", "DEADBOLT", "Now I Am Become Death|Blood on the Dancefloor|This Parrot Is No More|Undead Man Walkin’|Heynong Man|The Great Beyond|The Proverbial Dust Biters|The Way of the Dodo|Reaper (and) Blues|Hemolysis|Werner und Klaus|The Banality of Eternity|Defunktorum™|Break of Dawn|Reaped by Death|Limbo|Dies Irae|Ashes to Ashes, to Ashes (to Ashes)|The Choir Invisible|Lux Perpetua"),
+        ("Chris Christodoulou", "Risk of Rain", "Risk of Rain|Dew Point|Tropic of Capricorn|Monsoon|Cyclogenesis|25.3°N 91.7°E|Hailstorm|Moisture Deficit|Intermission|Tropic of Cancer|Aurora Borealis|Surface Tension|Arctic Oscillation|Precipitation|Double Fucking Rainbow|Coalescence|Chanson d'Automne.."),
+        ("glass beach", "plastic death", "coelacanth|motions|slip under the door|guitar song|rare animal|cul-de-sac|whalefall|puppy|the killer|the CIA|200|commatose|abyss angel"),
+        ("glass beach", "the first glass beach album", "classic j dies and goes to hell part 1|bedroom community|(forever---------)|bone skull|neon glow|cold weather|calico|glass beach|(blood rivers)|dallas|(rat castle)|planetarium|soft!!!!!!|yoshi's island|orchids"),
+        ("Car Seat Headrest", "Living While Starving", "It's Only Sex|Reuse the Cels|I Hate Living|Devil Moon|Oh! Starving"),
+        ("Car Seat Headrest", "Monomania", "Romantic Theory|Misheard Lyrics (Feat. Nora Knight)|Times To Die|Overexposed (Enjoy)|Los Borrachos (I Don’t Have Any Hope Left, But The Weather Is Nice)|Souls|Maud Gone|Sleeping With Strangers|Anchorite (Love You Very Much)"),
+        ("Car Seat Headrest", "4", "a good bridge to never cross until there's no doubt that he's dead|who even knows|even the who knows|not “kidding” around|heartless dick|dickless heart|feel like daniel johnston|the ghost of bob saget|around"),
+        ("Car Seat Headrest", "How To Leave Town", "The Ending of Dramamine|Beast Monster Thing (Love Isn't Love Enough)|Kimochi Warui (When? When? When? When? When? When? When?)|I-94 W (832 mi)|You're In Love With Me|America (Never Been)|I Want You To Know That I'm Awake/I Hope That You're Asleep|is this dust really from the Titanic?|Hey, Space Cadet (Beast Monster Thing In Space)"),
+        ("Car Seat Headrest", "Making a Door Less Open", "Weightlifters|Can’t Cool Me Down|Deadlines (Hostile)|Hollywood|Hymn (remix)|Martin|Deadlines (Thoughtful)|What’s With You Lately|Life Worth Missing|There Must Be More Than Blood|Famous"),
+        ("Car Seat Headrest", "Teens of Denial", "Fill in the Blank|Vincent|Destroyed by Hippie Powers|(Joe Gets Kicked Out of School for Using) Drugs With Friends (But Says This Isn't a Problem)|Not Just What I Needed|Drunk Drivers/Killer Whales|1937 State Park|Unforgiving Girl (She's Not An)|Cosmic Hero|The Ballad of the Costa Concordia|Connect the Dots (The Saga of Frank Sinatra)|Joe Goes to School"),
+    ] {
+        let expected = tracks.split('|').enumerate().map(|(index, track)| ExpectedTrackInput {
+            index,
+            title: track.into(),
+            artist: Some(artist.into()),
+            disc_number: Some(1),
+            track_number: Some(index as u32 + 1),
+            duration_ms: None,
+        }).collect::<Vec<_>>();
+        let events = std::sync::Mutex::new(Vec::new());
+        let (resolved, unavailable) = resolve_album_torrents(artist, title, &expected, |event| {
+            events.lock().unwrap().push(event);
+        }).await.unwrap();
+        println!("{artist} / {title}: unavailable={unavailable:?}");
+        for release in &resolved {
+            let web_seed = crate::torrent::web_seed::archive_item(&release.magnet_uri)
+                .and_then(|item| {
+                    let bytes = crate::torrent::inspect::cached_torrent_bytes(&release.magnet_uri)?;
+                    crate::torrent::web_seed::ArchiveSeed::parse(&bytes, &item, &release.info_hash).ok()
+                }).is_some();
+            println!("  {}: {} {}/{} seeds={:?} web_seed={web_seed} missing={:?} ambiguous={:?}",
+                release.provider, release.codec, release.matched_count, release.total_expected,
+                release.seeders, release.missing_titles, release.ambiguous_titles);
+        }
+        let events = events.into_inner().unwrap();
+        assert!(matches!(events.first(), Some(TorrentResolveEvent::Searching)));
+        assert!(matches!(events.last(), Some(TorrentResolveEvent::Resolved { .. })));
+        let checked: Vec<_> = events.iter().filter_map(|event| match event {
+            TorrentResolveEvent::InspectionProgress { checked, total } => Some((*checked, *total)),
+            _ => None,
+        }).collect();
+        if let Some(&(_, total)) = checked.first() {
+            assert_eq!(checked, (0..=total).map(|n| (n, total)).collect::<Vec<_>>());
+        }
+    }
 }
 
 #[test]

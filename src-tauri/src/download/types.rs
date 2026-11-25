@@ -49,6 +49,8 @@ pub struct TorrentTarget {
     pub file_path: String,
     pub file_size: u64,
     pub quality_tier: crate::metadata::types::AudioQualityTier,
+    #[serde(default)]
+    pub alternatives: Vec<TorrentTarget>,
 }
 
 #[derive(Debug, Clone, Default)]

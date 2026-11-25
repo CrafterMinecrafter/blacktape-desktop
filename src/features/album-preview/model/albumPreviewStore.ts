@@ -51,7 +51,7 @@ export interface AlbumPreviewStore {
   /** Opens the page for an album/set search item and loads its tracks. */
   open: (item: SearchSuggestion) => Promise<void>;
   /** Switches to a different MusicBrainz edition or platform release in the picker. */
-  selectRelease: (editionOrId: ReleaseEditionOption | string, options?: { silent?: boolean }) => Promise<void>;
+  selectRelease: (editionOrId: ReleaseEditionOption | string) => Promise<void>;
   /** Loads the tracks again (after an error). */
   reload: () => Promise<void>;
   /** Back to the search results. */
@@ -126,16 +126,6 @@ function mergeTracksFromCache(preview: AlbumPreview): { preview: AlbumPreview; c
 function shouldResolveCandidates(preview: AlbumPreview, cacheDone: boolean): boolean {
   if (preview.candidates_resolved || cacheDone) return false;
   return preview.tracks.some((t) => t.available && (!t.candidates || t.candidates.length === 0));
-}
-
-function pickDefaultMusicBrainzEdition(
-  editions: readonly ReleaseEditionOption[],
-): ReleaseEditionOption | undefined {
-  const mbEditions = editions.filter(
-    (e) => !e.source_kind || e.source_kind === "musicbrainz",
-  );
-  if (mbEditions.length === 0) return undefined;
-  return mbEditions.find((e) => e.is_default) ?? mbEditions[0];
 }
 
 /** Keeps the entries whose task the library still knows (finished tasks leave `activeDownloads`). */
@@ -276,12 +266,6 @@ export const useAlbumPreviewStore = create<AlbumPreviewStore>((set, get) => ({
               resolvingCandidates: curResolving,
               editions,
             });
-            if (curPreview.metadata_source !== "musicbrainz" && !curPreview.selected_release_id) {
-              const mbDefault = pickDefaultMusicBrainzEdition(editions);
-              if (mbDefault) {
-                void get().selectRelease(mbDefault, { silent: true });
-              }
-            }
           })
           .catch(() => {
             if (!guard.isLatest(token)) return;
@@ -294,7 +278,7 @@ export const useAlbumPreviewStore = create<AlbumPreviewStore>((set, get) => ({
     }
   },
 
-  selectRelease: async (editionOrId, options) => {
+  selectRelease: async (editionOrId) => {
     const { preview, editions } = get();
     if (!preview) return;
     const edition =
@@ -323,6 +307,8 @@ export const useAlbumPreviewStore = create<AlbumPreviewStore>((set, get) => ({
     const token = guard.begin();
     set({
       switchingRelease: true,
+      loadingEditions: false,
+      error: null,
       isEditingMetadata: false,
       selection: EMPTY_SELECTION,
     });
@@ -366,7 +352,7 @@ export const useAlbumPreviewStore = create<AlbumPreviewStore>((set, get) => ({
       if (!guard.isLatest(token)) return;
       set({
         switchingRelease: false,
-        ...(options?.silent ? {} : { error: typeof e === "string" ? e : String(e) }),
+        error: typeof e === "string" ? e : String(e),
       });
     }
   },
@@ -482,17 +468,6 @@ export const useAlbumPreviewStore = create<AlbumPreviewStore>((set, get) => ({
 
     const targetUrl = mergedFromCache.url;
     const rgId = mergedFromCache.release_group_id;
-    const pendingMbUpgrade =
-      editions.length > 0 &&
-      mergedFromCache.metadata_source !== "musicbrainz" &&
-      !mergedFromCache.selected_release_id
-        ? pickDefaultMusicBrainzEdition(editions)
-        : undefined;
-    if (pendingMbUpgrade) {
-      void get().selectRelease(pendingMbUpgrade, { silent: true });
-      return;
-    }
-
     const needsEditions =
       editions.length === 0 &&
       ((Boolean(rgId) && mergedFromCache.metadata_source === "musicbrainz") ||
@@ -519,17 +494,6 @@ export const useAlbumPreviewStore = create<AlbumPreviewStore>((set, get) => ({
               resolvingCandidates: curState.resolvingCandidates,
               isEditingMetadata: curState.isEditingMetadata,
             });
-          }
-          if (
-            curPreview &&
-            curPreview.url === targetUrl &&
-            curPreview.metadata_source !== "musicbrainz" &&
-            !curPreview.selected_release_id
-          ) {
-            const mbDefault = pickDefaultMusicBrainzEdition(nextEditions);
-            if (mbDefault) {
-              void get().selectRelease(mbDefault, { silent: true });
-            }
           }
         })
         .catch(() => {

@@ -74,6 +74,9 @@ pub(super) fn analyze_release(
         let Some((filename, folders)) = file.components.split_last() else {
             continue;
         };
+        if filename.starts_with("._") {
+            continue;
+        }
         let Some((stem, extension)) = filename.rsplit_once('.') else {
             continue;
         };
@@ -173,7 +176,7 @@ static DISC_TRACK_PREFIX: LazyLock<regex::Regex> =
 static TRACK_PREFIX: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"^([0-9]{1,3})[ ._-]+(.+)$").unwrap());
 
-fn track_title<'a>(folders: &[String], stem: &'a str) -> (Option<u32>, Option<u32>, &'a str) {
+pub(super) fn track_title<'a>(folders: &[String], stem: &'a str) -> (Option<u32>, Option<u32>, &'a str) {
     let stem = stem.trim();
     let disc = folders.iter().rev().find_map(|folder| {
         let captures = DISC_FOLDER.captures(folder.trim())?;
@@ -207,4 +210,27 @@ fn track_title<'a>(folders: &[String], stem: &'a str) -> (Option<u32>, Option<u3
 
 fn positive_number(text: &str) -> Option<u32> {
     text.parse().ok().filter(|number| *number > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finder_sidecars_are_not_audio_tracks() {
+        let files = [("01 Romantic Theory.mp3", 7_000_000), ("._01 Romantic Theory.mp3", 4096)]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, length))| RawFile {
+                index,
+                components: vec![name.into()],
+                path: name.into(),
+                length,
+                padding: false,
+            })
+            .collect();
+        let release = analyze_release(String::new(), "Monomania".into(), 7_004_096, files);
+        assert_eq!(release.tracks.len(), 1);
+        assert_eq!(release.tracks[0].title, "Romantic Theory");
+    }
 }

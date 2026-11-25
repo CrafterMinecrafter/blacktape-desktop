@@ -15,6 +15,7 @@ mod tests;
 
 const MAX_QUERY_FIELD_BYTES: usize = 512;
 const MAX_RESULT_TITLE_BYTES: usize = 1536;
+pub(super) const PROVIDER_COUNT: usize = providers::Provider::ALL.len();
 
 #[derive(Clone, Serialize)]
 pub struct SearchHit {
@@ -89,6 +90,7 @@ struct Query {
     title: String,
     artist_words: Vec<String>,
     title_words: Vec<String>,
+    verify_tracklist: bool,
 }
 
 impl Query {
@@ -97,6 +99,10 @@ impl Query {
             .ok_or_else(|| "Enter an artist for torrent discovery.".to_string())?;
         let title = clean_field(title, MAX_QUERY_FIELD_BYTES)
             .ok_or_else(|| "Enter a release or track title for torrent discovery.".to_string())?;
+        let title = match (normalize(&artist).as_str(), normalize(&title).as_str()) {
+            ("car seat headrest", "living while starving") => "Starving While Living".into(),
+            _ => title,
+        };
         let artist_words = normalize(&artist)
             .split_whitespace()
             .map(String::from)
@@ -115,11 +121,20 @@ impl Query {
             title,
             artist_words,
             title_words,
+            verify_tracklist: false,
         })
     }
 
-    fn text(&self) -> String {
-        format!("{} {}", self.artist, self.title)
+    fn text(&self, title_only: bool) -> String {
+        if title_only {
+            self.title.clone()
+        } else {
+            format!("{} {}", self.artist, self.title)
+        }
+    }
+
+    fn can_search_title_only(&self) -> bool {
+        self.verify_tracklist && self.title.chars().filter(|c| c.is_alphabetic()).take(3).count() == 3
     }
 
     fn artist_prefix<'a>(&self, words: &'a [&str]) -> Option<&'a [&'a str]> {
@@ -140,23 +155,32 @@ impl Query {
     fn identity(&self, raw_title: &str, creators: &[&str]) -> Option<u8> {
         let normalized = normalize(raw_title);
         let words = normalized.split_whitespace().collect::<Vec<_>>();
-        let leading_format = words.iter().take_while(|word| is_format_word(word)).count();
-        self.artist_prefix(&words)
-            .and_then(|tail| self.title_rank(tail))
-            .or_else(|| {
-                self.artist_prefix(&words[leading_format..])
-                    .and_then(|tail| self.title_rank(tail))
-            })
-            .or_else(|| {
-                creators
-                    .iter()
-                    .any(|creator| self.matches_creator(creator))
-                    .then(|| self.title_rank(&words))
-                    .flatten()
-            })
+        let leading = words.iter().take_while(|word| is_format_word(word) || is_year(word)).count();
+        let creator_matches = creators.iter().any(|creator| self.matches_creator(creator));
+        let title: Vec<_> = self.title_words.iter().map(String::as_str).collect();
+        let artist: Vec<_> = self.artist_words.iter().map(String::as_str).collect();
+        [words.as_slice(), &words[leading..]].into_iter().filter_map(|words| {
+            // Some indexes place the artist after the title, including soundtrack and vinyl catalogues.
+            let reversed = words.strip_prefix(title.as_slice()).and_then(|tail| {
+                tail.windows(artist.len()).enumerate().filter(|(_, part)| *part == artist.as_slice())
+                    .find_map(|(start, _)| {
+                        let front = suffix_rank(&tail[..start])?;
+                        let back = suffix_rank(&tail[start + artist.len()..])?;
+                        Some(front.min(back))
+                    })
+            });
+            self.artist_prefix(words)
+                .and_then(|tail| self.title_rank(tail, true))
+                .or(reversed)
+                .or_else(|| creator_matches.then(|| self.title_rank(words, true)).flatten())
+                .or_else(|| {
+                    (creators.is_empty() && self.can_search_title_only())
+                        .then(|| self.title_rank(words, false).map(|_| 1)).flatten()
+                })
+        }).max()
     }
 
-    fn title_rank(&self, words: &[&str]) -> Option<u8> {
+    fn title_rank(&self, words: &[&str], artist_verified: bool) -> Option<u8> {
         let title = self
             .title_words
             .iter()
@@ -168,7 +192,15 @@ impl Query {
         std::iter::once(words)
             .chain(after_year)
             .filter_map(|candidate| candidate.strip_prefix(title.as_slice()))
-            .find_map(suffix_rank)
+            .find_map(|suffix| suffix_rank(suffix).or_else(|| {
+                (artist_verified && self.can_search_title_only() && suffix.len() <= 6
+                    && !suffix.iter().any(|word| matches!(*word,
+                        "live" | "remix" | "remixed" | "mix" | "mixes" | "demo" | "demos" | "stems"
+                        | "instrumental" | "instrumentals" | "karaoke" | "cover" | "covers" | "tribute"
+                        | "acoustic" | "rerecorded" | "version" | "versions" | "unplugged" | "bootleg"
+                        | "discography" | "collection" | "concert")))
+                    .then_some(1)
+            }))
     }
 }
 
@@ -230,18 +262,34 @@ fn is_format_word(word: &str) -> bool {
     )
 }
 
+fn is_ordinal(word: &str) -> bool {
+    ["st", "nd", "rd", "th"].iter().any(|suffix| {
+        word.strip_suffix(suffix)
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
 fn suffix_rank(suffix: &[&str]) -> Option<u8> {
+    let suffix = suffix.strip_prefix(&["full", "album"]).unwrap_or(suffix);
     let mut rank = 3;
-    for word in suffix {
+    for (index, word) in suffix.iter().enumerate() {
         match *word {
             "deluxe" | "expanded" | "remaster" | "remastered" | "edition" | "reissue"
             | "anniversary" | "bonus" | "tracks" | "disc" | "disk" | "cd" | "cd1" | "cd2"
             | "cd3" => rank = 2,
+            "ost" | "soundtrack" => rank = 2,
+            "original" | "game" | "video" | "motion" | "picture"
+                if suffix.iter().any(|word| matches!(*word, "ost" | "soundtrack")) => rank = 2,
+            word if is_ordinal(word)
+                && suffix.get(index + 1).is_some_and(|next| matches!(*next, "anniversary" | "ann")) => rank = 2,
+            "ann" if index > 0 && is_ordinal(suffix[index - 1]) => rank = 2,
             word if is_format_word(word) || is_year(word) => {}
             word if word.bytes().all(|byte| byte.is_ascii_digit())
-                && suffix.iter().any(|word| {
-                    is_format_word(word) || matches!(*word, "cd" | "disc" | "disk")
-                }) => {}
+                && index > 0 && matches!(suffix[index - 1], "cd" | "disc" | "disk") => {}
+            "16" | "24" | "32" | "44" | "48" | "88" | "96" | "128" | "176" | "192" | "256" | "320" | "384"
+                if suffix.iter().any(|word| is_format_word(word)) => {}
+            "1" | "2" | "4" if index > 0 && matches!(suffix[index - 1], "44" | "88" | "176")
+                && suffix.iter().any(|word| is_format_word(word)) => {}
             _ => return None,
         }
     }
@@ -311,8 +359,18 @@ pub async fn search(
     title: &str,
     progress: impl Fn(ProviderReport),
 ) -> Result<SearchReport, String> {
+    search_for_release(artist, title, false, progress).await
+}
+
+pub(super) async fn search_for_release(
+    artist: &str,
+    title: &str,
+    verify_tracklist: bool,
+    progress: impl Fn(ProviderReport),
+) -> Result<SearchReport, String> {
     static CLIENT: OnceLock<Result<Client, reqwest::Error>> = OnceLock::new();
-    let query = Query::new(artist, title)?;
+    let mut query = Query::new(artist, title)?;
+    query.verify_tracklist = verify_tracklist;
     let client = CLIENT
         .get_or_init(|| {
             Client::builder()

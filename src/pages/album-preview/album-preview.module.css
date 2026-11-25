@@ -20,6 +20,42 @@
     background-color: rgba(255, 255, 255, 0.08);
 }
 
+.artistHeader {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 12px;
+    border-bottom: 1px solid var(--color-border);
+    margin-bottom: 12px;
+}
+
+.artistName {
+    min-width: 0;
+    max-width: 100%;
+    font-size: var(--font-xl);
+    line-height: 1.5;
+}
+
+.discoveryStatus:empty {
+    display: none;
+}
+
+.discoveryStatus:not(:empty) {
+    display: flex;
+    flex: 1 1 20rem;
+    flex-wrap: wrap;
+    gap: 6px 16px;
+    min-width: 0;
+    color: var(--color-muted);
+    font-size: var(--font-xs);
+}
+
+.discoveryStep {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
 .toolbar {
     display: flex;
     flex-wrap: wrap;
@@ -204,7 +240,6 @@
     font-size: var(--font-xl);
     font-weight: 700;
     line-height: 1.4;
-    margin-bottom: 10px;
 }
 
 .inlineTitleInput {
@@ -599,6 +634,34 @@
 .source_soundcloud {
     background-color: rgba(249, 115, 22, 0.16);
     color: #fdba74;
+}
+
+.albumQualityButton {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    white-space: nowrap;
+}
+
+.albumQualityMenu {
+    left: 0;
+    right: auto;
+    min-width: 270px;
+    max-height: 320px;
+    overflow-y: auto;
+}
+
+.albumQualityCoverage {
+    margin-left: auto;
+    white-space: nowrap;
+    color: var(--color-muted);
+    font-size: var(--font-xs);
+}
+
+.albumQualityNote {
+    padding: 6px 8px;
+    color: var(--color-muted);
+    font-size: var(--font-xs);
 }
 
 .estimateBadge {

@@ -59,7 +59,7 @@ static CACHED_TORRENT_BYTES: LazyLock<Mutex<Vec<(String, Vec<u8>)>>> =
 static INSPECTION_SLOTS: Semaphore = Semaphore::const_new(2);
 const MAX_CACHED_TORRENT_BYTES: usize = 24;
 
-fn cache_torrent_bytes(key: &str, bytes: &[u8]) {
+pub(super) fn cache_torrent_bytes(key: &str, bytes: &[u8]) {
     let norm = key.trim().to_ascii_lowercase();
     if norm.is_empty() || bytes.is_empty() || bytes.len() > MAX_METADATA_BYTES {
         return;
@@ -368,7 +368,7 @@ impl Resolve for PinnedResolver {
     }
 }
 
-async fn public_client(url: &Url) -> Result<Client, String> {
+pub(super) async fn public_client(url: &Url) -> Result<Client, String> {
     let mut builder = Client::builder()
         .no_proxy()
         .redirect(Policy::none())
@@ -473,7 +473,7 @@ async fn fetch_metadata(mut url: Url, is_cache: bool) -> Result<Vec<u8>, String>
     Err("Torrent URL redirected too many times.".into())
 }
 
-fn parse_metainfo(bytes: &[u8], expected_hash: Option<&str>) -> Result<InspectedRelease, String> {
+pub(super) fn parse_metainfo(bytes: &[u8], expected_hash: Option<&str>) -> Result<InspectedRelease, String> {
     if bytes.len() > MAX_METADATA_BYTES {
         return Err("Torrent metadata exceeds the size limit.".into());
     }

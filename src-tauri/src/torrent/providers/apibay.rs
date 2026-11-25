@@ -1,7 +1,7 @@
 use super::*;
 
-pub(super) fn request(client: &Client, query: &Query) -> RequestBuilder {
-    let text = query.text();
+pub(super) fn request(client: &Client, query: &Query, title_only: bool) -> RequestBuilder {
+    let text = query.text(title_only);
     client
         .get("https://apibay.org/q.php")
         .query(&[("q", text.as_str()), ("cat", "100")])

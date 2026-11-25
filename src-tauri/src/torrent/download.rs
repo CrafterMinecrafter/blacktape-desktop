@@ -1,5 +1,5 @@
 use crate::download::types::TrackDownload;
-use librqbit::{AddTorrent, AddTorrentOptions, ManagedTorrent, Session, SessionOptions};
+use librqbit::{AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent, Session, SessionOptions};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -12,6 +12,33 @@ const TORRENT_INIT_TIMEOUT: Duration = Duration::from_secs(25);
 const TORRENT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(25);
 const TORRENT_STALL_TIMEOUT: Duration = Duration::from_secs(45);
 const POLL_INTERVAL: Duration = Duration::from_millis(350);
+const NO_TORRENT_DATA: &str = "Timed out waiting for the selected torrent to send data.";
+
+enum TransferError {
+    NoData,
+    Other(String),
+}
+
+impl From<String> for TransferError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+async fn retry_without_dht<T, F, Fut>(mut attempt: F) -> Result<T, String>
+where
+    F: FnMut(bool) -> Fut,
+    Fut: std::future::Future<Output = Result<T, TransferError>>,
+{
+    let result = match attempt(false).await {
+        Err(TransferError::NoData) => attempt(true).await,
+        result => result,
+    };
+    result.map_err(|error| match error {
+        TransferError::NoData => NO_TORRENT_DATA.into(),
+        TransferError::Other(message) => message,
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct TorrentFileRequest {
@@ -25,6 +52,7 @@ pub struct TorrentFileRequest {
 pub struct TorrentTransferResult {
     pub completed: Vec<(PathBuf, TrackDownload, usize)>,
     pub failed_tracks: Vec<(usize, TrackDownload)>,
+    pub failure: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -112,15 +140,212 @@ pub async fn download_torrent_files(
     completed_counter: Arc<std::sync::atomic::AtomicUsize>,
     track_sender: Option<tokio::sync::mpsc::Sender<(PathBuf, TrackDownload, usize)>>,
 ) -> Result<TorrentTransferResult, String> {
+    download_with_alternates(locator, requests, |source, pending, retry| {
+        let completed_counter = Arc::clone(&completed_counter);
+        let track_sender = track_sender.clone();
+        async move {
+            if retry {
+                emit_task_progress(
+                    Some(app), task_id, completed_counter.load(std::sync::atomic::Ordering::SeqCst),
+                    total_task_tracks, "Retrying torrent with another release at the selected quality…",
+                ).await;
+            }
+            download_one_torrent(
+                app, task_id, library_dir, &source, &pending, total_task_tracks,
+                completed_counter, track_sender,
+            ).await
+        }
+    }).await
+}
+
+async fn download_with_alternates<F, Fut>(
+    locator: &str,
+    requests: &[TorrentFileRequest],
+    mut attempt: F,
+) -> Result<TorrentTransferResult, String>
+where
+    F: FnMut(String, Vec<TorrentFileRequest>, bool) -> Fut,
+    Fut: std::future::Future<Output = Result<TorrentTransferResult, String>>,
+{
+    let mut pending = requests.to_vec();
+    let mut completed = Vec::new();
+    let mut source = locator.to_owned();
+    let mut attempted = HashSet::from([locator.to_owned()]);
+    for retry in 0..=5 {
+        let result = attempt(source.clone(), pending.clone(), retry > 0).await;
+        let failure = match result {
+            Ok(result) => {
+                completed.extend(result.completed);
+                let failed: HashSet<_> = result.failed_tracks.iter().map(|(index, _)| *index).collect();
+                pending.retain(|request| failed.contains(&request.track_index));
+                result.failure
+            }
+            Err(error) if error == "Task cancelled" => return Err(error),
+            Err(error) => Some(error),
+        };
+        if pending.is_empty() {
+            return Ok(TorrentTransferResult { completed, failed_tracks: Vec::new(), failure: None });
+        }
+        if retry < 5 {
+            if let Some((next, requests)) = common_alternate(&pending, &attempted) {
+                attempted.insert(next.clone());
+                source = next;
+                pending = requests;
+                continue;
+            }
+        }
+        if completed.is_empty() {
+            if let Some(error) = failure {
+                return Err(error);
+            }
+        }
+        return Ok(TorrentTransferResult {
+            completed, failure,
+            failed_tracks: pending.into_iter().map(|request| (request.track_index, request.track)).collect(),
+        });
+    }
+    unreachable!("the last bounded attempt returns")
+}
+
+fn common_alternate(
+    requests: &[TorrentFileRequest],
+    attempted: &HashSet<String>,
+) -> Option<(String, Vec<TorrentFileRequest>)> {
+    let first = requests.first()?.track.torrent_target.as_ref()?;
+    first.alternatives.iter().find_map(|candidate| {
+        if attempted.contains(&candidate.magnet_uri) || candidate.quality_tier != first.quality_tier {
+            return None;
+        }
+        let mapped = requests.iter().map(|request| {
+            let primary = request.track.torrent_target.as_ref()?;
+            let replacement = primary.alternatives.iter().find(|alternative| {
+                alternative.info_hash == candidate.info_hash
+                    && alternative.magnet_uri == candidate.magnet_uri
+                    && alternative.quality_tier == primary.quality_tier
+            })?;
+            Some(TorrentFileRequest {
+                track_index: request.track_index,
+                file_index: replacement.file_index,
+                file_size: replacement.file_size,
+                track: request.track.clone(),
+            })
+        }).collect::<Option<Vec<_>>>()?;
+        Some((candidate.magnet_uri.clone(), mapped))
+    })
+}
+
+async fn download_one_torrent(
+    app: &AppHandle,
+    task_id: &str,
+    library_dir: &std::path::Path,
+    locator: &str,
+    requests: &[TorrentFileRequest],
+    total_task_tracks: usize,
+    completed_counter: Arc<std::sync::atomic::AtomicUsize>,
+    track_sender: Option<tokio::sync::mpsc::Sender<(PathBuf, TrackDownload, usize)>>,
+) -> Result<TorrentTransferResult, String> {
+    if let Some(item) = super::web_seed::archive_item(locator) {
+        match download_archive_seed(
+            Some(app), task_id, library_dir, locator, &item, requests, total_task_tracks,
+            &completed_counter, track_sender.as_ref(),
+        ).await {
+            Ok(result) => return Ok(result),
+            Err(error) if error == "Task cancelled" => return Err(error),
+            Err(error) => tracing::debug!(task_id, %error, "Archive web seed unavailable; trying peers"),
+        }
+    }
+    retry_without_dht(|trackers_only| {
+        transfer_attempt(
+            Some(app), task_id, library_dir, locator, requests, total_task_tracks,
+            Arc::clone(&completed_counter), track_sender.clone(), trackers_only,
+        )
+    })
+    .await
+}
+
+async fn download_archive_seed(
+    app: Option<&AppHandle>,
+    task_id: &str,
+    library_dir: &std::path::Path,
+    locator: &str,
+    item: &str,
+    requests: &[TorrentFileRequest],
+    total_tracks: usize,
+    counter: &std::sync::atomic::AtomicUsize,
+    sender: Option<&tokio::sync::mpsc::Sender<(PathBuf, TrackDownload, usize)>>,
+) -> Result<TorrentTransferResult, String> {
+    use std::sync::atomic::Ordering;
+    if is_task_cancelled(app, task_id).await {
+        return Err("Task cancelled".into());
+    }
+    let target = requests.first().and_then(|request| request.track.torrent_target.as_ref())
+        .and_then(|target| std::iter::once(target).chain(&target.alternatives).find(|source| source.magnet_uri == locator))
+        .ok_or("Archive web seed requires a matched torrent.")?;
+    if super::inspect::cached_torrent_bytes(locator).is_none() {
+        super::inspect::inspect(locator).await?;
+    }
+    let bytes = super::inspect::cached_torrent_bytes(locator).ok_or("Missing Archive torrent metadata.")?;
+    let seed = super::web_seed::ArchiveSeed::parse(&bytes, item, &target.info_hash)?;
+    let staging = torrent_staging_dir(&torrent_cache_root(library_dir), task_id);
+    tokio::fs::create_dir_all(&staging).await.map_err(|_| "Could not create web seed staging folder.")?;
+    emit_task_progress(app, task_id, counter.load(Ordering::SeqCst), total_tracks, "Downloading from Archive web seed…").await;
+    let mut completed: Vec<(PathBuf, TrackDownload, usize)> = Vec::new();
+    for request in requests {
+        let source = request.track.torrent_target.as_ref()
+            .and_then(|target| std::iter::once(target).chain(&target.alternatives).find(|source| source.magnet_uri == locator));
+        let extension = source.and_then(|source| std::path::Path::new(&source.file_path).extension())
+            .and_then(|ext| ext.to_str()).filter(|ext| ext.len() <= 8 && ext.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+            .unwrap_or("flac");
+        let path = staging.join(format!("web-{}.{extension}", Uuid::new_v4()));
+        let result = seed.transfer(request.file_index, request.file_size, &path, |percent| async move {
+            if is_task_cancelled(app, task_id).await { return false; }
+            emit_track_progress(app, task_id, request.track_index, &request.track.title, percent).await;
+            true
+        }).await;
+        if let Err(error) = result {
+            let _ = tokio::fs::remove_file(&path).await;
+            for (staged, _, _) in completed {
+                let _ = tokio::fs::remove_file(staged).await;
+            }
+            return Err(error);
+        }
+        completed.push((path, request.track.clone(), request.track_index));
+    }
+    for (path, track, index) in &completed {
+        emit_track_progress(app, task_id, *index, &track.title, 100).await;
+        let current = counter.fetch_add(1, Ordering::SeqCst) + 1;
+        emit_task_progress(app, task_id, current, total_tracks, "Downloaded from Archive web seed").await;
+        if let Some(sender) = sender {
+            let _ = sender.send((path.clone(), track.clone(), *index)).await;
+        }
+    }
+    Ok(TorrentTransferResult { completed, failed_tracks: Vec::new(), failure: None })
+}
+
+async fn transfer_attempt(
+    app: Option<&AppHandle>,
+    task_id: &str,
+    library_dir: &std::path::Path,
+    locator: &str,
+    requests: &[TorrentFileRequest],
+    total_task_tracks: usize,
+    completed_counter: Arc<std::sync::atomic::AtomicUsize>,
+    track_sender: Option<tokio::sync::mpsc::Sender<(PathBuf, TrackDownload, usize)>>,
+    trackers_only: bool,
+) -> Result<TorrentTransferResult, TransferError> {
     use std::sync::atomic::Ordering;
 
     if requests.is_empty() {
         return Ok(TorrentTransferResult {
             completed: Vec::new(),
             failed_tracks: Vec::new(),
+            failure: None,
         });
     }
 
+    if is_task_cancelled(app, task_id).await {
+        return Err("Task cancelled".to_string().into());
+    }
     // Validate scheme before handing locator to librqbit.
     super::inspect::normalize_locator_for_download(locator)?;
 
@@ -139,16 +364,30 @@ pub async fn download_torrent_files(
     only_files.sort_unstable();
     only_files.dedup();
 
-    let (session, handle) = add_torrent_with_recovery(
-        app,
-        task_id,
-        &cache_root,
-        &job_dir,
-        locator,
-        &only_files,
-        total_task_tracks,
-    )
-    .await?;
+    let added = if trackers_only {
+        emit_task_progress(
+            app, task_id, completed_counter.load(Ordering::SeqCst), total_task_tracks,
+            "Retrying torrent via trackers…",
+        )
+        .await;
+        add_torrent(
+            app, task_id, &cache_root, &job_dir, locator, &only_files,
+            total_task_tracks, true,
+        )
+        .await
+    } else {
+        add_torrent_with_recovery(
+            app, task_id, &cache_root, &job_dir, locator, &only_files, total_task_tracks,
+        )
+        .await
+    };
+    let (session, handle) = match added {
+        Ok(added) => added,
+        Err(error) => {
+            let _ = tokio::fs::remove_dir_all(&job_dir).await;
+            return Err(error.into());
+        }
+    };
     let torrent_id = handle.id();
 
     let init_started = Instant::now();
@@ -185,7 +424,7 @@ pub async fn download_torrent_files(
     if let Err(msg) = init_res {
         let _ = session.delete(torrent_id.into(), true).await;
         let _ = tokio::fs::remove_dir_all(&job_dir).await;
-        return Err(msg);
+        return Err(msg.into());
     }
 
     emit_task_progress(
@@ -210,7 +449,7 @@ pub async fn download_torrent_files(
         Err(e) => {
             let _ = session.delete(torrent_id.into(), true).await;
             let _ = tokio::fs::remove_dir_all(&job_dir).await;
-            return Err(format!("Torrent metadata unavailable: {e}"));
+            return Err(format!("Torrent metadata unavailable: {e}").into());
         }
     };
 
@@ -218,7 +457,7 @@ pub async fn download_torrent_files(
         if let Err(err) = validate_relative_path(rel) {
             let _ = session.delete(torrent_id.into(), true).await;
             let _ = tokio::fs::remove_dir_all(&job_dir).await;
-            return Err(err);
+            return Err(err.into());
         }
     }
 
@@ -231,6 +470,7 @@ pub async fn download_torrent_files(
     let mut last_wait_notice_at = Instant::now();
     let mut cancelled = false;
     let mut transfer_failure: Option<String> = None;
+    let mut no_data_timeout = false;
 
     loop {
         if is_task_cancelled(app, task_id).await {
@@ -254,26 +494,27 @@ pub async fn download_torrent_files(
             } else {
                 TORRENT_STALL_TIMEOUT
             };
-            if last_progress_at.elapsed() >= stall_limit {
+            if !stats.finished && last_progress_at.elapsed() >= stall_limit {
                 tracing::warn!(task_id, bytes = last_progress_bytes, "Torrent download stalled without peer progress");
-                transfer_failure = Some(if last_progress_bytes == 0 {
-                    "Timed out connecting to torrent peers (no active seeders responded).".into()
-                } else {
-                    "Torrent download stalled while waiting for remaining data.".into()
-                });
+                no_data_timeout = last_progress_bytes == 0 && completed.is_empty();
+                if !no_data_timeout {
+                    transfer_failure = Some("Torrent download stalled while waiting for remaining data.".into());
+                }
                 break;
             }
-            if last_progress_bytes == 0 && last_wait_notice_at.elapsed() >= Duration::from_secs(3) {
+            if last_wait_notice_at.elapsed() >= Duration::from_secs(3) {
                 last_wait_notice_at = Instant::now();
+                let message = if last_progress_bytes == 0 {
+                    format!("Waiting for torrent seeders ({}s)...", last_progress_at.elapsed().as_secs())
+                } else {
+                    format!("Waiting for torrent data ({}s)...", last_progress_at.elapsed().as_secs())
+                };
                 emit_task_progress(
                     app,
                     task_id,
                     completed_counter.load(Ordering::SeqCst),
                     total_task_tracks,
-                    &format!(
-                        "Waiting for torrent seeders ({}s)…",
-                        last_progress_at.elapsed().as_secs()
-                    ),
+                    &message,
                 )
                 .await;
             }
@@ -357,22 +598,26 @@ pub async fn download_torrent_files(
     let _ = tokio::fs::remove_dir_all(&job_dir).await;
 
     if cancelled {
-        return Err("Task cancelled".into());
+        return Err("Task cancelled".to_string().into());
+    }
+    if no_data_timeout {
+        return Err(TransferError::NoData);
     }
     if completed.is_empty() {
-        if let Some(err) = transfer_failure {
-            return Err(err);
+        if let Some(ref err) = transfer_failure {
+            return Err(err.clone().into());
         }
     }
 
     Ok(TorrentTransferResult {
         completed,
         failed_tracks,
+        failure: transfer_failure,
     })
 }
 
 async fn add_torrent_with_recovery(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     task_id: &str,
     cache_root: &std::path::Path,
     job_dir: &std::path::Path,
@@ -389,29 +634,13 @@ async fn add_torrent_with_recovery(
     )
     .await;
 
-    let cached_bytes = super::inspect::cached_torrent_bytes(locator);
-    let session = match get_or_init_session(cache_root.to_path_buf(), false).await {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = tokio::fs::remove_dir_all(job_dir).await;
-            return Err(e);
-        }
-    };
-
-    let primary = try_add_torrent(
-        app,
-        task_id,
-        &session,
-        AddTorrent::from_url(locator),
-        only_files,
-        job_dir,
-        total_task_tracks,
-        "Connecting to torrent peers",
+    let primary = add_torrent(
+        app, task_id, cache_root, job_dir, locator, only_files, total_task_tracks, false,
     )
     .await;
 
     match primary {
-        Ok(handle) => return Ok((session, handle)),
+        Ok(added) => return Ok(added),
         Err(err) if err == "Task cancelled" => {
             let _ = tokio::fs::remove_dir_all(job_dir).await;
             return Err(err);
@@ -459,30 +688,6 @@ async fn add_torrent_with_recovery(
                     return Err(err);
                 }
                 Err(tracker_err) => {
-                    if let Some(bytes) = cached_bytes {
-                        emit_task_progress(
-                            app,
-                            task_id,
-                            0,
-                            total_task_tracks,
-                            "Retrying with cached torrent metadata…",
-                        )
-                        .await;
-                        if let Ok(handle) = try_add_torrent(
-                            app,
-                            task_id,
-                            &tracker_session,
-                            AddTorrent::from_bytes(bytes),
-                            only_files,
-                            job_dir,
-                            total_task_tracks,
-                            "Connecting to cached torrent peers",
-                        )
-                        .await
-                        {
-                            return Ok((tracker_session, handle));
-                        }
-                    }
                     let _ = tokio::fs::remove_dir_all(job_dir).await;
                     return Err(tracker_err);
                 }
@@ -491,8 +696,46 @@ async fn add_torrent_with_recovery(
     }
 }
 
+async fn add_torrent(
+    app: Option<&AppHandle>,
+    task_id: &str,
+    cache_root: &std::path::Path,
+    job_dir: &std::path::Path,
+    locator: &str,
+    only_files: &[usize],
+    total_task_tracks: usize,
+    trackers_only: bool,
+) -> Result<(Arc<Session>, Arc<ManagedTorrent>), String> {
+    let cached_bytes = super::inspect::cached_torrent_bytes(locator);
+    let session = get_or_init_session(cache_root.to_path_buf(), trackers_only).await?;
+    let status = if trackers_only {
+        "Retrying torrent via trackers"
+    } else {
+        "Connecting to torrent peers"
+    };
+    let handle = try_add_torrent(
+        app,
+        task_id,
+        &session,
+        preferred_torrent_source(locator, cached_bytes.as_deref()),
+        only_files,
+        job_dir,
+        total_task_tracks,
+        status,
+    )
+    .await?;
+    Ok((session, handle))
+}
+
+fn preferred_torrent_source<'a>(locator: &'a str, cached: Option<&[u8]>) -> AddTorrent<'a> {
+    match cached {
+        Some(bytes) if !bytes.is_empty() => AddTorrent::from_bytes(bytes.to_vec()),
+        _ => AddTorrent::from_url(locator),
+    }
+}
+
 async fn try_add_torrent(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     task_id: &str,
     session: &Arc<Session>,
     source: AddTorrent<'_>,
@@ -542,18 +785,25 @@ async fn try_add_torrent(
         }
     };
 
-    response
-        .into_handle()
-        .ok_or_else(|| "Torrent metadata list-only returned unexpectedly.".to_string())
+    match response {
+        AddTorrentResponse::Added(_, handle) => Ok(handle),
+        AddTorrentResponse::AlreadyManaged(_, _) => {
+            Err("This torrent is already downloading in this session.".into())
+        }
+        AddTorrentResponse::ListOnly(_) => {
+            Err("Torrent metadata list-only returned unexpectedly.".into())
+        }
+    }
 }
 
 async fn emit_task_progress(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     task_id: &str,
     current: usize,
     total: usize,
     message: &str,
 ) {
+    let Some(app) = app else { return };
     let _ = app.emit(
         "download-task-progress",
         crate::download::types::ProgressEvent {
@@ -570,8 +820,8 @@ async fn emit_task_progress(
     }
 }
 
-async fn is_task_cancelled(app: &AppHandle, task_id: &str) -> bool {
-    if let Some(registry) = app.try_state::<crate::download::TaskRegistry>() {
+async fn is_task_cancelled(app: Option<&AppHandle>, task_id: &str) -> bool {
+    if let Some(registry) = app.and_then(|app| app.try_state::<crate::download::TaskRegistry>()) {
         registry.is_cancelled(task_id).await
     } else {
         false
@@ -579,12 +829,13 @@ async fn is_task_cancelled(app: &AppHandle, task_id: &str) -> bool {
 }
 
 async fn emit_track_progress(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     task_id: &str,
     track_index: usize,
     title: &str,
     percent: i32,
 ) {
+    let Some(app) = app else { return };
     let _ = app.emit(
         "download-track-progress",
         serde_json::json!({
@@ -627,6 +878,240 @@ pub(crate) fn torrent_staging_dir(cache_root: &std::path::Path, task_id: &str) -
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[tokio::test]
+    #[ignore = "downloads the real Syro release into an isolated temporary folder"]
+    async fn live_syro_resolution_and_transfer() {
+        use crate::metadata::types::AudioQualityTier;
+        use crate::torrent::matcher::{resolve_album_torrents, ExpectedTrackInput};
+
+        let titles = [
+            "minipops 67 [120.2][source field mix]", "XMAS_EVET10 [120][thanaton3 mix]",
+            "produk 29 [101]", "4 bit 9d api+e+6 [126.26]", "180db_ [130]",
+            "CIRCLONT6A [141.98][syrobonkus mix]", "fz pseudotimestretch+e+3 [138.85]",
+            "CIRCLONT14 [152.97][shrymoming mix]", "syro u473t8+e [141.98][piezoluminescence mix]",
+            "PAPAT4 [155][pineal mix]", "s950tx16wasr10 [163.97][earth portal mix]", "aisatsana [102]",
+        ];
+        let expected = titles.iter().enumerate().map(|(index, title)| ExpectedTrackInput {
+            index, title: (*title).into(), artist: Some("Aphex Twin".into()),
+            disc_number: Some(1), track_number: Some(index as u32 + 1), duration_ms: None,
+        }).collect::<Vec<_>>();
+        let (releases, unavailable) = resolve_album_torrents("Aphex Twin", "Syro", &expected, |_| {}).await.unwrap();
+        println!("Syro: {} resolved releases, unavailable providers: {unavailable:?}", releases.len());
+        let release = releases.iter().find(|release| release.tier == AudioQualityTier::Lossless)
+            .expect("Syro should resolve to a lossless source");
+        assert_eq!(release.matched_count, expected.len());
+        let item = super::super::web_seed::archive_item(&release.magnet_uri)
+            .expect("a complete web seed should rank ahead of the peer-only release");
+        let requests: Vec<_> = release.tracks.iter().map(|matched| {
+            let mut track = TrackDownload { title: titles[matched.expected_index].into(), ..Default::default() };
+            crate::download::album::apply_candidate_to_track(
+                &mut track, std::slice::from_ref(&matched.candidate), Some("source:torrent:lossless"), 0,
+            );
+            let target = track.torrent_target.as_ref().expect("resolver should stage a torrent candidate");
+            TorrentFileRequest {
+                track_index: matched.expected_index, file_index: target.file_index,
+                file_size: target.file_size, track,
+            }
+        }).collect();
+        let temp = tempfile::tempdir().unwrap();
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(expected.len());
+        let result = download_archive_seed(
+            None, "live-syro", temp.path(), &release.magnet_uri, &item, &requests,
+            expected.len(), &counter, Some(&sender),
+        ).await.unwrap();
+        assert!(result.failed_tracks.is_empty());
+        assert_eq!(result.completed.len(), expected.len());
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), expected.len());
+        let mut total_bytes = 0;
+        for _ in &expected {
+            let (path, _, index) = receiver.try_recv().unwrap();
+            let request = requests.iter().find(|request| request.track_index == index).unwrap();
+            assert_eq!(tokio::fs::metadata(&path).await.unwrap().len(), request.file_size);
+            let mut file = tokio::fs::File::open(path).await.unwrap();
+            let mut signature = [0; 4];
+            tokio::io::AsyncReadExt::read_exact(&mut file, &mut signature).await.unwrap();
+            assert_eq!(&signature, b"fLaC");
+            total_bytes += request.file_size;
+        }
+        println!("Syro: staged {} verified FLAC tracks, {total_bytes} bytes, Archive item {item}", expected.len());
+    }
+
+    #[tokio::test]
+    async fn alternate_release_requires_the_same_quality_and_all_pending_album_tracks() {
+        use crate::download::types::TorrentTarget;
+        use crate::metadata::types::AudioQualityTier::{HighLossy, Lossless};
+
+        let target = |hash: &str, file_index, quality_tier| TorrentTarget {
+            info_hash: hash.to_owned(),
+            magnet_uri: format!("magnet:{hash}"),
+            file_path: format!("{file_index}.flac"),
+            file_index,
+            file_size: 100 + file_index as u64,
+            quality_tier,
+            alternatives: Vec::new(),
+        };
+        let request = |index, alternatives| TorrentFileRequest {
+            track_index: index,
+            file_index: index,
+            file_size: 100,
+            track: TrackDownload {
+                torrent_target: Some(TorrentTarget { alternatives, ..target("primary", index, Lossless) }),
+                ..Default::default()
+            },
+        };
+        let first = request(0, vec![target("lossy", 1, HighLossy), target("partial", 2, Lossless), target("complete", 3, Lossless)]);
+        let second = request(1, vec![target("complete", 8, Lossless)]);
+        let (_, mapped) = common_alternate(&[first.clone(), second.clone()], &HashSet::new()).unwrap();
+        assert_eq!(mapped.iter().map(|r| (r.track_index, r.file_index, r.file_size)).collect::<Vec<_>>(), [(0, 3, 103), (1, 8, 108)]);
+        let attempted = HashSet::from(["magnet:complete".to_owned()]);
+        assert!(common_alternate(&[first.clone(), second], &attempted).is_none());
+        let (source, _) = common_alternate(&[first.clone()], &attempted).unwrap();
+        assert_eq!(source, "magnet:partial");
+
+        let mut attempts = Vec::new();
+        let result = download_with_alternates("magnet:primary", &[first], |source, mut pending, retry| {
+            attempts.push(source);
+            let request = pending.pop().unwrap();
+            std::future::ready(if retry {
+                assert_eq!(request.file_index, 2);
+                Ok(TorrentTransferResult {
+                    completed: vec![(PathBuf::from("recovered.flac"), request.track, request.track_index)],
+                    failed_tracks: Vec::new(), failure: None,
+                })
+            } else {
+                Err("No peers responded".into())
+            })
+        }).await.unwrap();
+        assert_eq!(attempts, ["magnet:primary", "magnet:partial"]);
+        assert_eq!(result.completed.len(), 1);
+        assert!(result.failed_tracks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn first_byte_timeout_retries_once_with_trackers() {
+        let mut modes = Vec::new();
+        let result = retry_without_dht(|trackers_only| {
+            modes.push(trackers_only);
+            std::future::ready(if trackers_only { Ok("downloaded") } else { Err(TransferError::NoData) })
+        }).await;
+        assert_eq!(result.unwrap(), "downloaded");
+        assert_eq!(modes, [false, true]);
+
+        modes.clear();
+        let result = retry_without_dht(|trackers_only| {
+            modes.push(trackers_only);
+            std::future::ready(Err::<(), _>(TransferError::NoData))
+        }).await;
+        assert_eq!(result.unwrap_err(), NO_TORRENT_DATA);
+        assert_eq!(modes, [false, true]);
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_other_failures_do_not_restart_the_transfer() {
+        for message in ["Task cancelled", "Torrent download stalled while waiting for remaining data."] {
+            let result = retry_without_dht(|trackers_only| {
+                assert!(!trackers_only);
+                std::future::ready(Err::<(), _>(TransferError::Other(message.into())))
+            }).await;
+            assert_eq!(result.unwrap_err(), message);
+        }
+    }
+
+    #[tokio::test]
+    async fn tracker_retry_downloads_and_stages_selected_file() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let seed_dir = root.path().join("seed");
+        tokio::fs::create_dir(&seed_dir).await.unwrap();
+        tokio::fs::write(seed_dir.join("song.flac"), b"abc").await.unwrap();
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let announce = format!("http://{}/announce", listener.local_addr().unwrap());
+        let mut metadata = format!(
+            "d8:announce{}:{announce}4:infod6:lengthi3e4:name9:song.flac12:piece lengthi16384e6:pieces20:",
+            announce.len()
+        ).into_bytes();
+        // SHA-1 of the complete piece, "abc".
+        metadata.extend_from_slice(&[
+            0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e,
+            0x25, 0x71, 0x78, 0x50, 0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d,
+        ]);
+        metadata.extend_from_slice(b"ee");
+        let torrent = librqbit::torrent_from_bytes::<librqbit::ByteBuf>(&metadata).unwrap();
+        let locator = format!("magnet:?xt=urn:btih:{}", torrent.info_hash.as_string());
+        super::super::inspect::cache_torrent_bytes(&torrent.info_hash.as_string(), &metadata);
+
+        let seed = Session::new_with_opts(seed_dir, SessionOptions {
+            disable_dht: true,
+            listen_port_range: Some(49152..65535),
+            ..Default::default()
+        }).await.unwrap();
+        let port = seed.tcp_listen_port().unwrap().to_be_bytes();
+        let peer_available = Arc::new(AtomicBool::new(false));
+        let availability = Arc::clone(&peer_available);
+        let tracker = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = [0; 4096];
+                if stream.read(&mut request).await.is_err() {
+                    continue;
+                }
+                let mut body = b"d8:completei1e10:incompletei0e8:intervali3600e5:peers".to_vec();
+                if availability.load(Ordering::SeqCst) {
+                    body.extend_from_slice(&[b'6', b':', 127, 0, 0, 1, port[0], port[1]]);
+                } else {
+                    body.extend_from_slice(b"0:");
+                }
+                body.push(b'e');
+                let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                if stream.write_all(header.as_bytes()).await.is_ok() {
+                    let _ = stream.write_all(&body).await;
+                }
+            }
+        });
+        let seeding = seed.add_torrent(AddTorrent::from_bytes(metadata), Some(AddTorrentOptions {
+            overwrite: true,
+            ..Default::default()
+        })).await.unwrap().into_handle().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), seeding.wait_until_completed()).await.unwrap().unwrap();
+
+        let requests = [TorrentFileRequest {
+            track_index: 7, file_index: 0, file_size: 3,
+            track: TrackDownload { title: "Song".into(), ..Default::default() },
+        }];
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let result = tokio::time::timeout(Duration::from_secs(60), retry_without_dht(|trackers_only| {
+            peer_available.store(trackers_only, Ordering::SeqCst);
+            transfer_attempt(
+                None, "tracker-retry-test", root.path(), &locator, &requests,
+                1, Arc::clone(&counter), Some(sender.clone()), trackers_only,
+            )
+        })).await;
+        tracker.abort();
+        seed.stop().await;
+
+        let result = result.unwrap().unwrap();
+        assert!(peer_available.load(Ordering::SeqCst));
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert!(result.failed_tracks.is_empty());
+        let (path, track, index) = receiver.try_recv().unwrap();
+        assert_eq!(track.title, "Song");
+        assert_eq!(index, 7);
+        assert_eq!(tokio::fs::read(path).await.unwrap(), b"abc");
+    }
+
+    #[test]
+    fn starts_with_cached_metadata_and_uses_locator_when_unavailable() {
+        let locator = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+        assert!(matches!(preferred_torrent_source(locator, Some(b"torrent metadata")), AddTorrent::TorrentFileBytes(_)));
+        assert!(matches!(preferred_torrent_source(locator, None), AddTorrent::Url(_)));
+        assert!(matches!(preferred_torrent_source(locator, Some(b"")), AddTorrent::Url(_)));
+        assert!(matches!(preferred_torrent_source("https://archive.org/test.torrent", None), AddTorrent::Url(_)));
+    }
 
     #[test]
     fn torrent_cache_root_lives_inside_library_temp_dir() {

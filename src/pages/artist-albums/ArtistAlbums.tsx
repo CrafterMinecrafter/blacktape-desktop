@@ -1,3 +1,4 @@
+import { torrentStatusMessage } from "@/features/library/model/downloadStatusMessage.ts";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import styles from "./artist-albums.module.css";
 import { ItemType, useLibraryStore, type DownloadProgress } from "@/shared/store/libraryStore.ts";
@@ -838,7 +839,7 @@ const ArtistAlbums = () => {
     );
   }
 
-  if (albums.length === 0 && activeArtistDownloads.length === 0) {
+  if (albums.length === 0 && activeArtistDownloads.length === 0 && failedArtistDownloads.length === 0) {
     return (
       <div className={styles.container}>
         <div className={styles.selectArtistPrompt}>
@@ -941,7 +942,7 @@ const ArtistAlbums = () => {
                   )}
                   <span className={styles.albumUpgradingBadge} title="Downloading album">
                     <span className={styles.albumUpgradingSpinner} aria-hidden="true" />
-                    <span>Downloading {download.overallPercent}%</span>
+                    <span role="status">{torrentStatusMessage(download.message) ?? `Downloading ${download.overallPercent}%`}</span>
                   </span>
                 </div>
                 <ul className={styles.songs}>
@@ -1057,6 +1058,16 @@ const ArtistAlbums = () => {
                   </span>
                 )}
                 {(() => {
+                  const albumDownloads = downloadsByExistingAlbum.get(album.title) ?? [];
+                  const torrentMessage = albumDownloads.map((d) => torrentStatusMessage(d.message)).find(Boolean);
+                  if (torrentMessage) {
+                    return (
+                      <span className={styles.albumUpgradingBadge} role="status">
+                        <span className={styles.albumUpgradingSpinner} aria-hidden="true" />
+                        <span>{torrentMessage}</span>
+                      </span>
+                    );
+                  }
                   const activeSongs = album.songs
                     .map((s) => upgradingBySongId.get(s.id))
                     .filter((v): v is { percent: number; done: boolean } => !!v);
@@ -1071,7 +1082,6 @@ const ArtistAlbums = () => {
                       </span>
                     );
                   }
-                  const albumDownloads = downloadsByExistingAlbum.get(album.title) ?? [];
                   if (albumDownloads.length > 0) {
                     const pct = Math.round(
                       albumDownloads.reduce((acc, d) => acc + (d.overallPercent ?? 0), 0) /
@@ -1080,7 +1090,7 @@ const ArtistAlbums = () => {
                     return (
                       <span className={styles.albumUpgradingBadge} title="Downloading tracks into this album">
                         <span className={styles.albumUpgradingSpinner} aria-hidden="true" />
-                        <span>Downloading {pct}%</span>
+                        <span role="status">{albumDownloads.map((d) => torrentStatusMessage(d.message)).find(Boolean) ?? `Downloading ${pct}%`}</span>
                       </span>
                     );
                   }

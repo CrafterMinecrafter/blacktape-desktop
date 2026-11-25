@@ -4,6 +4,7 @@ mod inspect;
 pub(crate) mod matcher;
 mod release;
 mod search;
+mod web_seed;
 
 #[cfg(test)]
 mod evaluation;

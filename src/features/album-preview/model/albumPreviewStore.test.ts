@@ -669,7 +669,7 @@ describe("download formats", () => {
     expect(store().preview?.title).toBe("Restored");
   });
 
-  it("auto-upgrades a platform album preview to MusicBrainz right after load when editions return a match", async () => {
+  it("offers late MusicBrainz editions without replacing the open preview or its selection", async () => {
     const ytPreview = {
       ...makePreview(),
       platform: "youtube" as const,
@@ -715,7 +715,8 @@ describe("download formats", () => {
     ];
 
     getAlbumPreviewMock.mockResolvedValueOnce(ytPreview).mockResolvedValueOnce(mbUpgraded);
-    getReleaseGroupReleasesMock.mockResolvedValueOnce(editions);
+    const pending = deferred<typeof editions>();
+    getReleaseGroupReleasesMock.mockReturnValueOnce(pending.promise);
 
     await store().open(
       albumItem({
@@ -725,9 +726,21 @@ describe("download formats", () => {
         item_url_path: ytPreview.url,
       }),
     );
-    await new Promise((r) => setTimeout(r, 10));
+    expect(store().loadingEditions).toBe(true);
+    store().selectTrack(0, { ctrl: false, shift: false });
+    const selection = store().selection;
+    pending.resolve(editions);
+    await pending.promise;
+    await Promise.resolve();
 
     expect(getReleaseGroupReleasesMock).toHaveBeenCalledWith(null, "The Doors", "The Soft Parade");
+    expect(getAlbumPreviewMock).toHaveBeenCalledTimes(1);
+    expect(store().loadingEditions).toBe(false);
+    expect(store().preview?.metadata_source).toBe("youtube");
+    expect(store().selection).toBe(selection);
+    expect(store().editions).toEqual(editions);
+
+    await store().selectRelease("rel-soft-parade");
     expect(getAlbumPreviewMock).toHaveBeenNthCalledWith(2, "youtube", "canonical:rel-soft-parade", false);
     expect(store().preview?.metadata_source).toBe("musicbrainz");
     expect(store().preview?.selected_release_id).toBe("rel-soft-parade");

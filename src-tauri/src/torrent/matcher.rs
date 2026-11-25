@@ -65,6 +65,8 @@ pub struct TorrentTierResolution {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TorrentResolveEvent {
     Searching,
+    SearchProgress { checked: usize, total: usize },
+    InspectionProgress { checked: usize, total: usize },
     Estimated {
         estimates: Vec<TorrentTierEstimate>,
     },
@@ -338,10 +340,47 @@ fn codec_quality_rank(codec: &str) -> u8 {
     }
 }
 
+fn parenthetical_base(title: &str) -> Option<String> {
+    let (base, _) = title.trim_end().strip_suffix(')')?.rsplit_once('(')?;
+    let base = clean_title(base);
+    (!base.is_empty()).then_some(base)
+}
+
+fn tagged_album_file(
+    file: &InspectedTrack,
+    normalized_artist: &str,
+    normalized_release: &str,
+) -> Option<InspectedTrack> {
+    use crate::search::ranking::normalize;
+    if normalized_artist.is_empty() {
+        return None;
+    }
+    let (prefix, rest) = file.title.split_once(" - ")?;
+    let (album, numbered_title) = rest.split_once(" - ")?;
+    if normalize(prefix) != normalized_artist {
+        return None;
+    }
+    let album = normalize(album);
+    let prefix = format!("{normalized_artist} {album}");
+    if album.is_empty() || !normalized_release.strip_prefix(&prefix)
+        .is_some_and(|tail| tail.is_empty() || tail.starts_with(' '))
+    {
+        return None;
+    }
+    let (disc, track, title) = super::release::track_title(&[], numbered_title);
+    Some(InspectedTrack {
+        title: title.into(),
+        track_number: Some(track?),
+        disc_number: disc.or(file.disc_number),
+        ..file.clone()
+    })
+}
+
 fn score_file_match(
     expected: &ExpectedTrackInput,
     file: &InspectedTrack,
     default_artist: Option<&str>,
+    version_base: Option<&str>,
 ) -> Option<(f32, bool)> {
     let artist = expected
         .artist
@@ -358,13 +397,26 @@ fn score_file_match(
         return None;
     }
 
+    // A bare filename cannot identify which of several separately listed versions it contains.
+    if target_clean != file_clean && version_base.is_some_and(|base|
+        file_clean == base || parenthetical_base(&stripped_file).as_deref() == Some(base)
+    ) {
+        return None;
+    }
+
     if has_unwanted_derivative(&expected.title, &stripped_file)
         || has_unwanted_derivative(&stripped_file, &expected.title)
     {
         return None;
     }
 
-    let title_sim = if target_clean == file_clean {
+    // The released recording has two titles across storefronts. The recalled medley
+    // has a different title and must stay separate.
+    let released_title_alias = matches!(
+        (target_clean.as_str(), file_clean.as_str()),
+        ("not just what i needed", "not what i needed") | ("not what i needed", "not just what i needed")
+    ) && crate::search::ranking::normalize(artist) == "car seat headrest";
+    let title_sim = if target_clean == file_clean || released_title_alias {
         1.0
     } else {
         jaro_winkler(&target_clean, &file_clean) as f32
@@ -446,22 +498,35 @@ pub fn match_release_to_expected(
         };
     }
 
-    let audio_files: Vec<&InspectedTrack> = release
+    let artist = crate::search::ranking::normalize(default_artist.unwrap_or_default());
+    let release_title = crate::search::ranking::normalize(&hit.title);
+    let normalized_files: Vec<_> = release
         .tracks
         .iter()
         .filter(|t| !t.is_sample)
+        .map(|file| tagged_album_file(file, &artist, &release_title)
+            .map_or(std::borrow::Cow::Borrowed(file), std::borrow::Cow::Owned))
         .collect();
+    let audio_files: Vec<_> = normalized_files.iter().map(|file| file.as_ref()).collect();
+
+    let mut versions = HashMap::<String, HashSet<String>>::new();
+    for track in expected {
+        if let Some(base) = parenthetical_base(&track.title) {
+            versions.entry(base).or_default().insert(clean_title(&track.title));
+        }
+    }
 
     // Score candidates per expected track.
     let mut ranked_per_expected: Vec<Vec<(usize, f32, bool)>> = Vec::with_capacity(expected.len());
-    let mut file_claims: HashMap<usize, Vec<(usize, f32)>> = HashMap::new();
 
-    for (exp_pos, exp) in expected.iter().enumerate() {
+    for exp in expected {
+        let base = parenthetical_base(&exp.title);
+        let version_base = base.as_deref().filter(|base| versions.get(*base).is_some_and(|titles| titles.len() > 1));
         let mut opts: Vec<(usize, f32, bool)> = audio_files
             .iter()
             .enumerate()
             .filter_map(|(file_pos, file)| {
-                let (score, strict) = score_file_match(exp, file, default_artist)?;
+                let (score, strict) = score_file_match(exp, file, default_artist, version_base)?;
                 Some((file_pos, score, strict))
             })
             .collect();
@@ -475,12 +540,6 @@ pub fn match_release_to_expected(
                 b.1.total_cmp(&a.1)
             }
         });
-        if let Some((best_file_pos, best_score, _)) = opts.first().copied() {
-            file_claims
-                .entry(best_file_pos)
-                .or_default()
-                .push((exp_pos, best_score));
-        }
         ranked_per_expected.push(opts);
     }
 
@@ -691,7 +750,7 @@ pub fn match_release_to_expected(
 /// Builds fast initial estimates grouped by quality tier from search hits before metadata inspection. Pure.
 pub fn build_tier_estimates(hits: &[SearchHit]) -> Vec<TorrentTierEstimate> {
     let mut best_by_tier: BTreeMap<AudioQualityTier, TorrentTierEstimate> = BTreeMap::new();
-    for hit in hits {
+    for hit in preferred_hits(hits) {
         if hit.rank < 2 || !hit_is_healthy(hit) {
             continue;
         }
@@ -710,6 +769,22 @@ pub fn build_tier_estimates(hits: &[SearchHit]) -> Vec<TorrentTierEstimate> {
         });
     }
     best_by_tier.into_values().rev().collect()
+}
+
+fn estimate_event(hits: &[SearchHit]) -> Option<TorrentResolveEvent> {
+    hits.iter()
+        .any(|hit| hit.rank >= 2 && hit_is_healthy(hit))
+        .then(|| TorrentResolveEvent::Estimated {
+            estimates: build_tier_estimates(hits),
+        })
+}
+
+// Keep the search ranking within each group, but try reported active swarms before
+// sources whose peer availability is unknown (notably Internet Archive).
+fn preferred_hits(hits: &[SearchHit]) -> Vec<&SearchHit> {
+    let mut ordered: Vec<_> = hits.iter().collect();
+    ordered.sort_by_key(|hit| !hit.seeders.is_some_and(|count| count > 0));
+    ordered
 }
 
 type ResolveCacheKey = (String, String, Vec<(usize, String)>);
@@ -732,6 +807,23 @@ fn should_keep_resolution(res: &TorrentTierResolution, expected_len: usize) -> b
         return false;
     }
     true
+}
+
+fn verified_inferred_release(resolution: &TorrentTierResolution, expected: &[ExpectedTrackInput]) -> bool {
+    // Repeated song names and fuzzy matches do not independently identify a release.
+    let expected_titles: HashMap<_, _> = expected.iter().map(|track| (track.index, clean_title(&track.title))).collect();
+    let matched: HashSet<_> = resolution.tracks.iter()
+        .filter(|track| track.candidate.is_strict_match)
+        .filter_map(|track| {
+            let title = track.candidate.matched_title.as_deref()?;
+            let expected = expected_titles.get(&track.expected_index)?;
+            let title = strip_leading_artist_from_title(
+                track.candidate.matched_artist.as_deref().unwrap_or_default(), title,
+            );
+            (!expected.is_empty() && *expected == clean_title(&title)).then_some(expected)
+        })
+        .collect();
+    matched.len() >= 4 && matched.len() >= expected.len() - expected.len() / 4
 }
 
 /// Searches providers, streams initial per-tier estimates, inspects top healthy hits per tier,
@@ -767,101 +859,119 @@ pub async fn resolve_album_torrents(
 
     emit(TorrentResolveEvent::Searching);
 
-    let report = search::search(artist, title, |_| {}).await?;
+    let found = std::sync::Mutex::new((0, Vec::new()));
+    let report = search::search_for_release(artist, title, expected.len() >= 4, |provider| {
+        if let Ok(mut progress) = found.lock() {
+            progress.0 += 1;
+            emit(TorrentResolveEvent::SearchProgress {
+                checked: progress.0,
+                total: search::PROVIDER_COUNT,
+            });
+            if estimate_event(&provider.hits).is_some() {
+                progress.1.extend(provider.hits);
+                if let Some(event) = estimate_event(&progress.1) {
+                    emit(event);
+                }
+            }
+        }
+    }).await?;
     let unavailable_providers: Vec<String> = report
         .providers
         .iter()
         .filter_map(|p| p.error.as_ref().map(|_| p.provider.clone()))
         .collect();
 
-    let estimates = build_tier_estimates(&report.hits);
-    if !estimates.is_empty() {
-        emit(TorrentResolveEvent::Estimated {
-            estimates: estimates.clone(),
-        });
+    if let Some(event) = estimate_event(&report.hits) {
+        emit(event);
     }
 
-    // Group up to 2 best healthy hits per quality bucket (including untagged bucket when no explicit tags).
+    // Keep a bounded shortlist per advertised tier, including untagged releases.
     let mut buckets: BTreeMap<Option<AudioQualityTier>, Vec<SearchHit>> = BTreeMap::new();
-    for hit in report.hits {
-        if hit.rank < 2 || !hit_is_healthy(&hit) {
+    for hit in preferred_hits(&report.hits) {
+        if hit.rank < 2 || !hit_is_healthy(hit) {
             continue;
         }
         let bucket = hit_quality_bucket(&hit);
         let list = buckets.entry(bucket).or_default();
-        if list.len() < 2 {
-            list.push(hit);
+        if list.len() < 6 {
+            list.push(hit.clone());
         }
     }
+    // Keep the fallback budget independent from confirmed artist/title matches.
+    for hit in report.hits.iter().filter(|hit| hit.rank == 1 && hit_is_healthy(hit)).take(2) {
+        buckets.entry(hit_quality_bucket(hit)).or_default().push(hit.clone());
+    }
 
+    let total = buckets.values().map(Vec::len).sum();
+    if total > 0 {
+        emit(TorrentResolveEvent::InspectionProgress { checked: 0, total });
+    }
+    let (finished, mut progress) = tokio::sync::mpsc::unbounded_channel();
     // Inspect each bucket concurrently, picking the highest-coverage release in that tier.
     let mut tasks = tokio::task::JoinSet::new();
     for (_bucket, candidates) in buckets {
         let expected_owned = expected.to_vec();
+        let finished = finished.clone();
         tasks.spawn(async move {
-            let mut best_res: Option<TorrentTierResolution> = None;
-            let mut cue_res: Option<TorrentTierResolution> = None;
+            let mut resolutions = Vec::new();
             for hit in candidates {
-                match inspect::inspect(&hit.input).await {
-                    Ok(release) => {
-                        if release.layout == ReleaseLayout::NonAudio {
-                            continue;
-                        }
+                if let Ok(release) = inspect::inspect(&hit.input).await {
+                    if release.layout != ReleaseLayout::NonAudio {
                         let res = match_release_to_expected(&release, &hit, &expected_owned);
-                        if !should_keep_resolution(&res, expected_owned.len()) {
-                            continue;
-                        }
-                        if res.matched_count == 0 {
-                            if cue_res.is_none() {
-                                cue_res = Some(res);
-                            }
-                            continue;
-                        }
-                        let is_full = !expected_owned.is_empty()
-                            && res.matched_count >= expected_owned.len();
-                        let better = match &best_res {
-                            None => true,
-                            Some(prev) => {
-                                res.matched_count > prev.matched_count
-                                    || (res.matched_count == prev.matched_count
-                                        && res.seeders.unwrap_or(0) > prev.seeders.unwrap_or(0))
-                            }
+                        let verified = if hit.rank == 1 {
+                            verified_inferred_release(&res, &expected_owned)
+                        } else {
+                            should_keep_resolution(&res, expected_owned.len())
                         };
-                        if better {
-                            best_res = Some(res);
-                        }
-                        if is_full {
-                            return best_res;
+                        if verified {
+                            resolutions.push(res);
                         }
                     }
-                    Err(_) => continue,
                 }
+                let _ = finished.send(());
             }
-            best_res.or(cue_res)
+            resolutions
         });
     }
+    drop(finished);
+    let mut checked = 0;
+    while progress.recv().await.is_some() {
+        checked += 1;
+        emit(TorrentResolveEvent::InspectionProgress { checked, total });
+    }
 
-    let mut by_tier: BTreeMap<AudioQualityTier, TorrentTierResolution> = BTreeMap::new();
+    let mut resolutions = Vec::new();
     while let Some(joined) = tasks.join_next().await {
-        if let Ok(Some(res)) = joined {
-            if !should_keep_resolution(&res, expected.len()) {
-                continue;
-            }
-            let replace = match by_tier.get(&res.tier) {
-                None => true,
-                Some(prev) => {
-                    res.matched_count > prev.matched_count
-                        || (res.matched_count == prev.matched_count
-                            && res.seeders.unwrap_or(0) > prev.seeders.unwrap_or(0))
-                }
-            };
-            if replace {
-                by_tier.insert(res.tier, res);
-            }
+        if let Ok(batch) = joined {
+            resolutions.extend(batch);
         }
     }
 
-    let resolutions: Vec<TorrentTierResolution> = by_tier.into_values().rev().collect();
+    resolutions.sort_by_cached_key(|release| {
+        let web_seed = super::web_seed::archive_item(&release.magnet_uri)
+            .and_then(|item| {
+                let bytes = inspect::cached_torrent_bytes(&release.magnet_uri)?;
+                super::web_seed::ArchiveSeed::parse(&bytes, &item, &release.info_hash).ok()
+            }).is_some();
+        (
+            std::cmp::Reverse(release.tier),
+            std::cmp::Reverse(release.matched_count),
+            std::cmp::Reverse(web_seed),
+            std::cmp::Reverse(release.seeders),
+            release.info_hash.clone(),
+            release.magnet_uri.clone(),
+        )
+    });
+    let mut seen = HashSet::new();
+    let mut counts = BTreeMap::new();
+    resolutions.retain(|release| {
+        let count = counts.entry(release.tier).or_insert(0);
+        if *count >= 6 || !seen.insert((release.tier, release.info_hash.clone())) {
+            return false;
+        }
+        *count += 1;
+        true
+    });
     {
         let mut guard = resolved_torrent_cache()
             .lock()
@@ -938,6 +1048,28 @@ mod tests {
     }
 
     #[test]
+    fn seeded_release_is_preferred_to_archive_with_unknown_peers() {
+        let hits = vec![
+            hit("Aphex Twin - Drukqs [FLAC]", "Archive.org", None, 3),
+            hit("Aphex Twin - Drukqs (2001) [FLAC]", "Knaben", Some(47), 2),
+        ];
+        let ordered = preferred_hits(&hits);
+        assert_eq!(ordered[0].provider, "Knaben");
+        assert_eq!(build_tier_estimates(&hits)[0].provider, "Knaben");
+    }
+
+    #[test]
+    fn eligible_untagged_torrent_reports_matching_before_inspection() {
+        let archive = hit("Aphex Twin - Syro", "Archive.org", None, 3);
+        assert!(matches!(
+            estimate_event(&[archive]),
+            Some(TorrentResolveEvent::Estimated { estimates }) if estimates.is_empty()
+        ));
+        let dead = hit("Aphex Twin - Syro [FLAC]", "Knaben", Some(0), 3);
+        assert!(estimate_event(&[dead]).is_none());
+    }
+
+    #[test]
     fn classify_inspected_track_quality_detects_mp3_320_vs_alac_m4a() {
         let (mp3_tier, mp3_codec, mp3_kbps, _) =
             classify_inspected_track_quality("MP3", 7_200_000, Some(180_000), None);
@@ -949,6 +1081,69 @@ mod tests {
             classify_inspected_track_quality("M4A", 20_000_000, Some(180_000), None);
         assert_eq!(alac_tier, AudioQualityTier::Lossless);
         assert_eq!(alac_codec, "ALAC");
+    }
+
+    #[test]
+    fn bare_deadlines_filename_does_not_match_either_digital_edition_version() {
+        let expected = |title: &str| ExpectedTrackInput {
+            index: 0, title: title.into(), artist: Some("Car Seat Headrest".into()),
+            disc_number: Some(1), track_number: Some(3), duration_ms: None,
+        };
+        let mut file = InspectedTrack {
+            file_index: 2, file_path: "03 Deadlines.mp3".into(), title: "Deadlines".into(),
+            codec: "MP3", size_bytes: 5_000_000, disc_number: None, track_number: Some(3),
+            folder: None, is_sample: false,
+        };
+        for title in ["Deadlines (Hostile)", "Deadlines (Thoughtful)"] {
+            assert!(score_file_match(&expected(title), &file, None, Some("deadlines")).is_none());
+        }
+        assert!(score_file_match(&expected("Deadlines"), &file, None, None).unwrap().1);
+        file.title = "Deadlines (Hostile)".into();
+        assert!(score_file_match(&expected("Deadlines (Hostile)"), &file, None, Some("deadlines")).unwrap().1);
+        assert!(score_file_match(&expected("Deadlines (Thoughtful)"), &file, None, Some("deadlines")).is_none());
+    }
+
+    #[test]
+    fn album_tagged_filenames_require_matching_artist_album_and_track_number() {
+        let file = InspectedTrack {
+            file_index: 8,
+            file_path: "Car Seat Headrest - 4 - 02 who even knows.flac".into(),
+            title: "Car Seat Headrest - 4 - 02 who even knows".into(),
+            codec: "FLAC",
+            size_bytes: 23_000_000,
+            disc_number: None,
+            track_number: None,
+            folder: None,
+            is_sample: false,
+        };
+        let tagged = tagged_album_file(&file, "car seat headrest", "car seat headrest 4 flac").unwrap();
+        assert_eq!(tagged.title, "who even knows");
+        assert_eq!(tagged.track_number, Some(2));
+        assert_eq!(tagged.file_path, file.file_path);
+        assert!(tagged_album_file(&file, "another artist", "another artist 4").is_none());
+        assert!(tagged_album_file(&file, "car seat headrest", "car seat headrest 43").is_none());
+        let unnumbered = InspectedTrack { title: "Car Seat Headrest - 4 - who even knows".into(), ..file };
+        assert!(tagged_album_file(&unnumbered, "car seat headrest", "car seat headrest 4").is_none());
+    }
+
+    #[test]
+    fn denial_released_title_alias_is_exact_but_recalled_medley_is_separate() {
+        let mut expected = ExpectedTrackInput {
+            index: 4, title: "Not Just What I Needed".into(), artist: Some("Car Seat Headrest".into()),
+            disc_number: Some(1), track_number: Some(5), duration_ms: Some(271_000),
+        };
+        let mut file = InspectedTrack {
+            file_index: 4, file_path: "05 Not What I Needed.mp3".into(), title: "Not What I Needed".into(),
+            codec: "MP3", size_bytes: 8_000_000, disc_number: None, track_number: Some(5),
+            folder: None, is_sample: false,
+        };
+        assert!(score_file_match(&expected, &file, None, None).unwrap().1);
+        expected.artist = Some("Another Artist".into());
+        assert!(!score_file_match(&expected, &file, None, None).is_some_and(|(_, strict)| strict));
+        expected.artist = Some("Car Seat Headrest".into());
+        file.title = "Just What I Needed , Not Just What I Needed".into();
+        file.codec = "FLAC";
+        assert!(score_file_match(&expected, &file, None, None).is_none());
     }
 
     #[test]
@@ -1126,6 +1321,35 @@ mod tests {
         };
         assert!(!should_keep_resolution(&one_of_eight, 8));
         assert!(should_keep_resolution(&one_of_eight, 1));
+    }
+
+    #[test]
+    fn weak_release_labels_require_four_distinct_exact_tracks_and_three_quarters_coverage() {
+        let titles = ["Weightlifters", "Can’t Cool Me Down", "Hollywood", "Hymn (remix)", "Martin"];
+        let expected: Vec<_> = titles.iter().enumerate().map(|(index, title)| ExpectedTrackInput {
+            index, title: (*title).into(), artist: Some("Car Seat Headrest".into()),
+            disc_number: None, track_number: Some(index as u32 + 1), duration_ms: None,
+        }).collect();
+        let files = |titles: &[&str]| titles.iter().enumerate().map(|(index, title)| InspectedTrack {
+            file_index: index, file_path: format!("{title}.flac"), title: (*title).into(),
+            codec: "FLAC", size_bytes: 20_000_000, disc_number: None,
+            track_number: Some(index as u32 + 1), folder: None, is_sample: false,
+        }).collect();
+        let mut release = InspectedRelease {
+            info_hash: "0123456789abcdef0123456789abcdef01234567".into(),
+            name: "Making a Door Less Open".into(), layout: ReleaseLayout::StandardAlbum,
+            total_size_bytes: 80_000_000, total_file_count: 4, tracks: files(&titles[..4]),
+            cover_art: Vec::new(), cue_sheets: Vec::new(), rip_logs: Vec::new(),
+        };
+        let hit = hit("Making a Door Less Open [FLAC]", "Archive.org", None, 1);
+        let matched = match_release_to_expected(&release, &hit, &expected);
+        assert!(verified_inferred_release(&matched, &expected));
+        release.tracks = files(&["Weightlifters", "Can’t Cool Me Down", "Hollywood", "Hymn (live)", "Hollywood"]);
+        let wrong = match_release_to_expected(&release, &hit, &expected);
+        assert!(!verified_inferred_release(&wrong, &expected));
+        let mut longer = expected.clone();
+        longer.push(ExpectedTrackInput { index: 5, title: "Famous".into(), ..expected[0].clone() });
+        assert!(!verified_inferred_release(&matched, &longer));
     }
 
     #[tokio::test]

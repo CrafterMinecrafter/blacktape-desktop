@@ -1,11 +1,11 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
-pub(super) fn request(client: &Client, query: &Query) -> RequestBuilder {
+pub(super) fn request(client: &Client, query: &Query, title_only: bool) -> RequestBuilder {
     client
         .post("https://api.knaben.org/v1")
         .json(&serde_json::json!({
-            "query": query.text(),
+            "query": query.text(title_only),
         "search_field": "title",
         "categories": [1_000_000], // Audio and its subcategories.
             "order_by": "seeders",

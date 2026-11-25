@@ -5,13 +5,10 @@ import { useModalStore } from "@/shared/store/modalStore.ts";
 import { ItemType, useLibraryStore, type DownloadOverrides, type StartDownloadParams } from "@/shared/store/libraryStore.ts";
 import { useAlbumPreviewStore } from "@/features/album-preview/model/albumPreviewStore.ts";
 import {
-  cancelTorrentInspection,
   probeUpgradeCandidates,
-  resolveTorrentAlbum,
   type ExpectedTorrentTrackInput,
-  type TorrentTierEstimate,
-  type TorrentTierResolution,
 } from "@/shared/lib/audio.ts";
+import { useTorrentDiscovery } from "@/features/download-quality/lib/useTorrentDiscovery.ts";
 import type { AlbumTrackInfo } from "@/shared/lib/remote/albumPreview.ts";
 import { platformLabel } from "@/shared/lib/remote/platforms.ts";
 import { PlatformBadge } from "@/shared/ui/platform-badge/PlatformBadge.tsx";
@@ -75,10 +72,6 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
   const waitingUpgradeProbe =
     isResolveUpgrade && resolveSongIds.length > 0 && resolvedUpgradeTracks === null;
 
-  const [torrentPhase, setTorrentPhase] = useState<"idle" | "searching" | "estimated" | "done">("idle");
-  const [torrentEstimates, setTorrentEstimates] = useState<TorrentTierEstimate[]>([]);
-  const [torrentResolutions, setTorrentResolutions] = useState<TorrentTierResolution[]>([]);
-
   const torrentScope = useMemo<{
     artist: string;
     title: string;
@@ -115,7 +108,7 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
     if (previewState && previewState.url === params.url) {
       const selectedSet = params.trackUrls?.length ? new Set(params.trackUrls) : null;
       const tracks = previewState.tracks.filter(
-        (t) => t.available && (!selectedSet || selectedSet.has(t.url)),
+        (t) => !selectedSet || selectedSet.has(t.url),
       );
       if (!previewState.artist.trim() || !previewState.title.trim()) return null;
       return {
@@ -152,78 +145,10 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
     };
   }, [isResolveUpgrade, resolveSongIds, localAlbums, previewState, params, album]);
 
-  const torrentScopeKey = useMemo(
-    () =>
-      torrentScope
-        ? JSON.stringify([
-            torrentScope.artist,
-            torrentScope.title,
-            torrentScope.expected.map((e) => [e.index, e.title, e.disc_number, e.track_number]),
-          ])
-        : "",
-    [torrentScope],
-  );
-
-  useEffect(() => {
-    if (!torrentScope) {
-      setTorrentPhase("idle");
-      setTorrentEstimates([]);
-      setTorrentResolutions([]);
-      return;
-    }
-
-    let cancelled = false;
-    const requestId = crypto.randomUUID();
-    setTorrentPhase("searching");
-    setTorrentEstimates([]);
-    setTorrentResolutions([]);
-
-    void resolveTorrentAlbum(
-      torrentScope.artist,
-      torrentScope.title,
-      torrentScope.expected,
-      requestId,
-      (ev) => {
-        if (cancelled) return;
-        if (ev.kind === "searching") {
-          setTorrentPhase("searching");
-        } else if (ev.kind === "estimated") {
-          setTorrentEstimates(ev.estimates);
-          setTorrentPhase("estimated");
-        } else if (ev.kind === "resolved") {
-          setTorrentResolutions(ev.resolutions);
-          setTorrentPhase("done");
-        }
-      },
-    )
-      .then(([resolutions]) => {
-        if (cancelled) return;
-        setTorrentResolutions(resolutions);
-        setTorrentPhase("done");
-        if (previewState && previewState.url === params.url && resolutions.some((r) => r.matched_count > 0)) {
-          useAlbumPreviewStore.setState((state) => {
-            if (!state.preview || state.preview.url !== params.url) return state;
-            return {
-              preview: {
-                ...state.preview,
-                tracks: mergeTorrentResolutionsIntoTracks(state.preview.tracks, resolutions),
-              },
-            };
-          });
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setTorrentResolutions([]);
-          setTorrentPhase("done");
-        }
-      });
-
-    return () => {
-      cancelled = true;
-      void cancelTorrentInspection(requestId).catch(() => {});
-    };
-  }, [torrentScopeKey, params.url]);
+  const torrentDiscovery = useTorrentDiscovery(params.url, torrentScope);
+  const torrentPhase = torrentDiscovery.phase;
+  const torrentEstimates = torrentPhase === "estimated" ? torrentDiscovery.estimates : [];
+  const torrentResolutions = torrentPhase === "done" ? torrentDiscovery.resolutions : [];
 
   const canonicalPlan = useMemo(() => {
     if (!isMultiSource) return null;
@@ -345,7 +270,16 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
       }
     }
 
-    if (start) start(format, overrides);
+    if (start) {
+      if (torrentResolutions.length > 0) {
+        useAlbumPreviewStore.setState((state) => {
+          if (!state.preview || state.preview.url !== params.url) return state;
+          const tracks = mergeTorrentResolutionsIntoTracks(state.preview.tracks, torrentResolutions);
+          return { preview: { ...state.preview, tracks } };
+        });
+      }
+      start(format, overrides);
+    }
     else void startDownload({ ...params, format, overrides });
     onStarted?.();
     closeModal();
@@ -355,7 +289,7 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
   const showBandcampHint = !isMultiSource && platform === "bandcamp" && (onlyLossy || error !== null);
 
   const torrentPendingBlock =
-    torrentPhase === "searching" ? (
+    torrentPhase === "searching" || (torrentPhase === "estimated" && torrentEstimates.length === 0) ? (
       <div className={clsx(styles.option, styles.optionDisabled)} role="status">
         <span className={styles.miniSpinner} aria-hidden="true" />
         <span className={styles.optionText}>
@@ -363,7 +297,7 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
             <PlatformBadge platform="torrent" />
             <span>Lossless / MP3 320 kbps</span>
           </span>
-          <span className={styles.muted}>Searching torrent sources and matching tracks…</span>
+          <span className={styles.muted}>{torrentPhase === "searching" ? "Searching torrent sources…" : "Matching torrent files…"}</span>
         </span>
       </div>
     ) : torrentPhase === "estimated" && torrentEstimates.length > 0 ? (
@@ -517,7 +451,10 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
               <div className={styles.sectionDivider}>
                 <span>Torrents</span>
               </div>
-              {torrentResolutions.map((res) => {
+              {torrentResolutions.filter((res, index, releases) =>
+                res.matched_count === 0 ||
+                releases.findIndex((release) => release.tier === res.tier && release.matched_count > 0) === index
+              ).map((res) => {
                 const isCueOnly = res.matched_count === 0 && !!res.layout_warning;
                 const optId = isCueOnly
                   ? `torrent-notice:${res.info_hash}`

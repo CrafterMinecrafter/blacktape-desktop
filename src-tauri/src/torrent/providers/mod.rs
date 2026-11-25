@@ -42,31 +42,53 @@ impl Provider {
         static KNABEN: Gate = Gate::new();
         static APIBAY: Gate = Gate::new();
 
-        let (request, gate) = match self {
-            Self::Archive => (archive::search_request(client, query), &ARCHIVE),
-            Self::Knaben => (knaben::request(client, query), &KNABEN),
-            Self::ApiBay => (apibay::request(client, query), &APIBAY),
+        let gate = match self {
+            Self::Archive => &ARCHIVE,
+            Self::Knaben => &KNABEN,
+            Self::ApiBay => &APIBAY,
         };
         let deadline = Instant::now() + PROVIDER_BUDGET;
-        let response = gate.json(request, deadline).await;
-        let hits = response.and_then(|root| match self {
+        let request = |title_only| match self {
+            Self::Archive => archive::search_request(client, query, title_only),
+            Self::Knaben => knaben::request(client, query, title_only),
+            Self::ApiBay => apibay::request(client, query, title_only),
+        };
+        let parse = |root| match self {
             Self::Archive => archive::parse_search(&root, query),
             Self::Knaben => knaben::parse(&root, query),
             Self::ApiBay => apibay::parse(&root, query),
-        });
-        let (hits, error) = match hits {
-            Ok(hits) if matches!(self, Self::Archive) => {
-                archive::check_hits(client, gate, deadline, hits).await
-            }
+        };
+        let first = gate.json(request(false), deadline).await.and_then(parse);
+        let (mut hits, mut error) = match first {
             Ok(hits) => (hits, None),
             Err(error) => (Vec::new(), Some(error)),
         };
+        if should_search_title_only(query, &hits, error) {
+            match gate.json(request(true), deadline).await.and_then(parse) {
+                Ok(additional) => {
+                    hits.extend(additional);
+                    hits = merge_hits(hits);
+                }
+                Err(failure) => error = Some(failure),
+            }
+        }
+        if matches!(self, Self::Archive) && !hits.is_empty() {
+            let (verified, verification_error) = archive::check_hits(client, gate, deadline, hits).await;
+            hits = verified;
+            error = error.or(verification_error);
+        }
         let report = ProviderReport::from_hits(self.name().into(), hits);
         match error {
             Some(error) => report.with_error(error),
             None => report,
         }
     }
+}
+
+fn should_search_title_only(query: &Query, hits: &[SearchHit], error: Option<ProviderError>) -> bool {
+    query.can_search_title_only() && error.is_none() && !hits.iter().any(|hit| {
+        hit.rank >= 2 && (hit.provider == "Archive.org" || hit.seeders.is_some_and(|count| count > 0))
+    })
 }
 
 pub(super) struct Gate(Mutex<Option<(Instant, Option<ProviderError>)>>);

@@ -180,6 +180,7 @@ function compareCandidates(a: AudioCandidate, b: AudioCandidate): number {
   }
   const rankDiff = audioTierRank(b.quality_tier) - audioTierRank(a.quality_tier);
   if (rankDiff !== 0) return rankDiff;
+  if (a.source.kind === "torrent" && b.source.kind === "torrent") return 0;
 
   // At equal lossless fidelity, prefer instant HTTP direct streams (e.g. Bandcamp free FLAC) over P2P torrents.
   if (a.source.kind !== b.source.kind && a.quality_tier === "lossless") {
@@ -250,6 +251,8 @@ export function mergeTorrentResolutionsIntoTracks(
         merged.push(cand);
       }
     }
+    if (merged.length === existing.length) return track;
+    const selected = existing[track.selected_candidate_idx ?? 0];
     merged.sort(compareCandidates);
     const top = merged[0];
     const nextUrl =
@@ -259,6 +262,7 @@ export function mergeTorrentResolutionsIntoTracks(
       available: track.available || merged.length > 0,
       url: nextUrl,
       candidates: merged,
+      selected_candidate_idx: selected ? merged.indexOf(selected) : 0,
     };
   });
 }
@@ -395,7 +399,8 @@ export function buildCanonicalQualityPlan(
 
   const torrentByBucket = new Map<string, TorrentTierResolution>();
   for (const res of torrentResolutions ?? []) {
-    torrentByBucket.set(`torrent::${res.tier}`, res);
+    const key = `torrent::${res.tier}`;
+    if (!torrentByBucket.has(key) && res.matched_count > 0) torrentByBucket.set(key, res);
   }
 
   const options: CanonicalQualityOption[] = sortedSources.map((src) => {

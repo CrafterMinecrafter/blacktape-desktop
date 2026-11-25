@@ -287,6 +287,7 @@ pub(crate) fn apply_candidate_to_track(
                 file_path: file_path.clone(),
                 file_size: *file_size,
                 quality_tier: chosen.quality_tier,
+                alternatives: torrent_alternatives(candidates, chosen_idx),
             });
             // Keep HTTP identity URL if present so `select_tracks` stays intact while storing HTTP fallbacks.
             let mut fallbacks = Vec::new();
@@ -323,6 +324,35 @@ pub(crate) fn apply_candidate_to_track(
     }
 
     Some(chosen.quality_tier)
+}
+
+fn torrent_alternatives(
+    candidates: &[crate::metadata::types::AudioCandidate],
+    chosen_idx: usize,
+) -> Vec<crate::download::types::TorrentTarget> {
+    use crate::metadata::types::AudioSource;
+    let chosen = &candidates[chosen_idx];
+    let AudioSource::Torrent { info_hash: chosen_hash, .. } = &chosen.source else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::from([chosen_hash.as_str()]);
+    candidates.iter().filter_map(|candidate| {
+        let AudioSource::Torrent { info_hash, magnet_uri, file_index, file_path, file_size, .. } = &candidate.source else {
+            return None;
+        };
+        if candidate.quality_tier != chosen.quality_tier || !seen.insert(info_hash) {
+            return None;
+        }
+        Some(crate::download::types::TorrentTarget {
+            info_hash: info_hash.clone(),
+            magnet_uri: magnet_uri.clone(),
+            file_index: *file_index,
+            file_path: file_path.clone(),
+            file_size: *file_size,
+            quality_tier: candidate.quality_tier,
+            alternatives: Vec::new(),
+        })
+    }).take(5).collect()
 }
 
 pub fn apply_download_overrides(
@@ -1118,17 +1148,8 @@ pub async fn process_album_url(
         .await
         {
             Ok(res) => {
-                for (_idx, mut failed) in res.failed_tracks {
-                    if let Some(http_url) = first_http_url(&failed) {
-                        failed.torrent_target = None;
-                        failed.url = http_url;
-                        http_tracks.push(failed);
-                    } else if transfer_err.is_none() {
-                        transfer_err = Some(format!(
-                            "Torrent track '{}' failed without an HTTP fallback.",
-                            failed.title
-                        ));
-                    }
+                if transfer_err.is_none() {
+                    transfer_err = torrent_transfer_error(&res);
                 }
             }
             Err(err) => {
@@ -1137,19 +1158,7 @@ pub async fn process_album_url(
                     http_tracks.clear();
                     break;
                 }
-                tracing::warn!(task_id, error = %err, "Torrent release transfer failed; checking HTTP fallbacks");
-                let mut had_no_fallback = false;
-                for req in requests {
-                    let mut track = req.track;
-                    if let Some(http_url) = first_http_url(&track) {
-                        track.torrent_target = None;
-                        track.url = http_url;
-                        http_tracks.push(track);
-                    } else {
-                        had_no_fallback = true;
-                    }
-                }
-                if had_no_fallback && transfer_err.is_none() {
+                if transfer_err.is_none() {
                     transfer_err = Some(err);
                 }
             }
@@ -1188,14 +1197,15 @@ pub async fn process_album_url(
                     let _ = fs::remove_dir_all(parent);
                 }
             }
-            if saved_songs.is_empty() {
-                if let Some(err) = transfer_err {
-                    return Err(err);
-                }
+            if let Some(err) = transfer_err {
+                return Err(err);
             }
             Ok((target_library_dir, Vec::new(), cover_path))
         }
         Err(err) => {
+            if let Some(torrent_err) = transfer_err {
+                return Err(torrent_err);
+            }
             if !saved_songs.is_empty() {
                 return Ok((target_library_dir, Vec::new(), cover_path));
             }
@@ -1211,15 +1221,13 @@ pub async fn process_album_url(
     }
 }
 
-fn first_http_url(track: &TrackDownload) -> Option<String> {
-    if track.url.starts_with("http://") || track.url.starts_with("https://") {
-        return Some(track.url.clone());
+fn torrent_transfer_error(result: &crate::torrent::download::TorrentTransferResult) -> Option<String> {
+    let failed_count = result.failed_tracks.len();
+    if failed_count == 0 {
+        return None;
     }
-    track
-        .fallback_urls
-        .iter()
-        .find(|u| u.starts_with("http://") || u.starts_with("https://"))
-        .cloned()
+    let reason = result.failure.as_deref().unwrap_or("Some torrent files could not be downloaded.");
+    Some(format!("{reason} {failed_count} track(s) failed. Completed tracks were kept."))
 }
 
 pub async fn download_album_cover(url: &str, output_dir: &Path) -> Result<(), String> {
@@ -1599,5 +1607,35 @@ mod tests {
         apply_candidate_to_track(&mut td, &candidates, Some("source:youtube:high"), 0);
         assert!(td.torrent_target.is_none());
         assert_eq!(td.url, "https://youtube.com/watch?v=orig");
+    }
+}
+
+#[cfg(test)]
+mod torrent_failure_tests {
+    use super::torrent_transfer_error;
+    use crate::download::types::TrackDownload;
+    use crate::torrent::download::TorrentTransferResult;
+
+    #[test]
+    fn failed_torrent_reports_error_even_when_http_fallback_exists() {
+        let track = TrackDownload {
+            url: "https://example.com/stream".into(),
+            fallback_urls: vec!["https://example.com/other".into()],
+            ..Default::default()
+        };
+        let result = TorrentTransferResult {
+            completed: Vec::new(),
+            failed_tracks: vec![(0, track)],
+            failure: Some("Torrent download stalled.".into()),
+        };
+        let message = torrent_transfer_error(&result).unwrap();
+        assert!(message.contains("Torrent download stalled."));
+        assert!(message.contains("1 track(s) failed"));
+    }
+
+    #[test]
+    fn completed_torrent_has_no_transfer_error() {
+        let result = TorrentTransferResult { completed: Vec::new(), failed_tracks: Vec::new(), failure: None };
+        assert!(torrent_transfer_error(&result).is_none());
     }
 }

@@ -103,6 +103,7 @@ export interface TorrentTierResolution {
 
 export type TorrentResolveEvent =
   | { kind: "searching" }
+  | { kind: "search_progress" | "inspection_progress"; checked: number; total: number }
   | { kind: "estimated"; estimates: TorrentTierEstimate[] }
   | { kind: "resolved"; resolutions: TorrentTierResolution[]; unavailable_providers: string[] };
 

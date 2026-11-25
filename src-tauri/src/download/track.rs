@@ -1,6 +1,6 @@
 use super::{bandcamp, soundcloud, youtube};
 use crate::download::album::download_album_cover;
-use crate::download::types::{AlbumMetaEvent, DownloadResult, ProgressEvent, TrackMetaItem};
+use crate::download::types::{AlbumMetaEvent, DownloadResult, ProgressEvent, TrackDownload, TrackMetaItem};
 use crate::download::ytdlp;
 use crate::types::Platform;
 use std::path::PathBuf;
@@ -248,7 +248,7 @@ pub async fn process_track_url(
             track: track_info.clone(),
         };
         let completed_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        match crate::torrent::download::download_torrent_files(
+        let result = crate::torrent::download::download_torrent_files(
             app_handle,
             task_id,
             std::path::Path::new(output_dir),
@@ -258,24 +258,8 @@ pub async fn process_track_url(
             completed_counter,
             None,
         )
-        .await
-        {
-            Ok(mut res) if !res.completed.is_empty() => {
-                let (path, track, _) = res.completed.remove(0);
-                (path, track)
-            }
-            Ok(_) | Err(_) if track_info.url.starts_with("http://") || track_info.url.starts_with("https://") => {
-                track_info.torrent_target = None;
-                ytdlp::download_single(app_handle, &track_info, output_dir, task_id).await?
-            }
-            Ok(_) => {
-                return Err(format!(
-                    "Torrent transfer failed for '{}'.",
-                    track_info.title
-                ));
-            }
-            Err(err) => return Err(err),
-        }
+        .await;
+        selected_torrent_track(result, &track_info.title)?
     } else {
         ytdlp::download_single(app_handle, &track_info, output_dir, task_id).await?
     };
@@ -298,4 +282,42 @@ pub async fn process_track_url(
         vec![(temp_file_path, downloaded_track)],
         cover_path,
     ))
+}
+
+fn selected_torrent_track(
+    result: Result<crate::torrent::download::TorrentTransferResult, String>,
+    title: &str,
+) -> Result<(PathBuf, TrackDownload), String> {
+    let mut result = result?;
+    if !result.completed.is_empty() {
+        let (path, track, _) = result.completed.remove(0);
+        return Ok((path, track));
+    }
+    Err(result.failure.unwrap_or_else(|| format!("Torrent transfer failed for '{title}'.")))
+}
+
+#[cfg(test)]
+mod torrent_selection_tests {
+    use super::*;
+    use crate::torrent::download::TorrentTransferResult;
+
+    #[test]
+    fn failed_selected_torrent_is_not_replaced_by_http() {
+        let track = TrackDownload { url: "https://example.com/stream".into(), ..Default::default() };
+        let result = TorrentTransferResult {
+            completed: Vec::new(), failed_tracks: vec![(0, track)],
+            failure: Some("No peers responded".into()),
+        };
+        assert_eq!(selected_torrent_track(Ok(result), "Song").unwrap_err(), "No peers responded");
+        assert_eq!(selected_torrent_track(Err("Task cancelled".into()), "Song").unwrap_err(), "Task cancelled");
+    }
+
+    #[test]
+    fn selected_torrent_returns_its_completed_file() {
+        let track = TrackDownload { title: "Song".into(), ..Default::default() };
+        let result = TorrentTransferResult {
+            completed: vec![(PathBuf::from("song.flac"), track, 0)], failed_tracks: Vec::new(), failure: None,
+        };
+        assert_eq!(selected_torrent_track(Ok(result), "Song").unwrap().0, PathBuf::from("song.flac"));
+    }
 }

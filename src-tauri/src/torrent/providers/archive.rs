@@ -31,12 +31,14 @@ fn escape_phrase(text: &str) -> String {
     escaped
 }
 
-pub(in crate::torrent::search) fn search_request(client: &Client, query: &Query) -> RequestBuilder {
+pub(in crate::torrent::search) fn search_request(client: &Client, query: &Query, title_only: bool) -> RequestBuilder {
     let artist = escape_phrase(&query.artist);
     let title = escape_phrase(&query.title);
-    let expression = format!(
-        r#"mediatype:audio AND ((creator:"{artist}" AND title:"{title}") OR title:"{artist} {title}")"#
-    );
+    let expression = if title_only {
+        format!(r#"mediatype:audio AND title:"{title}""#)
+    } else {
+        format!(r#"mediatype:audio AND ((creator:"{artist}" AND title:"{title}") OR (title:"{artist}" AND title:"{title}"))"#)
+    };
     let rows = MAX_ROWS.to_string();
     client
         .get("https://archive.org/advancedsearch.php")
