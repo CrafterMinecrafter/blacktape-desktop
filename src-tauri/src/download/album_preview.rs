@@ -44,6 +44,14 @@ pub struct AlbumPreview {
     pub tracks: Vec<AlbumTrackInfo>,
     /// Sum of the known track durations in ms; None when no track has a duration.
     pub total_duration_ms: Option<u64>,
+    pub metadata_source: String,
+    pub is_free_download: bool,
+    #[serde(default)]
+    pub release_group_id: Option<String>,
+    #[serde(default)]
+    pub selected_release_id: Option<String>,
+    #[serde(default)]
+    pub candidates_resolved: bool,
 }
 
 /// Maps a parsed album (plus the tracks a platform had to skip) to the preview. Pure.
@@ -113,6 +121,11 @@ pub fn build_preview(
         genres: album.genres.unwrap_or_default(),
         tracks: rows,
         total_duration_ms,
+        metadata_source: platform.to_string(),
+        is_free_download: false,
+        release_group_id: None,
+        selected_release_id: None,
+        candidates_resolved: false,
     }
 }
 
@@ -128,23 +141,23 @@ pub fn total_duration(rows: &[AlbumTrackInfo]) -> Option<u64> {
 
 /// Fetches the preview of the album/set at `url`.
 pub async fn album_preview(platform: Platform, url: &str) -> Result<AlbumPreview, String> {
-    let (album, skipped) = match platform {
-        Platform::Bandcamp => match bandcamp::parse_album(url).await {
-            Ok(res) => (res, Vec::new()),
+    let (album, skipped, is_free_download) = match platform {
+        Platform::Bandcamp => match bandcamp::parse_album_with_free_flag(url).await {
+            Ok((res, is_free)) => (res, Vec::new(), is_free),
             Err(e) => {
                 crate::telemetry::report_parser_failure("bandcamp", "album_preview", &e);
                 return Err(e);
             }
         },
         Platform::Youtube => match youtube::parse_album(url).await {
-            Ok(res) => (res, Vec::new()),
+            Ok(res) => (res, Vec::new(), false),
             Err(e) => {
                 crate::telemetry::report_parser_failure("youtube", "album_preview", &e);
                 return Err(e);
             }
         },
         Platform::Soundcloud => match soundcloud::parse_album_with_skipped(url).await {
-            Ok(res) => res,
+            Ok((res, skipped)) => (res, skipped, false),
             Err(e) => {
                 crate::telemetry::report_parser_failure("soundcloud", "album_preview", &e);
                 return Err(e);
@@ -152,7 +165,9 @@ pub async fn album_preview(platform: Platform, url: &str) -> Result<AlbumPreview
         },
         Platform::Local => return Err("Local albums have no preview.".to_string()),
     };
-    Ok(build_preview(platform, url, album, &skipped))
+    let mut preview = build_preview(platform, url, album, &skipped);
+    preview.is_free_download = is_free_download;
+    Ok(preview)
 }
 
 /// Converts a CanonicalRelease (with resolved track candidates) into an AlbumPreview for UI display.
@@ -174,7 +189,7 @@ pub fn canonical_release_to_preview(release: crate::metadata::types::CanonicalRe
                 url: primary_url,
                 available: true,
                 note: None,
-                duration_ms: Some(track.duration_ms),
+                duration_ms: (track.duration_ms > 0).then_some(track.duration_ms),
                 candidates: track.candidates.clone(),
                 selected_candidate_idx: track.selected_candidate_idx,
             });
@@ -191,8 +206,31 @@ pub fn canonical_release_to_preview(release: crate::metadata::types::CanonicalRe
         }
     };
 
+    let (platform, clean_metadata_source) = match release.metadata_source.as_str() {
+        s if s.starts_with("bandcamp") => (Platform::Bandcamp, "bandcamp".to_string()),
+        s if s.starts_with("soundcloud") => (Platform::Soundcloud, "soundcloud".to_string()),
+        s if s.starts_with("youtube") => (Platform::Youtube, "youtube".to_string()),
+        _ => (Platform::Youtube, "musicbrainz".to_string()),
+    };
+
+    let is_free_download = tracks.iter().any(|t| {
+        t.candidates.iter().any(|c| {
+            c.source.platform_name() == "bandcamp"
+                && c.quality_tier == crate::metadata::types::AudioQualityTier::Lossless
+        })
+    });
+
+    let inferred_rg_id = release
+        .release_group_id
+        .or_else(|| release.id.strip_prefix("rg:").map(str::to_string));
+    let selected_release_id = if clean_metadata_source == "musicbrainz" {
+        release.mbid
+    } else {
+        None
+    };
+
     AlbumPreview {
-        platform: Platform::Youtube,
+        platform,
         url: format!("canonical:{}", release.id),
         title: release.title,
         artist: release.album_artist,
@@ -201,6 +239,11 @@ pub fn canonical_release_to_preview(release: crate::metadata::types::CanonicalRe
         genres: Vec::new(),
         tracks,
         total_duration_ms,
+        metadata_source: clean_metadata_source,
+        is_free_download,
+        release_group_id: inferred_rg_id,
+        selected_release_id,
+        candidates_resolved: false,
     }
 }
 
@@ -396,6 +439,54 @@ mod tests {
         assert_eq!(preview.artist, "Various Artists");
         assert_eq!(preview.tracks[0].disc_number, Some(1));
         assert_eq!(preview.tracks[1].disc_number, Some(2));
+    }
+
+    #[test]
+    fn canonical_release_to_preview_treats_zero_duration_as_unknown() {
+        use crate::metadata::types::{CanonicalDisc, CanonicalRelease, CanonicalTrack};
+        let release = CanonicalRelease {
+            id: "rg:123".into(),
+            mbid: Some("rel-123".into()),
+            release_group_id: Some("123".into()),
+            title: "Drukqs".into(),
+            album_artist: "Aphex Twin".into(),
+            is_various_artists: false,
+            release_year: Some(2001),
+            total_tracks: 2,
+            total_discs: 1,
+            discs: vec![CanonicalDisc {
+                disc_number: 1,
+                title: None,
+                tracks: vec![
+                    CanonicalTrack {
+                        track_number: 1,
+                        disc_number: 1,
+                        title: "Jynweythek".into(),
+                        artists: vec!["Aphex Twin".into()],
+                        duration_ms: 0,
+                        isrc: None,
+                        candidates: vec![],
+                        selected_candidate_idx: 0,
+                    },
+                    CanonicalTrack {
+                        track_number: 2,
+                        disc_number: 1,
+                        title: "Vordhosbn".into(),
+                        artists: vec!["Aphex Twin".into()],
+                        duration_ms: 291_000,
+                        isrc: None,
+                        candidates: vec![],
+                        selected_candidate_idx: 0,
+                    },
+                ],
+            }],
+            cover_url: None,
+            metadata_source: "musicbrainz".into(),
+        };
+        let preview = canonical_release_to_preview(release);
+        assert_eq!(preview.tracks[0].duration_ms, None);
+        assert_eq!(preview.tracks[1].duration_ms, Some(291_000));
+        assert_eq!(preview.total_duration_ms, Some(291_000));
     }
 
     #[test]

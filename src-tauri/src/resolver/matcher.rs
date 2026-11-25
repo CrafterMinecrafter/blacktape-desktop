@@ -70,6 +70,107 @@ pub struct MatchEvaluation {
     pub title_similarity: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtistMatch {
+    Match,
+    Neutral,
+    Mismatch,
+}
+
+fn strip_channel_suffix(raw: &str) -> String {
+    let norm = crate::search::ranking::normalize(raw);
+    let words: Vec<&str> = norm.split_whitespace().collect();
+    let trimmed = if words.len() >= 2
+        && matches!(*words.last().unwrap_or(&""), "topic" | "vevo" | "official")
+    {
+        &words[..words.len() - 1]
+    } else {
+        &words[..]
+    };
+    trimmed.join(" ")
+}
+
+fn contains_token_sequence(haystack: &[&str], needle: &[&str]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Evaluates whether a candidate's uploader/artist (`cand_band_name`) or title (`cand_title`)
+/// matches `target_artist`. Prevents homonymous songs by completely different artists from matching.
+pub fn evaluate_artist_match(
+    target_artist: &str,
+    cand_band_name: &str,
+    cand_title: &str,
+) -> ArtistMatch {
+    let target_norm = strip_channel_suffix(target_artist);
+    if target_norm.is_empty()
+        || target_norm == "unknown artist"
+        || target_norm == "various artists"
+    {
+        return ArtistMatch::Neutral;
+    }
+
+    let cand_band_norm = strip_channel_suffix(cand_band_name);
+    let target_words: Vec<&str> = target_norm.split_whitespace().collect();
+
+    if !cand_band_norm.is_empty()
+        && cand_band_norm != "unknown artist"
+        && cand_band_norm != "various artists"
+    {
+        if cand_band_norm == target_norm
+            || jaro_winkler(&target_norm, &cand_band_norm) >= 0.86
+        {
+            return ArtistMatch::Match;
+        }
+        let cand_words: Vec<&str> = cand_band_norm.split_whitespace().collect();
+        if contains_token_sequence(&cand_words, &target_words)
+            || contains_token_sequence(&target_words, &cand_words)
+        {
+            return ArtistMatch::Match;
+        }
+        // Check significant multi-artist overlap (e.g. "Artist A, Artist B" vs "Artist A")
+        let shared = target_words
+            .iter()
+            .filter(|w| w.len() >= 2 && cand_words.contains(w))
+            .count();
+        if shared > 0 && shared * 2 >= target_words.len().max(1) {
+            return ArtistMatch::Match;
+        }
+    }
+
+    // Fallback: uploader might be a label/archive channel while the video title says "Artist - Song".
+    let title_norm = crate::search::ranking::normalize(cand_title);
+    let title_words: Vec<&str> = title_norm.split_whitespace().collect();
+    if contains_token_sequence(&title_words, &target_words) {
+        return ArtistMatch::Match;
+    }
+
+    if cand_band_norm.is_empty()
+        || cand_band_norm == "unknown artist"
+        || cand_band_norm == "various artists"
+    {
+        ArtistMatch::Neutral
+    } else {
+        ArtistMatch::Mismatch
+    }
+}
+
+/// Checks whether a platform album search result plausibly refers to `(target_artist, target_album)`.
+pub fn matches_album_listing(
+    target_artist: &str,
+    target_album: &str,
+    cand_title: &str,
+    cand_band_name: &str,
+) -> bool {
+    if evaluate_artist_match(target_artist, cand_band_name, cand_title) == ArtistMatch::Mismatch {
+        return false;
+    }
+    let eval = evaluate_track_match(target_album, 0, cand_title, 0);
+    eval.title_similarity >= 0.72
+}
+
 /// Evaluates how well a discovered candidate audio matches the target canonical track.
 pub fn evaluate_track_match(
     target_title: &str,
@@ -86,11 +187,19 @@ pub fn evaluate_track_match(
         1.0
     } else {
         let jw = jaro_winkler(&clean_target, &clean_cand) as f32;
-        // Substring / inclusion boost
         if clean_cand.contains(&clean_target) || clean_target.contains(&clean_cand) {
             jw.max(0.92)
         } else {
-            jw
+            // Prevent completely unrelated strings that share a few letters (e.g. "cul de sac" vs "coelacanth")
+            // from scoring high enough via Jaro-Winkler alone when they share zero tokens.
+            let t_words: Vec<&str> = clean_target.split_whitespace().collect();
+            let c_words: Vec<&str> = clean_cand.split_whitespace().collect();
+            let has_token_overlap = t_words.iter().any(|tw| c_words.contains(tw));
+            if !has_token_overlap && jw < 0.85 {
+                jw * 0.35
+            } else {
+                jw
+            }
         }
     };
 
@@ -394,5 +503,53 @@ mod tests {
         println!("Matched {}/{} popular and niche songs in {:?}", matched_count, popular_and_niche_tracks.len(), elapsed);
         assert_eq!(matched_count, 100);
         assert!(elapsed.as_millis() < 50, "100 songs took too long: {:?}", elapsed);
+    }
+
+    #[test]
+    fn unrelated_titles_with_zero_token_overlap_do_not_match() {
+        // Regression for Cul-de-sac vs Coelacanth / Slip Under The Door
+        let c1 = evaluate_track_match("Cul-de-sac", 225_000, "Coelacanth", 394_000);
+        assert!(c1.title_similarity < 0.40, "similarity={}", c1.title_similarity);
+        assert!(c1.confidence < 0.40, "confidence={}", c1.confidence);
+        assert!(!c1.is_strict_match);
+
+        let c2 = evaluate_track_match("Cul-de-sac", 225_000, "Slip Under The Door", 328_000);
+        assert!(c2.title_similarity < 0.40);
+        assert!(c2.confidence < 0.40);
+    }
+
+    #[test]
+    fn artist_match_rejects_different_artist_and_accepts_topic_or_title_artist() {
+        assert_eq!(
+            evaluate_artist_match("Glass Beach", "Glass Beach", "Cul-de-sac"),
+            ArtistMatch::Match
+        );
+        assert_eq!(
+            evaluate_artist_match("Glass Beach", "Glass Beach - Topic", "Cul-de-sac"),
+            ArtistMatch::Match
+        );
+        assert_eq!(
+            evaluate_artist_match("Glass Beach", "IndieArchive", "Glass Beach - Cul-de-sac (Official Audio)"),
+            ArtistMatch::Match
+        );
+        assert_eq!(
+            evaluate_artist_match("Glass Beach", "Genesis", "Cul-de-sac"),
+            ArtistMatch::Mismatch
+        );
+        assert_eq!(
+            evaluate_artist_match("Glass Beach", "Rory Sweeney", "Plastic Death"),
+            ArtistMatch::Mismatch
+        );
+        assert_eq!(
+            evaluate_artist_match("Various Artists", "DJ Mix", "Track 1"),
+            ArtistMatch::Neutral
+        );
+    }
+
+    #[test]
+    fn matches_album_listing_verifies_both_artist_and_album_title() {
+        assert!(matches_album_listing("Glass Beach", "Plastic Death", "Plastic Death", "Glass Beach"));
+        assert!(!matches_album_listing("Glass Beach", "Plastic Death", "Plastic Death", "Rory Sweeney"));
+        assert!(!matches_album_listing("Glass Beach", "Plastic Death", "The First Glass Beach Album", "Glass Beach"));
     }
 }

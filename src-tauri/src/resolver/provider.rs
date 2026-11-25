@@ -1,7 +1,33 @@
 use crate::metadata::types::{AudioCandidate, AudioQualityTier, AudioSource};
-use crate::resolver::matcher::evaluate_track_match;
+use crate::resolver::matcher::{
+    evaluate_artist_match, evaluate_track_match, matches_album_listing, ArtistMatch,
+};
 use crate::search::bandcamp::ItemType;
 use tracing::{debug, warn};
+
+fn accept_track_candidate(
+    artist: &str,
+    title: &str,
+    duration_ms: u64,
+    cand_name: &str,
+    cand_band_name: &str,
+    cand_duration_ms: u64,
+) -> Option<(f32, bool)> {
+    let artist_match = evaluate_artist_match(artist, cand_band_name, cand_name);
+    if artist_match == ArtistMatch::Mismatch {
+        return None;
+    }
+
+    let eval = evaluate_track_match(title, duration_ms, cand_name, cand_duration_ms);
+    if eval.title_similarity < 0.72 || eval.confidence < 0.50 {
+        return None;
+    }
+
+    let boost = if artist_match == ArtistMatch::Match { 0.04 } else { 0.0 };
+    let confidence = (eval.confidence + boost).clamp(0.0, 1.0);
+    let is_strict = eval.is_strict_match && artist_match != ArtistMatch::Mismatch;
+    Some((confidence, is_strict))
+}
 
 /// Queries YouTube for candidate streams matching the target track.
 pub async fn resolve_youtube_candidates(
@@ -27,10 +53,14 @@ pub async fn resolve_youtube_candidates(
         }
 
         let cand_duration_ms = item.duration.map(|d| d as u64 * 1000).unwrap_or(0);
-        let eval = evaluate_track_match(title, duration_ms, &item.name, cand_duration_ms);
-
-        // Keep candidates with decent confidence (> 0.40)
-        if eval.confidence >= 0.40 {
+        if let Some((confidence, is_strict_match)) = accept_track_candidate(
+            artist,
+            title,
+            duration_ms,
+            &item.name,
+            &item.band_name,
+            cand_duration_ms,
+        ) {
             candidates.push(AudioCandidate {
                 source: AudioSource::HttpStream {
                     platform: "youtube".into(),
@@ -44,8 +74,8 @@ pub async fn resolve_youtube_candidates(
                 bitrate_kbps: Some(160),
                 sample_rate_hz: Some(48000),
                 duration_ms: cand_duration_ms,
-                match_confidence: eval.confidence,
-                is_strict_match: eval.is_strict_match,
+                match_confidence: confidence,
+                is_strict_match,
                 display_label: "YouTube (Opus 160k)".into(),
             });
         }
@@ -84,9 +114,14 @@ pub async fn resolve_bandcamp_candidates(
         }
 
         let cand_duration_ms = item.duration.map(|d| d as u64 * 1000).unwrap_or(0);
-        let eval = evaluate_track_match(title, duration_ms, &item.name, cand_duration_ms);
-
-        if eval.confidence >= 0.40 {
+        if let Some((confidence, is_strict_match)) = accept_track_candidate(
+            artist,
+            title,
+            duration_ms,
+            &item.name,
+            &item.band_name,
+            cand_duration_ms,
+        ) {
             candidates.push(AudioCandidate {
                 source: AudioSource::HttpStream {
                     platform: "bandcamp".into(),
@@ -100,8 +135,8 @@ pub async fn resolve_bandcamp_candidates(
                 bitrate_kbps: Some(128),
                 sample_rate_hz: Some(44100),
                 duration_ms: cand_duration_ms,
-                match_confidence: eval.confidence,
-                is_strict_match: eval.is_strict_match,
+                match_confidence: confidence,
+                is_strict_match,
                 display_label: "Bandcamp (MP3 128k)".into(),
             });
         }
@@ -140,9 +175,14 @@ pub async fn resolve_soundcloud_candidates(
         }
 
         let cand_duration_ms = item.duration.map(|d| d as u64 * 1000).unwrap_or(0);
-        let eval = evaluate_track_match(title, duration_ms, &item.name, cand_duration_ms);
-
-        if eval.confidence >= 0.40 {
+        if let Some((confidence, is_strict_match)) = accept_track_candidate(
+            artist,
+            title,
+            duration_ms,
+            &item.name,
+            &item.band_name,
+            cand_duration_ms,
+        ) {
             candidates.push(AudioCandidate {
                 source: AudioSource::HttpStream {
                     platform: "soundcloud".into(),
@@ -156,8 +196,8 @@ pub async fn resolve_soundcloud_candidates(
                 bitrate_kbps: Some(128),
                 sample_rate_hz: Some(44100),
                 duration_ms: cand_duration_ms,
-                match_confidence: eval.confidence,
-                is_strict_match: eval.is_strict_match,
+                match_confidence: confidence,
+                is_strict_match,
                 display_label: "SoundCloud (MP3 128k)".into(),
             });
         }
@@ -196,7 +236,10 @@ pub async fn resolve_youtube_album_tracks(
     };
 
     for item in suggestions {
-        if item.item_type == ItemType::Album && item.item_url_path.contains("browse/MPREb_") {
+        if item.item_type == ItemType::Album
+            && item.item_url_path.contains("browse/MPREb_")
+            && matches_album_listing(artist, album_title, &item.name, &item.band_name)
+        {
             if let Ok(album_download) = crate::download::youtube::parse_album(&item.item_url_path).await {
                 debug!(
                     "Resolved {} tracks from YouTube Music album '{}'",
@@ -223,7 +266,10 @@ pub async fn resolve_bandcamp_album_tracks(
     };
 
     for item in suggestions {
-        if item.item_type == ItemType::Album && item.item_url_path.contains("/album/") {
+        if item.item_type == ItemType::Album
+            && item.item_url_path.contains("/album/")
+            && matches_album_listing(artist, album_title, &item.name, &item.band_name)
+        {
             if let Ok(album_download) = crate::download::bandcamp::parse_album(&item.item_url_path).await {
                 debug!(
                     "Resolved {} tracks from Bandcamp album '{}'",
@@ -250,7 +296,10 @@ pub async fn resolve_soundcloud_album_tracks(
     };
 
     for item in suggestions {
-        if item.item_type == ItemType::Album && item.item_url_path.contains("/sets/") {
+        if item.item_type == ItemType::Album
+            && item.item_url_path.contains("/sets/")
+            && matches_album_listing(artist, album_title, &item.name, &item.band_name)
+        {
             if let Ok((album_download, _)) = crate::download::soundcloud::parse_album_with_skipped(&item.item_url_path).await {
                 debug!(
                     "Resolved {} tracks from SoundCloud album '{}'",
@@ -262,4 +311,135 @@ pub async fn resolve_soundcloud_album_tracks(
         }
     }
     Vec::new()
+}
+
+/// Searches YouTube Music, Bandcamp, and SoundCloud concurrently for matching album releases
+/// to display alongside MusicBrainz editions in the AlbumPreview release picker.
+pub async fn find_platform_album_editions(
+    artist: &str,
+    album_title: &str,
+) -> Vec<crate::metadata::types::ReleaseEditionOption> {
+    let artist = artist.trim();
+    let album_title = album_title.trim();
+    if artist.is_empty() || album_title.is_empty() {
+        return Vec::new();
+    }
+    let query = format!("{artist} {album_title}");
+    let timeout = std::time::Duration::from_millis(2200);
+
+    let yt_fut = tokio::time::timeout(timeout, crate::search::youtube_fast::search(&query));
+    let bc_fut = tokio::time::timeout(timeout, crate::search::bandcamp::search(&query));
+    let sc_fut = tokio::time::timeout(timeout, crate::search::soundcloud::search(&query));
+
+    let (yt_res, bc_res, sc_res) = tokio::join!(yt_fut, bc_fut, sc_fut);
+
+    let mut out = Vec::new();
+
+    if let Ok(Ok(items)) = yt_res {
+        if let Some(item) = items.into_iter().find(|item| {
+            item.item_type == ItemType::Album
+                && (item.item_url_path.contains("browse/MPREb_")
+                    || item.item_url_path.contains("list=OLAK"))
+                && matches_album_listing(artist, album_title, &item.name, &item.band_name)
+        }) {
+            out.push(crate::metadata::types::ReleaseEditionOption {
+                id: format!("yt:{}", item.item_url_path),
+                title: item.name,
+                edition_label: "YouTube Music".to_string(),
+                year: item.year,
+                track_count: 0,
+                disc_count: 1,
+                format: Some("Opus High".to_string()),
+                is_default: false,
+                is_alternate: false,
+                source_kind: Some("youtube".to_string()),
+                url: Some(item.item_url_path),
+            });
+        }
+    }
+
+    if let Ok(Ok(items)) = bc_res {
+        if let Some(item) = items.into_iter().find(|item| {
+            item.item_type == ItemType::Album
+                && item.item_url_path.contains("/album/")
+                && matches_album_listing(artist, album_title, &item.name, &item.band_name)
+        }) {
+            out.push(crate::metadata::types::ReleaseEditionOption {
+                id: format!("bc:{}", item.item_url_path),
+                title: item.name,
+                edition_label: "Bandcamp".to_string(),
+                year: item.year,
+                track_count: 0,
+                disc_count: 1,
+                format: Some("Bandcamp".to_string()),
+                is_default: false,
+                is_alternate: false,
+                source_kind: Some("bandcamp".to_string()),
+                url: Some(item.item_url_path),
+            });
+        }
+    }
+
+    if let Ok(Ok(items)) = sc_res {
+        if let Some(item) = items.into_iter().find(|item| {
+            item.item_type == ItemType::Album
+                && item.item_url_path.contains("/sets/")
+                && matches_album_listing(artist, album_title, &item.name, &item.band_name)
+        }) {
+            out.push(crate::metadata::types::ReleaseEditionOption {
+                id: format!("sc:{}", item.item_url_path),
+                title: item.name,
+                edition_label: "SoundCloud".to_string(),
+                year: item.year,
+                track_count: 0,
+                disc_count: 1,
+                format: Some("SoundCloud".to_string()),
+                is_default: false,
+                is_alternate: false,
+                source_kind: Some("soundcloud".to_string()),
+                url: Some(item.item_url_path),
+            });
+        }
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accept_track_candidate_rejects_wrong_artist_and_unrelated_titles() {
+        assert_eq!(
+            accept_track_candidate("Glass Beach", "Cul-de-sac", 225_000, "Cul-de-sac", "Genesis", 225_000),
+            None
+        );
+        assert_eq!(
+            accept_track_candidate("Glass Beach", "Cul-de-sac", 225_000, "Coelacanth", "Glass Beach", 394_000),
+            None
+        );
+        assert!(
+            accept_track_candidate(
+                "Glass Beach",
+                "Cul-de-sac",
+                225_000,
+                "Cul-de-sac",
+                "Glass Beach - Topic",
+                225_000,
+            )
+            .is_some()
+        );
+        assert!(
+            accept_track_candidate(
+                "Glass Beach",
+                "Cul-de-sac",
+                225_000,
+                "glass beach - cul-de-sac (Official Audio)",
+                "IndieLabelUploader",
+                226_000,
+            )
+            .is_some()
+        );
+    }
 }

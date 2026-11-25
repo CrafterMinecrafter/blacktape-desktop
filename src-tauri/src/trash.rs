@@ -7,7 +7,7 @@
 //! so a slow cross-drive copy does not block other commands.
 
 use crate::audio::player::{lock_player, AudioPlayer};
-use crate::db::db::{Database, TrashRow};
+use crate::db::db::{Database, TrashRow, LIBRARY_DIR_KEY};
 use crate::types::Song;
 use crate::utils::set_hidden;
 use serde::{Deserialize, Serialize};
@@ -24,9 +24,6 @@ pub const TRASH_DIR_NAME: &str = ".blacktape-trash";
 
 /// Tauri event emitted (payload `()`) after every trash mutation.
 pub const TRASH_CHANGED_EVENT: &str = "trash-changed";
-
-/// `app_settings` key holding the library folder, written by `scan_music` (D11).
-pub const LIBRARY_DIR_KEY: &str = "library_dir";
 
 /// The app database behind the same tokio mutex that Tauri manages.
 pub type DbLock = tokio::sync::Mutex<Database>;
@@ -627,13 +624,58 @@ fn stop_if_playing(player: &Mutex<AudioPlayer>, ids: &[i64]) {
     }
 }
 
-async fn trash_root(app: &AppHandle, db: &Database) -> Result<PathBuf, String> {
+async fn trash_root<R: tauri::Runtime>(app: &AppHandle<R>, db: &Database) -> Result<PathBuf, String> {
     let library_dir = db
         .get_app_setting(LIBRARY_DIR_KEY)
         .await
         .map_err(|e| e.to_string())?;
     let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
     Ok(trash_root_dir(library_dir.as_deref(), &app_data))
+}
+
+/// Safely moves `old_song`'s audio file into the Blacktape Trash folder right before replacing it with a newly
+/// downloaded & verified upgrade. Returns `Ok(None)` if `old_song.path` does not exist on disk.
+/// Does NOT remove the song row or playlist/favorites links from the database.
+pub async fn move_old_file_for_upgrade<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    db_lock: &DbLock,
+    old_song: &Song,
+) -> Result<Option<(String, PathBuf, String, i64, i64)>, String> {
+    let src = PathBuf::from(&old_song.path);
+    if !src.exists() {
+        return Ok(None);
+    }
+    if let (Some(id), Some(player)) = (old_song.id, app.try_state::<Mutex<AudioPlayer>>()) {
+        stop_if_playing(&player, &[id]);
+    }
+    let size = fs::metadata(&src).map_err(|e| e.to_string())?.len() as i64;
+    let song_json = serde_json::to_string(old_song).map_err(|e| e.to_string())?;
+    let root = {
+        let guard = db_lock.lock().await;
+        trash_root(app, &guard).await?
+    };
+    if !root.exists() {
+        fs::create_dir_all(&root).map_err(|e| format!("could not create trash folder: {e}"))?;
+        let _ = set_hidden(&root, true);
+    }
+    let now = now_secs();
+    let file_name = src.file_name().and_then(|n| n.to_str()).unwrap_or("track");
+    let dst = unique_child_path(&root, &format!("{now}_{file_name}"));
+    move_file(&src, &dst)
+        .await
+        .map_err(|e| format!("could not move previous version to trash: {e}"))?;
+    Ok(Some((
+        song_json,
+        dst,
+        old_song.path.clone(),
+        size,
+        now,
+    )))
+}
+
+/// Restores a file from trash back to its original path if an upgrade fails before committing.
+pub async fn rollback_moved_file(trash_dst: &Path, original_path: &Path) {
+    let _ = move_file(trash_dst, original_path).await;
 }
 
 fn notify(app: &AppHandle, outcome: &TrashOutcome) {

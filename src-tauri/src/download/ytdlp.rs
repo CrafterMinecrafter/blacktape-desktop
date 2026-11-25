@@ -373,7 +373,13 @@ fn download_args(
         DownloadSite::Other => args.extend(["-f", "bestaudio/best"].map(String::from)),
     }
 
-    let mut args = crate::download::quality::prefer_format(args, format);
+    let site_hint = match download_site(url) {
+        DownloadSite::Youtube => Some("youtube"),
+        DownloadSite::Bandcamp => Some("bandcamp"),
+        DownloadSite::Soundcloud => Some("soundcloud"),
+        DownloadSite::Other => None,
+    };
+    let mut args = crate::download::quality::prefer_format_for_site(args, site_hint, format);
     args.push("--newline".to_string());
     args.push("--".to_string());
     args.push(url.to_string());

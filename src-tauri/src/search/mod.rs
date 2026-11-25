@@ -1,6 +1,7 @@
 use crate::search::bandcamp::ItemType;
 use crate::types::Platform;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::error::Error;
 use std::future::Future;
 use std::time::Duration;
@@ -33,11 +34,128 @@ pub mod ranking;
 pub mod youtube;
 pub mod youtube_fast;
 pub mod youtube_full;
+#[cfg(test)]
+mod simulation_tests;
 
 /// Time budget for the fast InnerTube path before the legacy rustypipe path takes over (D6).
 const FAST_PATH_TIMEOUT: Duration = Duration::from_millis(3500);
 
 type SearchResult = Result<Vec<SearchSuggestion>, Box<dyn Error + Send + Sync>>;
+
+/// Fetches canonical album releases from MusicBrainz `release-group` API (under a strict timeout),
+/// preferring primary studio albums and high-edition canonical entries, deduplicating `(artist, title)`
+/// pairs, and converting them into `SearchSuggestion` items prefixed with `canonical:rg:<mbid>`.
+pub async fn fetch_canonical_album_suggestions_result(
+    query: &str,
+    cache_dir: Option<std::path::PathBuf>,
+    platform: Platform,
+    limit: usize,
+    timeout: Duration,
+) -> Result<Vec<SearchSuggestion>, String> {
+    let client = crate::metadata::MusicBrainzClient::new(cache_dir);
+    let mut groups = match tokio::time::timeout(timeout, client.search_release_groups(query)).await {
+        Ok(Ok(g)) => g,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err("MusicBrainz request timed out after 6s. Please try again.".to_string());
+        }
+    };
+    groups.retain(|rg| !crate::metadata::musicbrainz::is_bootleg_only_group(&rg.releases));
+    // Prefer full studio Albums over EPs over Singles, no secondary types, and high release counts.
+    groups.sort_by(|a, b| {
+        let primary_rank = |p: Option<&str>| match p {
+            Some(s) if s.eq_ignore_ascii_case("Album") => 2u8,
+            Some(s) if s.eq_ignore_ascii_case("EP") => 1u8,
+            _ => 0u8,
+        };
+        let a_primary = a.secondary_types.is_empty();
+        let b_primary = b.secondary_types.is_empty();
+        let a_type = primary_rank(a.primary_type.as_deref());
+        let b_type = primary_rank(b.primary_type.as_deref());
+        let a_weight = a.score.unwrap_or(0) + (a.count.unwrap_or(0).min(25) * 3);
+        let b_weight = b.score.unwrap_or(0) + (b.count.unwrap_or(0).min(25) * 3);
+        b_primary
+            .cmp(&a_primary)
+            .then_with(|| b_type.cmp(&a_type))
+            .then_with(|| b_weight.cmp(&a_weight))
+            .then_with(|| b.count.unwrap_or(0).cmp(&a.count.unwrap_or(0)))
+    });
+    let has_album_or_ep = groups.iter().any(|rg| {
+        rg.primary_type
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case("Album") || p.eq_ignore_ascii_case("EP"))
+    });
+    let mut deduped = Vec::new();
+    let mut seen = HashSet::new();
+    for rg in groups {
+        let count = rg.count.unwrap_or(0);
+        let is_single = rg
+            .primary_type
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case("Single"));
+        // Singles with only 1 edition are tracks, not multi-source studio albums: skip them when
+        // actual Albums/EPs exist so they never hijack top Album slots (e.g. "plastic death").
+        if is_single && count < 2 && has_album_or_ep {
+            continue;
+        }
+        let is_primary_studio = rg.secondary_types.is_empty()
+            && rg
+                .primary_type
+                .as_deref()
+                .map_or(true, |p| p.eq_ignore_ascii_case("Album") || p.eq_ignore_ascii_case("EP"));
+        let summary = rg.into_canonical_summary();
+        if summary.title.trim().is_empty() || summary.artist.trim().is_empty() {
+            continue;
+        }
+        let key = (
+            ranking::normalize(&summary.artist),
+            ranking::normalize(&summary.title),
+        );
+        if !key.0.is_empty() && !key.1.is_empty() && !seen.insert(key) {
+            continue;
+        }
+        // Encode edition prominence into internal view_count proxy (not displayed in UI) so
+        // widely released studio albums (>= 3 editions) defeat 1-edition homonyms and compilations.
+        let prominence_proxy = if count >= 3 && is_primary_studio {
+            Some((count as u64).saturating_mul(25_000))
+        } else if count >= 2 {
+            Some((count as u64).saturating_mul(2_000))
+        } else {
+            None
+        };
+        deduped.push(SearchSuggestion {
+            item_type: ItemType::Album,
+            name: summary.title,
+            band_name: summary.artist,
+            album_name: None,
+            item_url_path: format!("canonical:{}", summary.id),
+            img: summary.cover_url.unwrap_or_default(),
+            subscriber_count: None,
+            audience_kind: None,
+            album_url: None,
+            view_count: prominence_proxy,
+            year: summary.year.map(|y| y as i32),
+            duration: None,
+            platform,
+        });
+        if deduped.len() >= limit {
+            break;
+        }
+    }
+    Ok(deduped)
+}
+
+pub async fn fetch_canonical_album_suggestions(
+    query: &str,
+    cache_dir: Option<std::path::PathBuf>,
+    platform: Platform,
+    limit: usize,
+    timeout: Duration,
+) -> Vec<SearchSuggestion> {
+    fetch_canonical_album_suggestions_result(query, cache_dir, platform, limit, timeout)
+        .await
+        .unwrap_or_default()
+}
 
 /// YouTube search with the fast InnerTube path first and the legacy rustypipe path as fallback (D6).
 /// The fast path is given `FAST_PATH_TIMEOUT`; see `with_fallback` for the exact rules.

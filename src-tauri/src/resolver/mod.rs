@@ -116,6 +116,17 @@ pub async fn resolve_release_candidates(
             track.candidates = unique;
             track.selected_candidate_idx = 0;
 
+            if track.duration_ms == 0 {
+                if let Some(inferred_ms) = track
+                    .candidates
+                    .iter()
+                    .find(|c| c.duration_ms > 0)
+                    .map(|c| c.duration_ms)
+                {
+                    track.duration_ms = inferred_ms;
+                }
+            }
+
             if let Some(app) = app_handle {
                 let _ = app.emit(
                     "album-track-candidates",
@@ -124,6 +135,7 @@ pub async fn resolve_release_candidates(
                         "track_index": global_track_idx,
                         "candidates": track.candidates,
                         "selected_candidate_idx": 0,
+                        "duration_ms": (track.duration_ms > 0).then_some(track.duration_ms),
                     }),
                 );
             }

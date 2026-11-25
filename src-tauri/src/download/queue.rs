@@ -1,5 +1,5 @@
 use crate::download::orchestrator::handle_download_task;
-use crate::download::types::DownloadTask;
+use crate::download::types::{DownloadOverrides, DownloadTask};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -12,6 +12,8 @@ use tokio::task::AbortHandle;
 pub struct TrackProgressState {
     pub title: String,
     pub track_number: Option<i32>,
+    #[serde(default)]
+    pub disc_number: Option<i32>,
     pub percent: i32,
     pub status: String,
 }
@@ -25,6 +27,8 @@ pub struct ActiveDownloadState {
     pub artist_name: String,
     pub album_title: String,
     pub cover_url: Option<String>,
+    #[serde(default)]
+    pub release_year: Option<i32>,
     pub status: String,
     pub current: usize,
     pub total: usize,
@@ -42,6 +46,12 @@ pub struct ActiveTaskInfo {
     pub is_cancelled: bool,
     /// yt-dlp format id the user picked in the quality menu (tried first; the platform's chain is the fallback).
     pub format: Option<String>,
+    /// Optional metadata & candidate overrides from AlbumPreview.
+    pub overrides: Option<DownloadOverrides>,
+    /// When upgrading an existing library song, stores its DB id for atomic swap + Trash cleanup.
+    pub replace_song_id: Option<i64>,
+    /// Per-track replacement song IDs when upgrading multiple tracks / an album in one batch task.
+    pub replace_song_ids: HashMap<usize, i64>,
     pub state: ActiveDownloadState,
 }
 
@@ -132,6 +142,9 @@ impl TaskRegistry {
                 child_pids: Vec::new(),
                 is_cancelled: false,
                 format: None,
+                overrides: None,
+                replace_song_id: None,
+                replace_song_ids: HashMap::new(),
                 state,
             },
         );
@@ -204,6 +217,39 @@ impl TaskRegistry {
         self.tasks.lock().await.get(task_id).and_then(|t| t.format.clone())
     }
 
+    pub async fn set_overrides(&self, task_id: &str, overrides: Option<DownloadOverrides>) {
+        if let Some(info) = self.tasks.lock().await.get_mut(task_id) {
+            info.overrides = overrides;
+        }
+    }
+
+    pub async fn overrides(&self, task_id: &str) -> Option<DownloadOverrides> {
+        self.tasks.lock().await.get(task_id).and_then(|t| t.overrides.clone())
+    }
+
+    pub async fn set_replace_song_id(&self, task_id: &str, replace_song_id: Option<i64>) {
+        if let Some(info) = self.tasks.lock().await.get_mut(task_id) {
+            info.replace_song_id = replace_song_id;
+        }
+    }
+
+    pub async fn replace_song_id(&self, task_id: &str) -> Option<i64> {
+        self.tasks.lock().await.get(task_id).and_then(|t| t.replace_song_id)
+    }
+
+    pub async fn set_replace_song_ids(&self, task_id: &str, ids: HashMap<usize, i64>) {
+        if let Some(info) = self.tasks.lock().await.get_mut(task_id) {
+            info.replace_song_ids = ids;
+        }
+    }
+
+    pub async fn replace_song_id_for(&self, task_id: &str, track_index: usize) -> Option<i64> {
+        let tasks = self.tasks.lock().await;
+        tasks
+            .get(task_id)
+            .and_then(|t| t.replace_song_ids.get(&track_index).copied().or(t.replace_song_id))
+    }
+
     pub async fn set_temp_dir(&self, task_id: &str, temp_dir: PathBuf) {
         let mut tasks = self.tasks.lock().await;
         if let Some(info) = tasks.get_mut(task_id) {
@@ -225,7 +271,8 @@ impl TaskRegistry {
         title: &str,
         artist: &str,
         cover_url: Option<&str>,
-        tracks: Vec<(String, Option<i32>)>,
+        release_year: Option<i32>,
+        tracks: Vec<(String, Option<i32>, Option<i32>)>,
     ) {
         let mut tasks = self.tasks.lock().await;
         if let Some(info) = tasks.get_mut(task_id) {
@@ -238,14 +285,18 @@ impl TaskRegistry {
             if let Some(c) = cover_url {
                 info.state.cover_url = Some(c.to_string());
             }
+            if release_year.is_some() {
+                info.state.release_year = release_year;
+            }
             if !tracks.is_empty() {
                 info.state.total = tracks.len();
                 info.state.tracks = tracks
                     .into_iter()
                     .enumerate()
-                    .map(|(idx, (t_title, t_num))| TrackProgressState {
+                    .map(|(idx, (t_title, t_num, d_num))| TrackProgressState {
                         title: t_title,
                         track_number: t_num.or(Some((idx + 1) as i32)),
+                        disc_number: d_num,
                         percent: 0,
                         status: "pending".to_string(),
                     })
@@ -268,6 +319,7 @@ impl TaskRegistry {
                 info.state.tracks.push(TrackProgressState {
                     title: format!("Track {}", idx + 1),
                     track_number: Some((idx + 1) as i32),
+                    disc_number: None,
                     percent: 0,
                     status: "pending".to_string(),
                 });
@@ -377,6 +429,7 @@ mod tests {
             artist_name: String::new(),
             album_title: String::new(),
             cover_url: None,
+            release_year: None,
             status: "queued".to_string(),
             current: 0,
             total: 0,

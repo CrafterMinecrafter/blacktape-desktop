@@ -26,6 +26,8 @@ use std::time::Duration;
 pub const CLIENT_VERSION: &str = "1.20261104.00.00";
 /// `params` value that restricts a search to songs (returns album name + duration per row).
 pub const SONGS_FILTER_PARAMS: &str = "EgWKAQIIAWoKEAkQBRAKEAMQBA==";
+/// `params` value that restricts a search to albums/EPs/singles (returns official discography).
+pub const ALBUMS_FILTER_PARAMS: &str = "EgWKAQIYAWoKEAkQBRAKEAMQBA==";
 
 const SEARCH_URL: &str = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
 const ORIGIN: &str = "https://music.youtube.com";
@@ -57,11 +59,34 @@ static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 /// * Never panics, never blocks the runtime (async reqwest only).
 pub async fn search(query: &str) -> Result<Vec<SearchSuggestion>, Box<dyn Error + Send + Sync>> {
     let client = http_client();
-    let (unfiltered, songs) = tokio::join!(
-        fetch_once(client, query, false),
-        fetch_once(client, query, true)
+    let album_query = strip_album_intent(query);
+    let (unfiltered, songs, albums) = tokio::join!(
+        fetch_with_params(client, query, None),
+        fetch_with_params(client, query, Some(SONGS_FILTER_PARAMS)),
+        fetch_with_params(client, &album_query, Some(ALBUMS_FILTER_PARAMS)),
     );
-    combine_outcomes(unfiltered, songs)
+    let merged = combine_outcomes(unfiltered, songs)?;
+    Ok(match albums {
+        Ok(album_items) => merge_album_results(merged, album_items),
+        Err(_) => merged,
+    })
+}
+
+fn strip_album_intent(query: &str) -> String {
+    let tokens: Vec<&str> = query
+        .split_whitespace()
+        .filter(|t| {
+            !matches!(
+                t.to_ascii_lowercase().as_str(),
+                "album" | "albums" | "discography"
+            )
+        })
+        .collect();
+    if tokens.is_empty() {
+        query.to_string()
+    } else {
+        tokens.join(" ")
+    }
 }
 
 fn http_client() -> &'static reqwest::Client {
@@ -75,12 +100,12 @@ fn http_client() -> &'static reqwest::Client {
     })
 }
 
-async fn fetch_once(
+async fn fetch_with_params(
     client: &reqwest::Client,
     query: &str,
-    songs_only: bool,
+    params: Option<&str>,
 ) -> Result<Vec<SearchSuggestion>, Box<dyn Error + Send + Sync>> {
-    let body = build_request_body(query, songs_only);
+    let body = build_request_body_with_params(query, params);
     let response = client
         .post(SEARCH_URL)
         .header("Origin", ORIGIN)
@@ -106,9 +131,27 @@ fn combine_outcomes<E>(
     })
 }
 
+/// Merges albums from the albums-filtered search into the existing results, deduplicating by URL. Pure.
+pub fn merge_album_results(
+    mut base: Vec<SearchSuggestion>,
+    albums: Vec<SearchSuggestion>,
+) -> Vec<SearchSuggestion> {
+    let seen_urls: HashSet<String> = base.iter().map(|s| s.item_url_path.clone()).collect();
+    for item in albums {
+        if matches!(item.item_type, ItemType::Album) && !seen_urls.contains(&item.item_url_path) {
+            base.push(item);
+        }
+    }
+    base
+}
+
 /// Builds the JSON body for a search request. `songs_only == true` adds `"params": SONGS_FILTER_PARAMS`.
 /// Pure; must produce valid JSON for any query (quotes, unicode, backslashes) - use serde_json::json!.
 pub fn build_request_body(query: &str, songs_only: bool) -> Value {
+    build_request_body_with_params(query, songs_only.then_some(SONGS_FILTER_PARAMS))
+}
+
+pub fn build_request_body_with_params(query: &str, params: Option<&str>) -> Value {
     let mut body = json!({
         "context": {
             "client": {
@@ -120,8 +163,8 @@ pub fn build_request_body(query: &str, songs_only: bool) -> Value {
         },
         "query": query
     });
-    if songs_only {
-        body["params"] = Value::String(SONGS_FILTER_PARAMS.to_string());
+    if let Some(p) = params {
+        body["params"] = Value::String(p.to_string());
     }
     body
 }

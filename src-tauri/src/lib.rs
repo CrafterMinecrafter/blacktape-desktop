@@ -32,7 +32,8 @@ use crate::audio::commands::{
 };
 use crate::audio::media_controls::MediaControls;
 use crate::auth::youtube::{cookies_are_ready, launch_youtube_login};
-use crate::db::db::Database;
+use crate::db::db::{Database, LIBRARY_DIR_KEY};
+use crate::utils::resolve_library_dir;
 use crate::db::schema::db_file_path;
 use crate::download::{DownloadPayload, DownloadQueue, DownloadTask, TaskRegistry};
 use crate::favorites::commands::{
@@ -115,8 +116,8 @@ async fn scan_music(
             "total": songs.len(),
         }),
     );
-    // The trash folder lives inside the library dir, so the backend needs to know it (D11).
-    db.set_app_setting(trash::LIBRARY_DIR_KEY, &dir)
+    // Keep `library_dir` synced in app settings for Trash and downloads.
+    db.set_app_setting(LIBRARY_DIR_KEY, &dir)
         .await
         .map_err(|e| e.to_string())?;
     asset_scope::allow_dir(&app, std::path::Path::new(&dir), true);
@@ -152,15 +153,21 @@ async fn get_artist_albums(
         .map_err(|e| e.to_string())
 }
 
+static LATEST_SUGGESTION_SEQ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[command]
 async fn get_search_suggestions(
     app: AppHandle,
     query: String,
     platforms: Vec<Platform>,
 ) -> Vec<SearchSuggestion> {
+    use std::sync::atomic::Ordering;
+    let seq = LATEST_SUGGESTION_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
     let mut tasks: JoinSet<Result<Vec<SearchSuggestion>, Box<dyn Error + Send + Sync>>> =
         JoinSet::new();
 
+    let want_canonical = platforms.contains(&Platform::Youtube) || platforms.len() > 1;
     for platform in platforms {
         let q = query.clone();
         tasks.spawn(async move {
@@ -173,39 +180,35 @@ async fn get_search_suggestions(
         });
     }
 
-    let q_mb = query.clone();
-    let cache_dir = app.path().app_cache_dir().ok();
-    tasks.spawn(async move {
-        let client = crate::metadata::MusicBrainzClient::new(cache_dir);
-        match tokio::time::timeout(std::time::Duration::from_millis(2000), client.search_releases(&q_mb)).await {
-            Ok(Ok(releases)) => {
-                let suggestions = releases
-                    .into_iter()
-                    .take(3)
-                    .map(|r| {
-                        let summary = r.into_canonical_summary();
-                        SearchSuggestion {
-                            item_type: search::bandcamp::ItemType::Album,
-                            name: summary.title,
-                            band_name: summary.artist,
-                            album_name: None,
-                            item_url_path: format!("canonical:{}", summary.id),
-                            img: summary.cover_url.unwrap_or_default(),
-                            subscriber_count: None,
-                            audience_kind: None,
-                            album_url: None,
-                            view_count: None,
-                            year: summary.year.map(|y| y as i32),
-                            duration: None,
-                            platform: Platform::Youtube,
-                        }
-                    })
-                    .collect();
-                Ok(suggestions)
+    let app_for_mb = app.clone();
+    if want_canonical {
+        let q_mb = query.clone();
+        let cache_dir = app.path().app_cache_dir().ok();
+        tasks.spawn(async move {
+            // Brief yield so rapid keystrokes cancel stale MusicBrainz queries before hitting the rate limiter.
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            if LATEST_SUGGESTION_SEQ.load(Ordering::SeqCst) != seq {
+                return Ok(Vec::new());
             }
-            _ => Ok(Vec::new()),
-        }
-    });
+            match search::fetch_canonical_album_suggestions_result(
+                &q_mb,
+                cache_dir,
+                Platform::Youtube,
+                6,
+                std::time::Duration::from_millis(6000),
+            )
+            .await
+            {
+                Ok(items) => Ok(items),
+                Err(err) => {
+                    if LATEST_SUGGESTION_SEQ.load(Ordering::SeqCst) == seq {
+                        let _ = app_for_mb.emit("search-mb-warning", serde_json::json!({ "query": q_mb, "message": err }));
+                    }
+                    Ok(Vec::new())
+                }
+            }
+        });
+    }
 
     let mut raw_suggestions = Vec::new();
     while let Some(res) = tasks.join_next().await {
@@ -216,40 +219,25 @@ async fn get_search_suggestions(
         }
     }
 
-    // Cluster albums across platforms and upgrade all album items to canonical multi-source
-    let mut seen_albums = std::collections::HashSet::new();
-    let mut processed_suggestions = Vec::new();
-
-    for mut item in raw_suggestions {
-        if item.item_type == search::bandcamp::ItemType::Album {
-            let norm_artist = crate::resolver::matcher::clean_title(&item.band_name);
-            let norm_title = crate::resolver::matcher::clean_title(&item.name);
-            let key = (norm_artist, norm_title);
-
-            if !key.0.is_empty() && !key.1.is_empty() {
-                if !seen_albums.insert(key) {
-                    continue;
-                }
-            }
-
-            if !item.item_url_path.starts_with("canonical:") {
-                item.item_url_path = format!("canonical:{}", item.item_url_path);
-            }
-        }
-        processed_suggestions.push(item);
-    }
-
-    search::ranking::rank(processed_suggestions, &query)
+    search::ranking::rank_with_options(
+        raw_suggestions,
+        &query,
+        search::ranking::RankOptions {
+            promote_canonical_albums: true,
+        },
+    )
 }
 
 #[command]
 async fn search_full(
+    app: AppHandle,
     query: String,
     kind: SearchKind,
     platforms: Vec<Platform>,
     cursor: Option<SearchCursor>,
 ) -> Result<FullSearchPage, String> {
-    search::full::search_full(&query, kind, &platforms, cursor).await
+    let cache_dir = app.path().app_cache_dir().ok();
+    search::full::search_full_with_cache(&query, kind, &platforms, cursor, cache_dir).await
 }
 
 #[command]
@@ -653,6 +641,8 @@ async fn download(
     track_urls: Option<Vec<String>>,
     placement: Option<crate::download::types::TrackPlacement>,
     format: Option<String>,
+    overrides: Option<crate::download::types::DownloadOverrides>,
+    replace_song_id: Option<i64>,
 ) -> Result<String, String> {
     if platform == Platform::Youtube {
         let res = launch_youtube_login(app_handle.clone(), false, auth_lock).await;
@@ -663,8 +653,32 @@ async fn download(
         }
     }
 
-    let home_dir = app_handle.path().home_dir().map_err(|e| e.to_string())?;
-    let download_dir = home_dir.join("blacktape-lib").to_str().unwrap().to_string();
+    let (configured_library_dir, db_default_quality) =
+        if let Some(db_state) = app_handle.try_state::<tokio::sync::Mutex<Database>>() {
+            let db = db_state.lock().await;
+            let lib_dir = db.get_app_setting(LIBRARY_DIR_KEY).await.ok().flatten();
+            let quality = if format.as_deref().is_some_and(|f| !f.trim().is_empty()) {
+                None
+            } else {
+                db.get_app_setting("default_download_quality")
+                    .await
+                    .ok()
+                    .flatten()
+                    .filter(|s| !s.trim().is_empty())
+            };
+            (lib_dir, quality)
+        } else {
+            (None, None)
+        };
+
+    let home_dir = app_handle.path().home_dir().ok();
+    let resolved_library_dir =
+        resolve_library_dir(configured_library_dir.as_deref(), home_dir.as_deref())
+            .ok_or_else(|| "Could not determine library or home directory.".to_string())?;
+    let download_dir = resolved_library_dir
+        .into_os_string()
+        .into_string()
+        .map_err(|_| "Library directory path is not valid UTF-8.".to_string())?;
 
     let initial_artist = artist_name.unwrap_or_else(|| "Unknown Artist".to_string());
     let initial_title = title.unwrap_or_else(|| "Download".to_string());
@@ -684,6 +698,7 @@ async fn download(
             initial_title.clone()
         },
         cover_url,
+        release_year: None,
         status: "downloading".to_string(),
         current: 0,
         total: if is_track { 1 } else { 0 },
@@ -693,6 +708,7 @@ async fn download(
             vec![crate::download::TrackProgressState {
                 title: initial_title,
                 track_number: Some(1),
+                disc_number: None,
                 percent: 0,
                 status: "downloading".to_string(),
             }]
@@ -701,8 +717,15 @@ async fn download(
         },
     };
 
+    let resolved_format = match format {
+        Some(f) if !f.trim().is_empty() => Some(f),
+        _ => db_default_quality,
+    };
+
     task_registry.register_task(initial_state).await;
-    task_registry.set_format(&id, format).await;
+    task_registry.set_format(&id, resolved_format).await;
+    task_registry.set_overrides(&id, overrides).await;
+    task_registry.set_replace_song_id(&id, replace_song_id).await;
 
     let payload = match download_type {
         DownloadType::Album => match track_urls {
@@ -737,6 +760,7 @@ async fn get_album_preview(
     app: AppHandle,
     platform: Platform,
     url: String,
+    skip_mb_upgrade: Option<bool>,
 ) -> Result<crate::download::album_preview::AlbumPreview, String> {
     let cache_dir = app.path().app_cache_dir().ok();
     let client = crate::metadata::MusicBrainzClient::new(cache_dir.clone());
@@ -759,13 +783,26 @@ async fn get_album_preview(
             platform
         };
         let raw = crate::download::album_preview::album_preview(detected_platform, raw_target).await?;
-        crate::metadata::fallback::synthesize_canonical_from_preview(raw)
+        let mut upgraded: Option<crate::metadata::types::CanonicalRelease> = None;
+        if !skip_mb_upgrade.unwrap_or(false) {
+            if let Some(mut mb_release) = client
+                .try_cached_canonical_for_album(&raw.artist, &raw.title)
+                .await
+            {
+                if mb_release.cover_url.is_none() {
+                    mb_release.cover_url = raw.cover_url.clone();
+                }
+                crate::metadata::musicbrainz::seed_candidates_from_preview(&mut mb_release, &raw);
+                upgraded = Some(mb_release);
+            }
+        }
+        upgraded.unwrap_or_else(|| crate::metadata::fallback::synthesize_canonical_from_preview(raw))
     };
 
     // Check if we already have the fully resolved release in cache
-    let cache_key = format!("release:{}", canonical.id);
+    let cache_key = format!("release_v5:{}", canonical.id);
     if let Some(cached_str) = client.read_cache(&cache_key).await {
-        if let Ok(cached_release) =
+        if let Ok(mut cached_release) =
             serde_json::from_str::<crate::metadata::types::CanonicalRelease>(&cached_str)
         {
             if cached_release
@@ -773,9 +810,14 @@ async fn get_album_preview(
                 .iter()
                 .any(|d| d.tracks.iter().any(|t| !t.candidates.is_empty()))
             {
-                return Ok(crate::download::album_preview::canonical_release_to_preview(
+                if cached_release.release_group_id.is_none() {
+                    cached_release.release_group_id = canonical.release_group_id.clone();
+                }
+                let mut preview = crate::download::album_preview::canonical_release_to_preview(
                     cached_release,
-                ));
+                );
+                preview.candidates_resolved = true;
+                return Ok(preview);
             }
         }
     }
@@ -795,9 +837,13 @@ async fn get_album_preview(
         if let Ok(serialized) = serde_json::to_string(&canonical) {
             let client = crate::metadata::MusicBrainzClient::new(cache_dir);
             client
-                .write_cache(&format!("release:{}", canonical.id), &serialized)
+                .write_cache(&format!("release_v5:{}", canonical.id), &serialized)
                 .await;
         }
+        let _ = app_handle.emit(
+            "album-candidates-done",
+            serde_json::json!({ "album_url": album_url }),
+        );
     });
 
     Ok(initial_preview)
@@ -916,6 +962,37 @@ async fn get_onboarding_completed(
     Ok(completed)
 }
 
+const DEFAULT_DOWNLOAD_QUALITY_KEY: &str = "default_download_quality";
+
+#[command]
+async fn get_default_download_quality(
+    state: State<'_, tokio::sync::Mutex<Database>>,
+) -> Result<String, String> {
+    let db = state.lock().await;
+    let quality = db
+        .get_app_setting(DEFAULT_DOWNLOAD_QUALITY_KEY)
+        .await
+        .map_err(|e| e.to_string())?
+        .filter(|v| matches!(v.as_str(), "best" | "high" | "standard"))
+        .unwrap_or_else(|| "best".to_string());
+    Ok(quality)
+}
+
+#[command]
+async fn set_default_download_quality(
+    quality: String,
+    state: State<'_, tokio::sync::Mutex<Database>>,
+) -> Result<(), String> {
+    let normalized = quality.trim().to_ascii_lowercase();
+    if !matches!(normalized.as_str(), "best" | "high" | "standard") {
+        return Err(format!("Invalid download quality preset: {quality}"));
+    }
+    let db = state.lock().await;
+    db.set_app_setting(DEFAULT_DOWNLOAD_QUALITY_KEY, &normalized)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[command]
 async fn set_onboarding_completed(
     completed: bool,
@@ -1025,7 +1102,7 @@ pub fn run() {
             // The interface reads covers only from the library and the folders of known covers.
             let (library_dir, cover_paths) = tauri::async_runtime::block_on(async {
                 let library_dir = db
-                    .get_app_setting(trash::LIBRARY_DIR_KEY)
+                    .get_app_setting(LIBRARY_DIR_KEY)
                     .await
                     .ok()
                     .flatten();
@@ -1045,8 +1122,9 @@ pub fn run() {
                 download::tools::start(&app_handle, &[data.clone(), data.join("ffmpeg")]);
             }
 
-            if let Ok(home) = app.path().home_dir() {
-                let temp_dir = home.join("blacktape-lib").join(".temp");
+            let home_dir = app.path().home_dir().ok();
+            if let Some(root) = resolve_library_dir(library_dir.as_deref(), home_dir.as_deref()) {
+                let temp_dir = root.join(".temp");
                 let _ = std::fs::create_dir_all(&temp_dir);
                 let _ = crate::utils::set_hidden(&temp_dir, true);
                 if let Ok(entries) = std::fs::read_dir(&temp_dir) {
@@ -1102,10 +1180,12 @@ pub fn run() {
             // Canonical metadata & Multi-source resolver
             metadata::commands::search_canonical_releases,
             metadata::commands::get_canonical_release,
+            metadata::commands::get_release_group_releases,
             metadata::commands::resolve_canonical_candidates,
             metadata::commands::prewarm_album_previews,
             // Library index (status of remote items, missing tracks)
             library_index::commands::get_download_status,
+            library_index::commands::get_library_track_ids,
             library_index::commands::get_album_status,
             library_index::commands::get_library_album,
             library_index::commands::get_artist_album_sources,
@@ -1191,11 +1271,13 @@ pub fn run() {
             trash::empty_trash,
             trash::get_trash_settings,
             trash::set_trash_settings,
-            // Telemetry & Onboarding
+            // Telemetry & Onboarding & Preferences
             get_telemetry_enabled,
             set_telemetry_enabled,
             get_onboarding_completed,
             set_onboarding_completed,
+            get_default_download_quality,
+            set_default_download_quality,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

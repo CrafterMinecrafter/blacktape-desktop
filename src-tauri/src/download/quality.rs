@@ -65,15 +65,61 @@ pub fn checked_format_id(id: &str) -> Option<&str> {
 }
 
 /// `args` with `preferred` tried first by the `-f` selector (the platform's own chain stays as the fallback, so a
-/// track that lacks the chosen format still downloads in the next best one). Unchanged without `preferred`, for an
-/// unsafe id, or when there is no `-f`. Pure.
-pub fn prefer_format(mut args: Vec<String>, preferred: Option<&str>) -> Vec<String> {
-    let Some(id) = preferred.and_then(checked_format_id) else {
+/// track that lacks the chosen format still downloads in the next best one). Unchanged without `preferred`, for
+/// `"best"` (uses the site's native best chain), for an unsafe id, or when there is no `-f`.
+/// Semantic tiers `"high"` and `"standard"` expand to safe per-platform audio selectors. Pure.
+pub fn prefer_format(args: Vec<String>, preferred: Option<&str>) -> Vec<String> {
+    prefer_format_for_site(args, None, preferred)
+}
+
+/// Site-aware variant of `prefer_format` handling semantic quality tiers (`"best"`, `"high"`, `"standard"`)
+/// as well as concrete yt-dlp format ids (`"251"`, `"flac"`, `"mp3-320"`, etc.). Pure.
+pub fn prefer_format_for_site(
+    mut args: Vec<String>,
+    site_hint: Option<&str>,
+    preferred: Option<&str>,
+) -> Vec<String> {
+    let Some(raw) = preferred.map(str::trim).filter(|s| !s.is_empty()) else {
         return args;
     };
+    let effective = if let Some(rest) = raw.strip_prefix("source:") {
+        match rest.split_once(':') {
+            Some((_, fmt)) if !fmt.trim().is_empty() => fmt.trim(),
+            _ => return args,
+        }
+    } else {
+        raw
+    };
+    let lower = effective.to_ascii_lowercase();
+    if lower == "best" {
+        return args;
+    }
+
+    let replacement_prefix: Option<&str> = match lower.as_str() {
+        "high" => match site_hint {
+            Some("bandcamp") => Some("mp3-320/mp3-v0/aac-hi/vorbis"),
+            Some("soundcloud") => Some("aac_160k/hls_aac_160k/mp3"),
+            _ => Some("251/250/140"),
+        },
+        "standard" => match site_hint {
+            Some("bandcamp") => Some("mp3-128/vorbis"),
+            Some("soundcloud") => Some("http_mp3_128_url/hls_mp3_128_url/mp3"),
+            _ => Some("140/250/249/139"),
+        },
+        _ => None,
+    };
+
+    let prefix = if let Some(semantic) = replacement_prefix {
+        semantic
+    } else if let Some(id) = checked_format_id(effective) {
+        id
+    } else {
+        return args;
+    };
+
     if let Some(i) = args.iter().position(|a| a == "-f") {
         if let Some(chain) = args.get_mut(i + 1) {
-            *chain = format!("{id}/{chain}");
+            *chain = format!("{prefix}/{chain}");
         }
     }
     args
@@ -687,5 +733,18 @@ mod tests {
         for bad in ["--exec=calc", "-x", "file:///C:/a.mp3", "ftp://x.com/a", ""] {
             assert!(probe_args(bad, &[]).is_err(), "accepted {bad:?}");
         }
+    }
+
+    #[test]
+    fn prefer_format_for_site_handles_semantic_and_source_specs() {
+        let yt = vec!["-f".into(), "251/140/ba".into()];
+        assert_eq!(prefer_format_for_site(yt.clone(), Some("youtube"), Some("best"))[1], "251/140/ba");
+        assert_eq!(prefer_format_for_site(yt.clone(), Some("youtube"), Some("source:youtube"))[1], "251/140/ba");
+        assert_eq!(prefer_format_for_site(yt.clone(), Some("youtube"), Some("standard"))[1], "140/250/249/139/251/140/ba");
+        assert_eq!(prefer_format_for_site(yt, Some("youtube"), Some("source:youtube:standard"))[1], "140/250/249/139/251/140/ba");
+
+        let bc = vec!["-f".into(), "flac/mp3-320".into()];
+        assert_eq!(prefer_format_for_site(bc.clone(), Some("bandcamp"), Some("high"))[1], "mp3-320/mp3-v0/aac-hi/vorbis/flac/mp3-320");
+        assert_eq!(prefer_format_for_site(bc, Some("bandcamp"), Some("standard"))[1], "mp3-128/vorbis/flac/mp3-320");
     }
 }

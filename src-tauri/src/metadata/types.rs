@@ -114,6 +114,8 @@ pub struct CanonicalDisc {
 pub struct CanonicalRelease {
     pub id: String, // mbid or synthesized id
     pub mbid: Option<String>,
+    #[serde(default)]
+    pub release_group_id: Option<String>,
     pub title: String,
     pub album_artist: String,
     pub is_various_artists: bool,
@@ -146,4 +148,23 @@ pub struct CanonicalReleaseSummary {
     pub track_count: usize,
     pub cover_url: Option<String>,
     pub metadata_source: String,
+}
+
+/// Distinct edition within a MusicBrainz release-group shown in the album release picker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseEditionOption {
+    pub id: String,
+    pub title: String,
+    pub edition_label: String,
+    pub year: Option<i32>,
+    pub track_count: usize,
+    pub disc_count: usize,
+    pub format: Option<String>,
+    pub is_default: bool,
+    #[serde(default)]
+    pub is_alternate: bool,
+    #[serde(default)]
+    pub source_kind: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
 }

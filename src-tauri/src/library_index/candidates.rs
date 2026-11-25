@@ -7,6 +7,8 @@ use crate::search::SearchSuggestion;
 use crate::types::Platform;
 use serde::Serialize;
 use std::collections::HashSet;
+use std::time::Duration;
+use tauri::{AppHandle, Manager};
 use tokio::task::JoinSet;
 
 /// Best candidates shown to the user.
@@ -78,7 +80,10 @@ pub fn rank_candidates(album_artist: &str, album: &str, items: Vec<SearchSuggest
     let mut ranked: Vec<AlbumCandidate> = items
         .into_iter()
         .filter_map(|item| {
-            let score = score_candidate(album_artist, album, &item)?;
+            let mut score = score_candidate(album_artist, album, &item)?;
+            if item.item_url_path.starts_with("canonical:") {
+                score += 0.05;
+            }
             if item.item_url_path.is_empty() || !seen.insert(item.item_url_path.clone()) {
                 return None;
             }
@@ -98,11 +103,31 @@ pub fn rank_candidates(album_artist: &str, album: &str, items: Vec<SearchSuggest
     ranked
 }
 
-/// Platform albums that may be the library album (`album_artist`, `album`), best first.
+/// Platform and canonical MusicBrainz albums that may be the library album (`album_artist`, `album`), best first.
 #[tauri::command]
-pub async fn find_album_candidates(album_artist: String, album: String) -> Vec<AlbumCandidate> {
+pub async fn find_album_candidates(
+    app: AppHandle,
+    album_artist: String,
+    album: String,
+) -> Vec<AlbumCandidate> {
     let query = format!("{album_artist} {album}");
+    let cache_dir = app.path().app_cache_dir().ok();
     let mut tasks: JoinSet<Vec<SearchSuggestion>> = JoinSet::new();
+
+    {
+        let q = query.clone();
+        tasks.spawn(async move {
+            crate::search::fetch_canonical_album_suggestions(
+                &q,
+                cache_dir,
+                Platform::Youtube,
+                5,
+                Duration::from_secs(3),
+            )
+            .await
+        });
+    }
+
     for platform in [Platform::Bandcamp, Platform::Youtube, Platform::Soundcloud] {
         let q = query.clone();
         tasks.spawn(async move {
@@ -268,5 +293,15 @@ mod tests {
         let some = ranked.iter().find(|c| c.url == "https://x/some").expect("candidate kept");
         assert_eq!(none.cover_url, None);
         assert_eq!(some.cover_url.as_deref(), Some("cover.jpg"));
+    }
+
+    #[test]
+    fn rank_prefers_canonical_musicbrainz_on_equal_match() {
+        let items = vec![
+            album("Abbey Road", "The Beatles", "https://youtube.com/browse/MPRE_1"),
+            album("Abbey Road", "The Beatles", "canonical:rg:mb-abbey"),
+        ];
+        let ranked = rank_candidates("The Beatles", "Abbey Road", items);
+        assert_eq!(ranked[0].url, "canonical:rg:mb-abbey");
     }
 }

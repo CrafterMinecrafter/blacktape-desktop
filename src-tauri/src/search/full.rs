@@ -23,7 +23,6 @@
 
 #![allow(dead_code)]
 
-use crate::search::bandcamp::ItemType;
 use crate::search::{bandcamp_full, ranking, soundcloud, youtube_full, SearchSuggestion};
 use crate::types::Platform;
 use serde::{Deserialize, Serialize};
@@ -160,6 +159,17 @@ pub async fn search_full(
     platforms: &[Platform],
     cursor: Option<SearchCursor>,
 ) -> Result<FullSearchPage, String> {
+    search_full_with_cache(query, kind, platforms, cursor, None).await
+}
+
+/// Same as `search_full`, with an optional cache directory for MusicBrainz canonical lookups.
+pub async fn search_full_with_cache(
+    query: &str,
+    kind: SearchKind,
+    platforms: &[Platform],
+    cursor: Option<SearchCursor>,
+    cache_dir: Option<std::path::PathBuf>,
+) -> Result<FullSearchPage, String> {
     let query = query.trim();
     let want_youtube = platforms.contains(&Platform::Youtube);
     let want_bandcamp = platforms.contains(&Platform::Bandcamp);
@@ -193,29 +203,72 @@ pub async fn search_full(
         return assemble_platforms(query, youtube, None, soundcloud);
     }
 
+    let clean_q_tokens: Vec<String> = {
+        let tokens = ranking::tokenize(query);
+        let (stripped, _) = ranking::extract_query_intent(&tokens);
+        stripped
+    };
+    let platform_query_owned = if clean_q_tokens.is_empty() {
+        query.to_string()
+    } else {
+        clean_q_tokens.join(" ")
+    };
+    let upstream_query = if platform_query_owned.is_empty() {
+        query
+    } else {
+        platform_query_owned.as_str()
+    };
+
+    let want_canonical = kind == SearchKind::Album && (want_youtube || platforms.len() > 1);
     let youtube = async {
         if want_youtube {
-            Some(youtube_first_page(query, kind).await)
+            Some(youtube_first_page(upstream_query, kind).await)
         } else {
             None
         }
     };
     let bandcamp = async {
         if want_bandcamp {
-            Some(bandcamp_page(query, kind).await)
+            Some(bandcamp_page(upstream_query, kind).await)
         } else {
             None
         }
     };
     let soundcloud = async {
         if want_soundcloud {
-            Some(soundcloud_page(query, kind, 0).await)
+            Some(soundcloud_page(upstream_query, kind, 0).await)
         } else {
             None
         }
     };
-    let (youtube, bandcamp, soundcloud) = tokio::join!(youtube, bandcamp, soundcloud);
-    assemble_platforms(query, youtube, bandcamp, soundcloud)
+    let musicbrainz = async {
+        if want_canonical {
+            super::fetch_canonical_album_suggestions_result(
+                query,
+                cache_dir,
+                Platform::Youtube,
+                8,
+                Duration::from_millis(6000),
+            )
+            .await
+        } else {
+            Ok(Vec::new())
+        }
+    };
+    let (youtube, bandcamp, soundcloud, canonical_outcome) =
+        tokio::join!(youtube, bandcamp, soundcloud, musicbrainz);
+    let (canonical_items, canonical_warning) = match canonical_outcome {
+        Ok(items) => (items, None),
+        Err(msg) => (Vec::new(), Some(msg)),
+    };
+    let mut page = assemble_with_canonical(query, youtube, bandcamp, soundcloud, canonical_items)?;
+    if let Some(message) = canonical_warning {
+        page.warnings.push(PlatformWarning {
+            platform: Platform::Youtube,
+            message,
+        });
+    }
+    Ok(page)
 }
 
 /// First YouTube page of `kind` (D5 chain). Err only when its very first request failed.
@@ -303,6 +356,16 @@ pub(crate) fn assemble_platforms(
     bandcamp: Option<Result<Fetched, String>>,
     soundcloud: Option<Result<Fetched, String>>,
 ) -> Result<FullSearchPage, String> {
+    assemble_with_canonical(query, youtube, bandcamp, soundcloud, Vec::new())
+}
+
+pub(crate) fn assemble_with_canonical(
+    query: &str,
+    youtube: Option<Result<Fetched, String>>,
+    bandcamp: Option<Result<Fetched, String>>,
+    soundcloud: Option<Result<Fetched, String>>,
+    canonical_items: Vec<SearchSuggestion>,
+) -> Result<FullSearchPage, String> {
     let requested: Vec<(Platform, Result<Fetched, String>)> = [
         (Platform::Youtube, youtube),
         (Platform::Bandcamp, bandcamp),
@@ -316,7 +379,7 @@ pub(crate) fn assemble_platforms(
     }
     let total = requested.len();
 
-    let mut items = Vec::new();
+    let mut items = canonical_items;
     let mut warnings = Vec::new();
     let mut failures = Vec::new();
     let mut next_token = None;
@@ -349,12 +412,13 @@ pub(crate) fn assemble_platforms(
         soundcloud: next_offset,
     });
     let has_more = next_cursor.is_some();
-    let (mut items, copies) = ranking::rank_flat_with_copies(items, query);
-    for item in &mut items {
-        if item.item_type == ItemType::Album && !item.item_url_path.starts_with("canonical:") {
-            item.item_url_path = format!("canonical:{}", item.item_url_path);
-        }
-    }
+    let (items, copies) = ranking::rank_flat_with_options(
+        items,
+        query,
+        ranking::RankOptions {
+            promote_canonical_albums: true,
+        },
+    );
     Ok(FullSearchPage {
         items,
         copies: copies.into_iter().map(|(of, item)| PlatformCopy { of, item }).collect(),

@@ -45,6 +45,13 @@ pub fn synthesize_canonical_from_preview(preview: AlbumPreview) -> CanonicalRele
         let mut initial_candidates = Vec::new();
         if track.available && !track.url.is_empty() {
             let (codec, bitrate, sample_rate, display_label, tier) = match preview.platform {
+                crate::types::Platform::Bandcamp if preview.is_free_download => (
+                    "FLAC".to_string(),
+                    None,
+                    Some(44100),
+                    "Bandcamp · FLAC (Lossless)".to_string(),
+                    crate::metadata::types::AudioQualityTier::Lossless,
+                ),
                 crate::types::Platform::Bandcamp => (
                     "MP3".to_string(),
                     Some(128),
@@ -123,6 +130,7 @@ pub fn synthesize_canonical_from_preview(preview: AlbumPreview) -> CanonicalRele
     CanonicalRelease {
         id: synthesized_id,
         mbid: None,
+        release_group_id: None,
         title: preview.title,
         album_artist,
         is_various_artists: is_va,
@@ -193,6 +201,11 @@ mod tests {
                 },
             ],
             total_duration_ms: Some(776000),
+            metadata_source: "youtube".into(),
+            is_free_download: false,
+            release_group_id: None,
+            selected_release_id: None,
+            candidates_resolved: false,
         };
 
         let canonical = synthesize_canonical_from_preview(preview);
@@ -263,6 +276,11 @@ mod tests {
                 },
             ],
             total_duration_ms: Some(600000),
+            metadata_source: "soundcloud".into(),
+            is_free_download: false,
+            release_group_id: None,
+            selected_release_id: None,
+            candidates_resolved: false,
         };
 
         let canonical = synthesize_canonical_from_preview(preview);

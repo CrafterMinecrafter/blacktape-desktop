@@ -29,6 +29,7 @@ pub struct AlbumMetaEvent {
     pub title: String,
     pub artist: String,
     pub cover_url: Option<String>,
+    pub release_year: Option<i32>,
     pub tracks: Vec<TrackMetaItem>,
 }
 
@@ -67,6 +68,24 @@ pub struct AlbumDownload {
     pub genres: Option<Vec<String>>,
     pub release_year: Option<i32>,
     pub external_cover_url: Option<String>,
+}
+
+/// Staged candidate/title selection for one album track sent from AlbumPreview UI.
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+pub struct TrackOverride {
+    pub index: Option<usize>,
+    pub title: Option<String>,
+    pub url: Option<String>,
+    pub fallback_urls: Option<Vec<String>>,
+}
+
+/// User-edited album metadata & per-track candidate choices passed to `download`.
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+pub struct DownloadOverrides {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub year: Option<i32>,
+    pub tracks: Option<Vec<TrackOverride>>,
 }
 
 /// Where a downloaded single track belongs: the library album and song it stands for (the user picked this

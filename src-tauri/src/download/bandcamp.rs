@@ -6,6 +6,10 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 pub async fn parse_album(album_url: &str) -> Result<AlbumDownload, String> {
+    parse_album_with_free_flag(album_url).await.map(|(album, _)| album)
+}
+
+pub async fn parse_album_with_free_flag(album_url: &str) -> Result<(AlbumDownload, bool), String> {
     let base_url = extract_base_url(album_url)?;
 
     let client = Client::new();
@@ -18,6 +22,7 @@ pub async fn parse_album(album_url: &str) -> Result<AlbumDownload, String> {
         .await
         .map_err(|e| format!("Failed to read page payload: {}", e))?;
 
+    let is_free_download = crate::download::quality::bandcamp_has_free_download(&html);
     let mut tracks = parse_tracks_from_html(&html, base_url)?;
     let album_meta = parse_album_meta(&html);
 
@@ -39,15 +44,18 @@ pub async fn parse_album(album_url: &str) -> Result<AlbumDownload, String> {
         track.release_year = album_meta.release_year;
     }
 
-    Ok(AlbumDownload {
-        title: album_meta.title,
-        artists: album_meta.artists,
-        album_artist: album_artist_fallback,
-        tracks,
-        genres: album_meta.genres,
-        release_year: album_meta.release_year,
-        external_cover_url: album_meta.external_cover_url,
-    })
+    Ok((
+        AlbumDownload {
+            title: album_meta.title,
+            artists: album_meta.artists,
+            album_artist: album_artist_fallback,
+            tracks,
+            genres: album_meta.genres,
+            release_year: album_meta.release_year,
+            external_cover_url: album_meta.external_cover_url,
+        },
+        is_free_download,
+    ))
 }
 
 /// Page url of the album a track page belongs to (json-ld `inAlbum` id/url, else the first `/album/` link of the
