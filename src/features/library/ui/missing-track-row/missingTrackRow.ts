@@ -103,8 +103,11 @@ export function missingAlbumMenuItems(
   }
   // the link can be changed when it is wrong (another platform, another edition)
   if (actions.find || actions.unlink) {
-    // which platform album the songs come from (shown, not clickable)
-    items.push({ label: `Linked to ${candidateMeta({ platform: source.platform, year: null })}`, disabled: true });
+    const linkedLabel = source.source_url.startsWith("canonical:")
+      ? "MusicBrainz"
+      : candidateMeta({ platform: source.platform, year: null });
+    // which platform / canonical release the songs come from (shown, not clickable)
+    items.push({ label: `Linked to ${linkedLabel}`, disabled: true });
     if (actions.find) items.push({ label: "Change linked album...", action: actions.find });
     if (actions.unlink) items.push({ label: "Unlink album", action: actions.unlink });
   }

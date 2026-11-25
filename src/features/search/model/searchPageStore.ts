@@ -93,6 +93,8 @@ export interface SearchPageState {
   setFilters: (patch: Partial<SearchPageFilters>) => void;
   resetFilters: () => void;
   setSort: (sort: SearchPageSort) => void;
+  invalidatePending: () => void;
+  resumeIncomplete: () => void;
 }
 
 export const emptySection = (): SectionState => ({
@@ -298,5 +300,47 @@ export const useSearchPageStore = create<SearchPageState>((set, get) => {
     setFilters: (patch) => set((s) => ({ filters: { ...s.filters, ...patch } })),
     resetFilters: () => set({ filters: DEFAULT_FILTERS }),
     setSort: (sort) => set({ sort }),
+
+    invalidatePending: () => {
+      searchGuard.begin();
+      profileGuard.begin();
+      for (const kind of KINDS) loadMoreGuards[kind].begin();
+    },
+
+    resumeIncomplete: () => {
+      const { query, sections, profile } = get();
+      const q = query.trim();
+      if (!q) return;
+
+      const loadingKinds = KINDS.filter((k) => sections[k]?.status === "loading");
+      if (loadingKinds.length > 0) {
+        const token = searchGuard.begin();
+        for (const kind of loadingKinds) {
+          void loadFirstPage(kind, q, token);
+        }
+      }
+
+      for (const kind of KINDS) {
+        if (sections[kind]?.status === "loadingMore") {
+          setSection(kind, { status: "ready" });
+        }
+      }
+
+      if (profile.status === "loading" && profile.artist) {
+        const artist = profile.artist;
+        const token = profileGuard.begin();
+        getArtistProfile(artist.platform, artist.item_url_path).then(
+          (data) => {
+            if (!profileGuard.isLatest(token)) return;
+            set({ profile: { artist, status: "ready", data } });
+            warmPreviewStreams(data.top_songs ?? []);
+          },
+          () => {
+            if (!profileGuard.isLatest(token)) return;
+            set({ profile: { artist, status: "error", data: null } });
+          },
+        );
+      }
+    },
   };
 });

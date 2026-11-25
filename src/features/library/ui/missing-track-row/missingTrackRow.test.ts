@@ -578,6 +578,12 @@ describe("missingAlbumMenuItems linked album entry", () => {
     const a = { ...actions(), find: vi.fn() };
     const labels = missingAlbumMenuItems(source({ platform: "soundcloud", missing: 0 }), false, a).map((i) => i.label);
     expect(labels).toEqual(["", "Linked to SoundCloud", "Change linked album..."]);
+    const canonicalLabels = missingAlbumMenuItems(
+      source({ platform: "youtube", source_url: "canonical:rg:mbid-1", missing: 0 }),
+      false,
+      a,
+    ).map((i) => i.label);
+    expect(canonicalLabels).toEqual(["", "Linked to MusicBrainz", "Change linked album..."]);
   });
 
   it("is shown with find alone, so the link can be changed even when nothing is missing", () => {

@@ -1,5 +1,5 @@
 import { coverSrc } from "@/shared/lib/remote/cover";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import styles from "./search-bar.module.css";
 import { AiOutlineArrowRight, AiOutlineSearch } from "react-icons/ai";
 import { BiFilterAlt, BiInfoCircle } from "react-icons/bi";
@@ -30,6 +30,7 @@ import { useAlbumPreviewStore } from "@/features/album-preview/model/albumPrevie
 import { searchItemDownloadParams, trackAlbumItem } from "@/pages/search-results/searchResultsFormat.ts";
 import { DownloadSplitButton } from "@/shared/ui/download-split-button/DownloadSplitButton.tsx";
 import { openQualityMenu } from "@/features/download-quality/ui/QualityModal.tsx";
+import { useModalStore } from "@/shared/store/modalStore.ts";
 
 const formatSuggestionType = (type: ItemType): string => {
   switch (type) {
@@ -87,9 +88,13 @@ export const SearchBar = ({ className, ...rootProps }: SearchBarProps) => {
   const [isSearching, setIsSearching] = useState<boolean>(false);
   const [isFilterMenuOpen, setIsFilterMenuOpen] = useState<boolean>(false);
   const [showDropdown, setShowDropdown] = useState<boolean>(false);
+  const searchTokenRef = useRef(0);
+  const latestQueryRef = useRef(query);
+  latestQueryRef.current = query;
 
   const {
     searchResults,
+    searchWarning,
     setSearchQuery,
     executeSearch,
     activeCategory,
@@ -100,6 +105,22 @@ export const SearchBar = ({ className, ...rootProps }: SearchBarProps) => {
     activeDownloads,
     initDownloadListeners,
   } = useLibraryStore();
+  const modalOpen = useModalStore((s) => s.isOpen);
+
+  useEffect(() => {
+    if (modalOpen) {
+      setShowDropdown(false);
+      setIsFilterMenuOpen(false);
+    }
+  }, [modalOpen]);
+
+  const dismissDropdownForAction = () => {
+    setShowDropdown(false);
+    setIsFilterMenuOpen(false);
+    if (document.activeElement instanceof HTMLElement) {
+      document.activeElement.blur();
+    }
+  };
 
   useEffect(() => {
     initDownloadListeners().catch(console.error);
@@ -128,16 +149,26 @@ export const SearchBar = ({ className, ...rootProps }: SearchBarProps) => {
   }, [query]);
 
   useEffect(() => {
+    const token = ++searchTokenRef.current;
     setSearchQuery(debouncedQuery);
     if (debouncedQuery.trim() === "") {
       setIsSearching(false);
       return;
     }
 
+    setIsSearching(true);
     executeSearch(debouncedQuery).finally(() => {
-      setIsSearching(false);
+      if (
+        searchTokenRef.current === token &&
+        latestQueryRef.current.trim() === debouncedQuery.trim()
+      ) {
+        setIsSearching(false);
+      }
     });
   }, [debouncedQuery, setSearchQuery, executeSearch]);
+
+  const showingSkeleton =
+    isSearching || (query.trim() !== "" && query.trim() !== debouncedQuery.trim());
 
   const filteredResults = useMemo(() => {
     return searchResults.filter((item) => {
@@ -260,10 +291,35 @@ export const SearchBar = ({ className, ...rootProps }: SearchBarProps) => {
         )}
       </div>
 
-      {showDropdown && (
+      {showDropdown && !modalOpen && (
         <div className={styles.suggestions}>
+          {!showingSkeleton && searchWarning && (
+            <div className={styles.warningBanner}>
+              <span>{searchWarning}</span>
+              <button
+                type="button"
+                className={styles.warningRetry}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => {
+                  const token = ++searchTokenRef.current;
+                  const targetQ = debouncedQuery || query;
+                  setIsSearching(true);
+                  void executeSearch(targetQ, true).finally(() => {
+                    if (
+                      searchTokenRef.current === token &&
+                      latestQueryRef.current.trim() === targetQ.trim()
+                    ) {
+                      setIsSearching(false);
+                    }
+                  });
+                }}
+              >
+                Retry
+              </button>
+            </div>
+          )}
           <div className={styles.suggestionsList}>
-            {isSearching ? (
+            {showingSkeleton ? (
               Array.from({ length: 4 }).map((_, i) => (
                 <div key={i} className={styles.skeletonItem}>
                   <div className={styles.skeletonCover} />
@@ -380,12 +436,14 @@ export const SearchBar = ({ className, ...rootProps }: SearchBarProps) => {
                                   const rect =
                                     e.currentTarget.getBoundingClientRect();
                                   flyToLibrary(rect, suggestion.img);
+                                  dismissDropdownForAction();
                                   startDownload(searchItemDownloadParams(suggestion)).catch((err) => {
                                     console.log("Download error: ", err);
                                   });
                                 }}
                                 onChooseQuality={(e) => {
                                   const rect = e.currentTarget.getBoundingClientRect();
+                                  dismissDropdownForAction();
                                   openQualityMenu(searchItemDownloadParams(suggestion), {
                                     onStarted: () => flyToLibrary(rect, suggestion.img),
                                   });
@@ -428,7 +486,7 @@ export const SearchBar = ({ className, ...rootProps }: SearchBarProps) => {
             )}
           </div>
 
-          {!isSearching && filteredResults.length > 0 && (
+          {!showingSkeleton && filteredResults.length > 0 && (
             <a
               className={styles.browseButton}
               href="#"

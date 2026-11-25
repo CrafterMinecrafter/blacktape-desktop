@@ -9,9 +9,10 @@ import {
   type RemoteRef,
 } from "@/shared/lib/library/libraryIndex.ts";
 import { formatTotalDuration } from "@/shared/lib/library/trackDuration.ts";
+import { sameUrl } from "@/shared/lib/remote/urlKey.ts";
 import { ItemType, type SearchSuggestion } from "@/shared/store/libraryStore.ts";
 import type { Platform } from "@/shared/types.ts";
-import type { AudioCandidate } from "@/shared/types/canonical.ts";
+import type { AudioCandidate, ReleaseEditionOption } from "@/shared/types/canonical.ts";
 
 export interface AlbumTrackInfo {
   /** Position in the album (0-based, also for unavailable rows). */
@@ -42,11 +43,177 @@ export interface AlbumPreview {
   tracks: AlbumTrackInfo[];
   /** Sum of the known track durations in ms; null when no track has one. */
   total_duration_ms?: number | null;
+  metadata_source?: string;
+  is_free_download?: boolean;
+  release_group_id?: string | null;
+  selected_release_id?: string | null;
+  candidates_resolved?: boolean;
+}
+
+export function formatEditionSubtext(edition: Pick<ReleaseEditionOption, "year" | "track_count" | "format">): string {
+  const parts: string[] = [];
+  if (edition.year) parts.push(String(edition.year));
+  if (edition.track_count > 0) {
+    parts.push(`${edition.track_count} ${edition.track_count === 1 ? "track" : "tracks"}`);
+  }
+  if (edition.format) parts.push(edition.format);
+  return parts.join(" · ");
+}
+
+function normalizeMatchText(raw: string | null | undefined): string {
+  return (raw ?? "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+/** Whether an album preview row represents the currently playing song (checks local ID, active track URL, or same-album track title across edition switches). Pure. */
+export function isTrackRowActive(
+  track: Pick<AlbumTrackInfo, "available" | "url" | "title" | "candidates">,
+  localSongId: number | undefined,
+  currentSong: { id?: number; title?: string | null; album?: string | null; source_url?: string | null } | null | undefined,
+  albumTitle?: string | null,
+): boolean {
+  if (!track.available || !currentSong) return false;
+  if (localSongId !== undefined && currentSong.id === localSongId) return true;
+  if (sameUrl(currentSong.source_url, track.url)) return true;
+
+  const normTrackTitle = normalizeMatchText(track.title);
+  const normCurrentTitle = normalizeMatchText(currentSong.title);
+  if (!normTrackTitle || normTrackTitle !== normCurrentTitle) return false;
+
+  const candidateMatched =
+    !!currentSong.source_url &&
+    (track.candidates?.some(
+      (c) => c.source.kind === "http_stream" && sameUrl(currentSong.source_url, c.source.url),
+    ) ??
+      false);
+  if (candidateMatched) return true;
+
+  const normAlbum = normalizeMatchText(albumTitle);
+  const normCurrentAlbum = normalizeMatchText(currentSong.album);
+  return !!normAlbum && normAlbum === normCurrentAlbum;
+}
+
+export interface AlbumMetadataSource {
+  label: string;
+  kind: "musicbrainz" | "youtube" | "bandcamp" | "soundcloud";
+}
+
+export function albumMetadataSourceBadge(
+  preview: Pick<AlbumPreview, "platform" | "metadata_source" | "url">,
+): AlbumMetadataSource {
+  const src = (preview.metadata_source ?? "").toLowerCase();
+  if (src === "musicbrainz" || preview.url.startsWith("canonical:rg:")) {
+    return { label: "MusicBrainz", kind: "musicbrainz" };
+  }
+  if (src === "bandcamp" || src.startsWith("bandcamp") || String(preview.platform).toLowerCase() === "bandcamp") {
+    return { label: "Bandcamp", kind: "bandcamp" };
+  }
+  if (src === "soundcloud" || src.startsWith("soundcloud") || String(preview.platform).toLowerCase() === "soundcloud") {
+    return { label: "SoundCloud", kind: "soundcloud" };
+  }
+  return { label: "YouTube", kind: "youtube" };
+}
+
+export interface EstimatedTrackQuality {
+  label: string;
+  tier: "lossless" | "high" | "standard";
+}
+
+export function estimatedPlatformQuality(
+  preview: Pick<AlbumPreview, "platform" | "metadata_source" | "is_free_download">,
+  trackUrl: string,
+): EstimatedTrackQuality {
+  const urlLower = trackUrl.toLowerCase();
+  let plat = String(preview.platform).toLowerCase();
+  if (urlLower.includes("bandcamp.com")) plat = "bandcamp";
+  else if (urlLower.includes("soundcloud.com")) plat = "soundcloud";
+  else if (urlLower.includes("youtube.com") || urlLower.includes("youtu.be")) plat = "youtube";
+  else if ((preview.metadata_source ?? "").toLowerCase() === "musicbrainz") {
+    plat = "youtube";
+  }
+
+  if (plat === "bandcamp") {
+    return preview.is_free_download
+      ? { label: "~ BC · Lossless", tier: "lossless" }
+      : { label: "~ BC · MP3 128k", tier: "standard" };
+  }
+  if (plat === "soundcloud") {
+    return { label: "~ SC · MP3 128k", tier: "standard" };
+  }
+  return { label: "~ YT · OPUS (High)", tier: "high" };
+}
+
+export function applyMetadataPatch(
+  preview: AlbumPreview,
+  patch: {
+    title?: string;
+    artist?: string;
+    year?: number | null;
+    tracks?: Array<{ index: number; title: string }>;
+  },
+): AlbumPreview {
+  const updatedTracks = preview.tracks.map((t) => {
+    const override = patch.tracks?.find((p) => p.index === t.index);
+    return override ? { ...t, title: override.title } : t;
+  });
+
+  return {
+    ...preview,
+    title: patch.title !== undefined ? patch.title : preview.title,
+    artist: patch.artist !== undefined ? patch.artist : preview.artist,
+    year: patch.year !== undefined ? patch.year : preview.year,
+    tracks: updatedTracks,
+  };
+}
+
+export interface MetadataSnapshot {
+  title: string;
+  artist: string;
+  year: number | null;
+  trackTitles: Record<number, string>;
+}
+
+export function snapshotMetadata(preview: AlbumPreview): MetadataSnapshot {
+  const trackTitles: Record<number, string> = {};
+  for (const t of preview.tracks) {
+    trackTitles[t.index] = t.title;
+  }
+  return {
+    title: preview.title,
+    artist: preview.artist,
+    year: preview.year ?? null,
+    trackTitles,
+  };
+}
+
+export function hasMetadataChanges(
+  preview: AlbumPreview | null,
+  original: MetadataSnapshot | null,
+): boolean {
+  if (!preview || !original) return false;
+  if (
+    preview.title !== original.title ||
+    preview.artist !== original.artist ||
+    (preview.year ?? null) !== original.year
+  ) {
+    return true;
+  }
+  return preview.tracks.some((t) => t.title !== (original.trackTitles[t.index] ?? t.title));
 }
 
 /** Fetches the track list of the album at `url`. Rejects with a message string. */
-export const getAlbumPreview = (platform: Platform, url: string): Promise<AlbumPreview> =>
-  invoke<AlbumPreview>("get_album_preview", { platform, url });
+export const getAlbumPreview = (
+  platform: Platform,
+  url: string,
+  skipMbUpgrade?: boolean,
+): Promise<AlbumPreview> =>
+  invoke<AlbumPreview>("get_album_preview", {
+    platform,
+    url,
+    ...(skipMbUpgrade ? { skipMbUpgrade } : {}),
+  });
 
 /** The tracks that can be selected and downloaded, in album order. */
 export function selectableTracks(preview: Pick<AlbumPreview, "tracks">): AlbumTrackInfo[] {
@@ -283,4 +450,27 @@ export function trackRowStatus(
   if (libraryState === "downloaded" || task?.phase === "done") return { kind: "downloaded" };
   if (task?.phase === "running") return { kind: "running", percent: task.percent };
   return { kind: "download" };
+}
+
+export interface PartitionedEditions {
+  visibleMb: ReleaseEditionOption[];
+  hiddenMbCount: number;
+  platformEditions: ReleaseEditionOption[];
+}
+
+/** Splits MusicBrainz releases into primary vs alternate (vinyl/mono/retitled/duplicate 1×CD) and platform options. */
+export function partitionEditions(
+  editions: readonly ReleaseEditionOption[],
+  selectedReleaseId: string | null | undefined,
+  showAll: boolean,
+): PartitionedEditions {
+  const mb = editions.filter((e) => !e.source_kind || e.source_kind === "musicbrainz");
+  const platformEditions = editions.filter((e) => e.source_kind && e.source_kind !== "musicbrainz");
+  const primary = mb.filter((e) => !e.is_alternate || (selectedReleaseId != null && e.id === selectedReleaseId));
+  const useAll = showAll || primary.length === 0;
+  return {
+    visibleMb: useAll ? mb : primary,
+    hiddenMbCount: primary.length === 0 ? 0 : Math.max(0, mb.length - primary.length),
+    platformEditions,
+  };
 }

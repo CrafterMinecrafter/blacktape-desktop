@@ -4,6 +4,7 @@ import {
   CanonicalRelease,
   CanonicalReleaseSummary,
   CanonicalTrack,
+  ReleaseEditionOption,
 } from "@/shared/types/canonical";
 
 export const scanMusic = (dir: string): Promise<Song[]> =>
@@ -132,6 +133,14 @@ export const setTelemetryEnabled = (enabled: boolean): Promise<void> =>
 export const getOnboardingCompleted = (): Promise<boolean> =>
   invoke<boolean>("get_onboarding_completed");
 
+export type DownloadQualityPreset = "best" | "high" | "standard";
+
+export const getDefaultDownloadQuality = (): Promise<DownloadQualityPreset> =>
+  invoke<DownloadQualityPreset>("get_default_download_quality");
+
+export const setDefaultDownloadQuality = (quality: DownloadQualityPreset): Promise<void> =>
+  invoke("set_default_download_quality", { quality });
+
 export const setOnboardingCompleted = (completed: boolean): Promise<void> =>
   invoke("set_onboarding_completed", { completed });
 
@@ -157,6 +166,17 @@ export const searchCanonicalReleases = (
 
 export const getCanonicalRelease = (id: string): Promise<CanonicalRelease> =>
   invoke<CanonicalRelease>("get_canonical_release", { id });
+
+export const getReleaseGroupReleases = (
+  rgId?: string | null,
+  artist?: string,
+  title?: string,
+): Promise<ReleaseEditionOption[]> =>
+  invoke<ReleaseEditionOption[]>("get_release_group_releases", {
+    rgId: rgId || undefined,
+    artist: artist || undefined,
+    title: title || undefined,
+  });
 
 export const resolveCanonicalCandidates = (
   track: CanonicalTrack,

@@ -1,3 +1,9 @@
+import { useEffect, useState } from "react";
+import {
+  getDefaultDownloadQuality,
+  setDefaultDownloadQuality,
+  type DownloadQualityPreset,
+} from "@/shared/lib/audio.ts";
 import {
   anyBusy,
   anyFailed,
@@ -15,16 +21,58 @@ interface Props {
   rowClassName: string;
   buttonClassName: string;
   mutedClassName: string;
+  selectClassName?: string;
 }
 
-/** Settings rows for yt-dlp, deno and ffmpeg: version, where it comes from, state, and a manual check. */
-export const DownloaderSettings = ({ rowClassName, buttonClassName, mutedClassName }: Props) => {
+/** Settings rows for Default Download Quality and yt-dlp, deno and ffmpeg setup/updates. */
+export const DownloaderSettings = ({
+  rowClassName,
+  buttonClassName,
+  mutedClassName,
+  selectClassName,
+}: Props) => {
   const status = useToolsStatus();
   const check = useToolsStore((s) => s.check);
   const busy = anyBusy(status);
+  const [defaultQuality, setDefaultQuality] = useState<DownloadQualityPreset>("best");
+
+  useEffect(() => {
+    getDefaultDownloadQuality()
+      .then(setDefaultQuality)
+      .catch((err) => console.error("Failed to load default download quality:", err));
+  }, []);
+
+  const handleQualityChange = async (next: DownloadQualityPreset) => {
+    const prev = defaultQuality;
+    setDefaultQuality(next);
+    try {
+      await setDefaultDownloadQuality(next);
+    } catch (err) {
+      console.error("Failed to save default download quality:", err);
+      setDefaultQuality(prev);
+    }
+  };
 
   return (
     <>
+      <div className={rowClassName}>
+        <label htmlFor="default-download-quality-select" className={styles.toolName}>
+          <span>Default Download Quality</span>
+          <span className={mutedClassName}>
+            Used when clicking Download directly without opening the quality picker.
+          </span>
+        </label>
+        <select
+          id="default-download-quality-select"
+          className={selectClassName}
+          value={defaultQuality}
+          onChange={(e) => void handleQualityChange(e.target.value as DownloadQualityPreset)}
+        >
+          <option value="best">Automatic Best Quality (Lossless / Opus 160k)</option>
+          <option value="high">High Quality (Opus 160k / AAC 256k)</option>
+          <option value="standard">Standard Quality (MP3 128k)</option>
+        </select>
+      </div>
       {TOOL_NAMES.map((name) => {
         const tool = status?.[name];
         const details = tool ? toolDetails(tool) : "";

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyMetadataPatch } from "./MetadataEditModal";
+import { applyMetadataPatch, hasMetadataChanges, snapshotMetadata } from "@/shared/lib/remote/albumPreview.ts";
 import type { AlbumPreview } from "@/shared/lib/remote/albumPreview";
 
 describe("applyMetadataPatch", () => {
@@ -59,5 +59,18 @@ describe("applyMetadataPatch", () => {
     expect(updated.artist).toBe("Original Artist");
     expect(updated.year).toBe(1995);
     expect(updated.tracks[0].title).toBe("Track 1");
+  });
+
+  it("tracks dirty metadata changes vs snapshot and detects undo cleanly", () => {
+    const snap = snapshotMetadata(basePreview);
+    expect(hasMetadataChanges(basePreview, snap)).toBe(false);
+
+    const editedTitle = applyMetadataPatch(basePreview, { title: "Edited Album" });
+    expect(hasMetadataChanges(editedTitle, snap)).toBe(true);
+
+    const editedTrack = applyMetadataPatch(basePreview, {
+      tracks: [{ index: 1, title: "Renamed Track" }],
+    });
+    expect(hasMetadataChanges(editedTrack, snap)).toBe(true);
   });
 });

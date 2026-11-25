@@ -43,12 +43,32 @@
 }
 
 .notice {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
     font-size: var(--font-sm);
     color: var(--color-warning);
     padding: 6px 10px;
     border-left: 2px solid var(--color-warning);
     background-color: rgba(255, 255, 255, 0.03);
     border-radius: var(--radius-xs);
+}
+
+.noticeRetry {
+    padding: 2px 8px;
+    border-radius: var(--radius-xs);
+    border: 1px solid color-mix(in srgb, var(--color-warning) 45%, transparent);
+    background-color: color-mix(in srgb, var(--color-warning) 12%, transparent);
+    color: var(--color-warning);
+    font-size: var(--font-xs);
+    font-weight: 600;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.noticeRetry:hover {
+    background-color: color-mix(in srgb, var(--color-warning) 22%, transparent);
 }
 
 .content {

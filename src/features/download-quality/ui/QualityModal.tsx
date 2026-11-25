@@ -1,12 +1,16 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import clsx from "clsx";
 import { MdCheck, MdHelpOutline } from "react-icons/md";
 import { useModalStore } from "@/shared/store/modalStore.ts";
 import { ItemType, useLibraryStore, type StartDownloadParams } from "@/shared/store/libraryStore.ts";
+import { useAlbumPreviewStore } from "@/features/album-preview/model/albumPreviewStore.ts";
 import { platformLabel } from "@/shared/lib/remote/platforms.ts";
+import { PlatformBadge } from "@/shared/ui/platform-badge/PlatformBadge.tsx";
 import {
   BANDCAMP_QUALITY_HINT,
   PROBE_WAIT_TEXT,
+  buildCanonicalQualityPlan,
+  downloadButtonLabel,
   formatDetails,
   probeAudioFormats,
   type AudioFormat,
@@ -42,41 +46,22 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
   const [error, setError] = useState<string | null>(null);
   const [picked, setPicked] = useState<string | null>(null);
   const [hintOpen, setHintOpen] = useState(false);
+  const previewState = useAlbumPreviewStore((s) => s.preview);
   const album = isAlbumDownload(params);
   const platform = String(params.platform).toLowerCase();
 
-  const isCanonical = params.url.startsWith("canonical:");
+  const isMultiSource = params.url.startsWith("canonical:") || params.url.startsWith("resolve:");
+
+  const canonicalPlan = useMemo(() => {
+    if (!isMultiSource) return null;
+    const tracks = previewState && previewState.url === params.url ? previewState.tracks : [];
+    return buildCanonicalQualityPlan(tracks, params.trackUrls);
+  }, [isMultiSource, previewState, params.url, params.trackUrls]);
 
   useEffect(() => {
-    if (isCanonical) {
-      const canonicalFormats: AudioFormat[] = [
-        {
-          id: "best",
-          label: "Automatic Best Quality (Lossless / Opus 160k)",
-          codec: "Opus / FLAC",
-          bitrate_kbps: 160,
-          sample_rate_hz: 48000,
-          lossless: true,
-        },
-        {
-          id: "high",
-          label: "High Quality (Opus 160k / AAC 256k)",
-          codec: "Opus",
-          bitrate_kbps: 160,
-          sample_rate_hz: 48000,
-          lossless: false,
-        },
-        {
-          id: "standard",
-          label: "Standard Quality (MP3 128k)",
-          codec: "MP3",
-          bitrate_kbps: 128,
-          sample_rate_hz: 44100,
-          lossless: false,
-        },
-      ];
-      setFormats(canonicalFormats);
+    if (isMultiSource) {
       setPicked("best");
+      setFormats([]);
       return;
     }
 
@@ -95,7 +80,7 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
     return () => {
       cancelled = true;
     };
-  }, [params.platform, params.url, params.trackUrls, album, isCanonical]);
+  }, [params.platform, params.url, params.trackUrls, album, isMultiSource]);
 
   const download = () => {
     const format = picked ?? undefined;
@@ -106,18 +91,77 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
   };
 
   const onlyLossy = formats !== null && formats.length > 0 && !formats.some((f) => f.lossless);
-  const showBandcampHint = !isCanonical && platform === "bandcamp" && (onlyLossy || error !== null);
+  const showBandcampHint = !isMultiSource && platform === "bandcamp" && (onlyLossy || error !== null);
 
   return (
     <div className={styles.container}>
       <h2 className={styles.title}>Download quality</h2>
       <span className={styles.subtitle}>
         {params.title || "Download"}
-        {params.artistName ? ` · ${params.artistName}` : ""} ·{" "}
-        {isCanonical ? "Multi-Source Engine" : platformLabel(params.platform)}
+        {params.artistName ? ` · ${params.artistName}` : ""}
+        {!isMultiSource ? ` · ${platformLabel(params.platform)}` : ""}
       </span>
 
-      {formats === null ? (
+      {isMultiSource && canonicalPlan ? (
+        <div className={styles.list} role="radiogroup" aria-label="Formats">
+          <button
+            key={canonicalPlan.best.id}
+            type="button"
+            role="radio"
+            aria-checked={picked === canonicalPlan.best.id}
+            className={clsx(
+              styles.option,
+              styles.bestCard,
+              picked === canonicalPlan.best.id && styles.picked,
+            )}
+            onClick={() => setPicked(canonicalPlan.best.id)}
+          >
+            <span className={styles.radio} aria-hidden="true">
+              {picked === canonicalPlan.best.id && <MdCheck />}
+            </span>
+            <span className={styles.optionText}>
+              <span className={styles.optionLabel}>
+                {canonicalPlan.best.label}
+                <span className={styles.best}>Best</span>
+              </span>
+              <span className={styles.muted}>{canonicalPlan.best.details}</span>
+            </span>
+          </button>
+
+          {canonicalPlan.options.length > 0 && (
+            <>
+              <div className={styles.sectionDivider}>
+                <span>
+                  {canonicalPlan.hasDiscoveredCandidates
+                    ? "Discovered streams by platform"
+                    : "Quality presets"}
+                </span>
+              </div>
+              {canonicalPlan.options.map((opt) => (
+                <button
+                  key={opt.id}
+                  type="button"
+                  role="radio"
+                  aria-checked={picked === opt.id}
+                  className={clsx(styles.option, picked === opt.id && styles.picked)}
+                  onClick={() => setPicked(opt.id)}
+                >
+                  <span className={styles.radio} aria-hidden="true">
+                    {picked === opt.id && <MdCheck />}
+                  </span>
+                  <span className={styles.optionText}>
+                    <span className={styles.optionLabel}>
+                      {opt.platform && <PlatformBadge platform={opt.platform} />}
+                      <span>{opt.label}</span>
+                    </span>
+                    {opt.details && <span className={styles.muted}>{opt.details}</span>}
+                  </span>
+                </button>
+              ))}
+            </>
+          )}
+        </div>
+      ) : formats === null ? (
         <div className={styles.waiting} role="status">
           <span className={styles.spinner} aria-hidden="true" />
           <span>
@@ -133,7 +177,11 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
               type="button"
               role="radio"
               aria-checked={picked === format.id}
-              className={clsx(styles.option, picked === format.id && styles.picked)}
+              className={clsx(
+                styles.option,
+                i === 0 && styles.bestCard,
+                picked === format.id && styles.picked,
+              )}
               onClick={() => setPicked(format.id)}
             >
               <span className={styles.radio} aria-hidden="true">
@@ -141,7 +189,8 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
               </span>
               <span className={styles.optionText}>
                 <span className={styles.optionLabel}>
-                  {format.label}
+                  <PlatformBadge platform={platform} />
+                  <span>{format.label}</span>
                   {i === 0 && <span className={styles.best}>Best</span>}
                 </span>
                 {formatDetails(format) && <span className={styles.muted}>{formatDetails(format)}</span>}
@@ -176,7 +225,7 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
           {canGoBack ? "Back" : "Cancel"}
         </button>
         <button type="button" className={styles.primary} onClick={download} disabled={formats === null}>
-          {formats !== null && formats.length === 0 ? "Download in the best quality" : "Download"}
+          {downloadButtonLabel(isMultiSource, picked, formats)}
         </button>
       </div>
     </div>

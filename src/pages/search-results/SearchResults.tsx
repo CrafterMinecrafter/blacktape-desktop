@@ -15,6 +15,7 @@ import {
   durationFilterEnabled,
   isKindShown,
   isProfileVisible,
+  prefersAlbumsFirst,
   visibleSectionItems,
   yearFilterEnabled,
 } from "./searchResultsView.ts";
@@ -111,6 +112,16 @@ const SearchResults = () => {
     />
   );
 
+  const albumsFirst =
+    showAll &&
+    prefersAlbumsFirst(trimmed, visible[ItemType.Album], visible[ItemType.Track]);
+  const albumsSection =
+    isKindShown(tab, ItemType.Album) &&
+    renderSection(ItemType.Album, "Albums", "No albums found");
+  const tracksSection =
+    isKindShown(tab, ItemType.Track) &&
+    renderSection(ItemType.Track, "Tracks", "No tracks found");
+
   return (
     <div className={styles.container}>
       <header className={styles.header}>
@@ -121,7 +132,10 @@ const SearchResults = () => {
           <ul className={styles.notices}>
             {warnings.map((message) => (
               <li key={message} className={styles.notice}>
-                {message}
+                <span>{message}</span>
+                <button type="button" className={styles.noticeRetry} onClick={() => retry()}>
+                  Retry
+                </button>
               </li>
             ))}
           </ul>
@@ -149,10 +163,17 @@ const SearchResults = () => {
           />
         )}
 
-        {isKindShown(tab, ItemType.Track) &&
-          renderSection(ItemType.Track, "Tracks", "No tracks found")}
-        {isKindShown(tab, ItemType.Album) &&
-          renderSection(ItemType.Album, "Albums", "No albums found")}
+        {albumsFirst ? (
+          <>
+            {albumsSection}
+            {tracksSection}
+          </>
+        ) : (
+          <>
+            {tracksSection}
+            {albumsSection}
+          </>
+        )}
         {isKindShown(tab, ItemType.Artist) &&
           renderSection(ItemType.Artist, "Artists", "No artists found")}
       </div>

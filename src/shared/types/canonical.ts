@@ -59,6 +59,7 @@ export interface CanonicalDisc {
 export interface CanonicalRelease {
   id: string;
   mbid?: string;
+  release_group_id?: string;
   title: string;
   album_artist: string;
   is_various_artists: boolean;
@@ -79,6 +80,20 @@ export interface CanonicalReleaseSummary {
   track_count: number;
   cover_url?: string;
   metadata_source: string;
+}
+
+export interface ReleaseEditionOption {
+  id: string;
+  title: string;
+  edition_label: string;
+  year: number | null;
+  track_count: number;
+  disc_count: number;
+  format: string | null;
+  is_default: boolean;
+  is_alternate?: boolean;
+  source_kind?: string | null;
+  url?: string | null;
 }
 
 export function getQualityTierBadge(tier: AudioQualityTier): {

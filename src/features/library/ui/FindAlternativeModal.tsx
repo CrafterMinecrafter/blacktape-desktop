@@ -16,6 +16,8 @@ interface FindAlternativeModalProps {
   excludePlatform?: string;
   /** The library album and song this download fills (it is filed there with these names and this number). */
   placement?: TrackPlacement;
+  /** Library song id to atomically upgrade and replace (old file moves to Trash). */
+  replaceSongId?: number;
 }
 
 /** Parameters of the single-track download of a search result (the library files it into the album by its title). */
@@ -24,6 +26,7 @@ export function alternativeDownloadParams(
   artist: string,
   title: string,
   placement?: TrackPlacement,
+  replaceSongId?: number,
 ) {
   return {
     platform: item.platform,
@@ -33,6 +36,7 @@ export function alternativeDownloadParams(
     title: item.name || title,
     coverUrl: item.img,
     placement,
+    replaceSongId,
   };
 }
 
@@ -43,7 +47,13 @@ export const alternativeQuery = (artist: string, title: string): string => `${ar
  * A song of an album has no audio stream on the album's platform: looks for it on YouTube and SoundCloud and
  * downloads the result the user picks (it lands in the album when its title matches the album's track).
  */
-const FindAlternativeModal = ({ artist, title, excludePlatform, placement }: FindAlternativeModalProps) => {
+const FindAlternativeModal = ({
+  artist,
+  title,
+  excludePlatform,
+  placement,
+  replaceSongId,
+}: FindAlternativeModalProps) => {
   const closeModal = useModalStore((s) => s.closeModal);
   const [results, setResults] = useState<SearchSuggestion[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -66,7 +76,8 @@ const FindAlternativeModal = ({ artist, title, excludePlatform, placement }: Fin
   }, [artist, title, excludePlatform]);
 
   // the quality menu opens on top of this list ("Back" returns here) and starts the download
-  const pick = (item: SearchSuggestion) => openQualityMenu(alternativeDownloadParams(item, artist, title, placement));
+  const pick = (item: SearchSuggestion) =>
+    openQualityMenu(alternativeDownloadParams(item, artist, title, placement, replaceSongId));
 
   return (
     <div className={styles.container}>

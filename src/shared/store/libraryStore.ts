@@ -26,6 +26,7 @@ export interface TrackDownloadProgress {
   percent: number;
   status: "pending" | "downloading" | "completed" | "failed";
   trackNumber?: number;
+  discNumber?: number;
 }
 
 export interface DownloadProgress {
@@ -38,6 +39,7 @@ export interface DownloadProgress {
   artistName: string;
   albumTitle: string;
   coverUrl?: string;
+  releaseYear?: number;
   itemType: ItemType | "Track" | "Album";
   platform: Platform;
   overallPercent: number;
@@ -46,6 +48,22 @@ export interface DownloadProgress {
   placement?: TrackPlacement;
   /** Album downloads of some tracks: their page urls (absent for a whole album and for recovered downloads). */
   trackUrls?: string[];
+  /** Library song id when upgrading/replacing a single existing track. */
+  replaceSongId?: number;
+}
+
+interface TrackOverride {
+  index?: number;
+  title?: string;
+  url?: string;
+  fallback_urls?: string[];
+}
+
+export interface DownloadOverrides {
+  title?: string;
+  artist?: string;
+  year?: number | null;
+  tracks?: TrackOverride[];
 }
 
 export interface StartDownloadParams {
@@ -59,8 +77,12 @@ export interface StartDownloadParams {
   trackUrls?: string[];
   /** Single track downloads: the library album and song this track stands for (names and number win over the platform's). */
   placement?: TrackPlacement;
-  /** yt-dlp format id picked in the quality menu (the platform's best is the fallback); omitted: the best. */
+  /** yt-dlp format id picked in the quality menu (the platform's best is the fallback); omitted: global default. */
   format?: string;
+  /** Edited album/track metadata & chosen candidates staged in AlbumPreview. */
+  overrides?: DownloadOverrides;
+  /** Library song id to atomically upgrade and replace (old file moves to Trash after verified download). */
+  replaceSongId?: number;
 }
 
 /** Mirrors the Rust `TrackPlacement` (snake_case on the wire). */
@@ -124,13 +146,16 @@ interface LibraryState {
 
   activeView: ActiveView;
   setActiveView: (view: ActiveView) => void;
+  scrollToAlbum: string | null;
+  setScrollToAlbum: (albumTitle: string | null) => void;
 
   // Search Bar Live State
   searchQuery: string;
   searchResults: SearchSuggestion[];
   searchCache: Record<string, any[]>;
+  searchWarning: string | null;
   setSearchQuery: (query: string) => void;
-  executeSearch: (query: string) => Promise<void>;
+  executeSearch: (query: string, force?: boolean) => Promise<void>;
 
   // Global Filters
   activeCategory: CategoryFilter;
@@ -140,6 +165,7 @@ interface LibraryState {
 
   fetchTabs: (query?: string) => Promise<void>;
   setSelectedTab: (identifier: string) => void;
+  cancelTabLoad: () => void;
 
   // Download tracking
   activeDownloads: Record<string, DownloadProgress>;
@@ -153,8 +179,9 @@ interface LibraryState {
   cancelDownload: (taskId: string) => Promise<void>;
 }
 
-// Only the most recently started search may update `searchResults`; older responses still fill the cache.
+// Only the most recently started search or artist-tab load may commit results.
 const searchGuard = createLatestGuard();
+const tabGuard = createLatestGuard();
 
 const savedInitialNav =
   typeof window !== "undefined" ? loadSavedNavEntry() : null;
@@ -168,10 +195,13 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
 
   activeView: savedInitialNav?.view || "ARTIST_ALBUMS",
   setActiveView: (view) => set({ activeView: view }),
+  scrollToAlbum: null,
+  setScrollToAlbum: (albumTitle) => set({ scrollToAlbum: albumTitle }),
 
   searchQuery: "",
   searchResults: [],
   searchCache: {},
+  searchWarning: null,
 
   activeCategory: "All",
   activePlatform: "All",
@@ -179,51 +209,77 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
   setActivePlatform: (plat) => set({ activePlatform: plat }),
 
   setSearchQuery: (query) => set({ searchQuery: query }),
-  executeSearch: async (query) => {
+  executeSearch: async (query, force = false) => {
     const token = searchGuard.begin();
     const trimmedQuery = query.trim().toLowerCase();
     if (!trimmedQuery) {
-      set({ searchResults: [] });
+      set({ searchResults: [], searchWarning: null });
       return;
     }
 
+    set({ searchWarning: null });
     const { searchCache } = get();
 
-    if (searchCache[trimmedQuery]) {
+    if (!force && searchCache[trimmedQuery]) {
       set({ searchResults: searchCache[trimmedQuery] });
       return;
     }
 
+    let warning: string | null = null;
+    let unlisten: (() => void) | null = null;
     try {
+      if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+        unlisten = await listen<{ query: string; message: string }>(
+          "search-mb-warning",
+          (ev) => {
+            if (ev.payload.query.trim().toLowerCase() === trimmedQuery) {
+              warning = ev.payload.message;
+            }
+          },
+        );
+      }
       const results: SearchSuggestion[] = await searchPlatforms(
         trimmedQuery,
         SEARCH_PLATFORMS,
       );
       const isLatest = searchGuard.isLatest(token);
 
-      set((state) => ({
-        ...(isLatest ? { searchResults: results } : {}),
-        searchCache: {
-          ...state.searchCache,
-          [trimmedQuery]: results,
-        },
-      }));
+      set((state) => {
+        const nextCache = { ...state.searchCache };
+        // Don't poison cache if MusicBrainz was unavailable (503) so subsequent search retries cleanly.
+        if (!warning) {
+          nextCache[trimmedQuery] = results;
+        }
+        return {
+          ...(isLatest ? { searchResults: results, searchWarning: warning } : {}),
+          searchCache: nextCache,
+        };
+      });
     } catch (error) {
       console.error("Search failed", error);
       captureFrontendError(error, "libraryStore.executeSearch");
+    } finally {
+      unlisten?.();
     }
   },
 
   setSelectedTab: async (identifier) => {
+    const token = tabGuard.begin();
     set({ selectedTab: identifier, activeView: "ARTIST_ALBUMS" });
     try {
       const albums = await getArtistAlbums(identifier);
+      if (!tabGuard.isLatest(token)) return;
       set({ albums });
     } catch (error) {
+      if (!tabGuard.isLatest(token)) return;
       console.error("Failed to fetch artist albums:", error);
       captureFrontendError(error, "libraryStore.getArtistAlbums");
       set({ albums: [] });
     }
+  },
+
+  cancelTabLoad: () => {
+    tabGuard.begin();
   },
 
   fetchTabs: async (query?: string): Promise<void> => {
@@ -253,6 +309,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
           artist_name: string;
           album_title: string;
           cover_url?: string;
+          release_year?: number;
           status: string;
           current: number;
           total: number;
@@ -261,6 +318,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
           tracks: {
             title: string;
             track_number?: number;
+            disc_number?: number;
             percent: number;
             status: string;
           }[];
@@ -281,6 +339,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
               artistName: item.artist_name,
               albumTitle: item.album_title,
               coverUrl: item.cover_url,
+              releaseYear: item.release_year,
               itemType: (item.download_type === "Track"
                 ? ItemType.Track
                 : ItemType.Album) as ItemType,
@@ -289,6 +348,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
               tracks: (item.tracks || []).map((t) => ({
                 title: t.title,
                 trackNumber: t.track_number,
+                discNumber: t.disc_number,
                 percent: t.percent,
                 status: t.status as any,
               })),
@@ -326,9 +386,10 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       title: string;
       artist: string;
       cover_url?: string;
-      tracks: { title: string; track_number?: number }[];
+      release_year?: number;
+      tracks: { title: string; track_number?: number; disc_number?: number }[];
     }>("download-album-meta", (event) => {
-      const { task_id, title, artist, cover_url, tracks } = event.payload;
+      const { task_id, title, artist, cover_url, release_year, tracks } = event.payload;
       set((state) => {
         const existing = state.activeDownloads[task_id];
         if (!existing) return {};
@@ -338,6 +399,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
           return {
             title: t.title,
             trackNumber: t.track_number ?? idx + 1,
+            discNumber: t.disc_number,
             percent: existingTrack ? existingTrack.percent : 0,
             status: existingTrack ? existingTrack.status : "pending",
           };
@@ -351,6 +413,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
               artistName: artist || existing.artistName,
               albumTitle: title || existing.albumTitle,
               coverUrl: cover_url || existing.coverUrl,
+              releaseYear: release_year ?? existing.releaseYear,
               total: tracks.length,
               tracks: updatedTracks,
             },
@@ -622,6 +685,8 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     const trackUrls = isObject ? paramsOrPlatform.trackUrls : undefined;
     const placement = isObject ? paramsOrPlatform.placement : undefined;
     const format = isObject ? paramsOrPlatform.format : undefined;
+    const overrides = isObject ? paramsOrPlatform.overrides : undefined;
+    const replaceSongId = isObject ? paramsOrPlatform.replaceSongId : undefined;
 
     // A second click while the same songs are still downloading would queue them again.
     if (isRunning(findDownload(get().activeDownloads, { url, trackUrls }))) return;
@@ -649,6 +714,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
           overallPercent: 0,
           placement,
           trackUrls,
+          replaceSongId,
           tracks: isSingleTrack
             ? [
                 {
@@ -675,6 +741,8 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
         trackUrls: trackUrls ?? null,
         placement: placement ?? null,
         format: format ?? null,
+        overrides: overrides ?? null,
+        replaceSongId: replaceSongId ?? null,
       });
     } catch (e) {
       console.error("Download invoke failed:", e);

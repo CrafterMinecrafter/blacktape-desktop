@@ -42,6 +42,7 @@ import { useModalStore } from "@/shared/store/modalStore.ts";
 import { useTrackStatus } from "@/shared/hooks/useDownloadStatus.ts";
 import { findDownload, isRunning } from "@/shared/lib/library/downloadMatch.ts";
 import { streamAlbumUrl } from "@/shared/lib/remote/stream.ts";
+import { sameUrl } from "@/shared/lib/remote/urlKey.ts";
 import {
   albumTarget,
   remoteTrackRef,
@@ -182,19 +183,36 @@ export const PlayerControls = () => {
     [streamTrack],
   );
   // The download of this song started from anywhere (here, a menu, the album page), if any.
-  const download = useLibraryStore((s) =>
-    downloadParams
-      ? findDownload(s.activeDownloads, downloadParams)
-      : undefined,
-  );
+  const download = useLibraryStore((s) => {
+    if (!downloadParams || !streamTrack) return undefined;
+    const direct = findDownload(s.activeDownloads, downloadParams);
+    if (direct) return direct;
+    const matched = Object.values(s.activeDownloads).filter(
+      (d) =>
+        d.status !== "failed" &&
+        d.status !== "cancelled" &&
+        (sameUrl(d.url, streamTrack.url) ||
+          (d.trackUrls?.some((u) => sameUrl(u, streamTrack.url)) ?? false)),
+    );
+    return matched.find(isRunning) ?? matched[0];
+  });
   const downloading = isRunning(download);
   const downloaded =
     downloadState === "downloaded" || download?.status === "completed";
 
+  const openArtist = () => {
+    if (!currentSong?.album_artist) return;
+    const lib = useLibraryStore.getState();
+    lib.setScrollToAlbum(null);
+    void lib.setSelectedTab(currentSong.album_artist);
+  };
+
   const openAlbum = () => {
     if (!currentSong || !target) return;
     if (target.kind === "library") {
-      void useLibraryStore.getState().setSelectedTab(target.albumArtist);
+      const lib = useLibraryStore.getState();
+      lib.setScrollToAlbum(currentSong.album || null);
+      void lib.setSelectedTab(target.albumArtist);
       return;
     }
     const item: SearchSuggestion = {
@@ -317,7 +335,22 @@ export const PlayerControls = () => {
                       Streaming
                     </span>
                   )}
-                  {currentSong.album_artist}
+                  {currentSong.album_artist ? (
+                    <span
+                      role="button"
+                      tabIndex={0}
+                      className={styles.albumLink}
+                      onClick={openArtist}
+                      onKeyDown={(e) => {
+                        if (e.key !== "Enter" && e.key !== " ") return;
+                        e.preventDefault();
+                        openArtist();
+                      }}
+                      title="Open artist"
+                    >
+                      {currentSong.album_artist}
+                    </span>
+                  ) : null}
                   {currentSong.album && " • "}
                   {target ? (
                     // A span, not a button: a button is one unbreakable box, so a long album name

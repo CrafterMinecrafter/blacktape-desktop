@@ -47,52 +47,6 @@
     background-color: var(--bg-surface); /* placeholder while the image loads */
 }
 
-.downloadingAlbumBlock {
-    position: relative;
-    opacity: 0.65;
-    filter: grayscale(40%);
-    transition: opacity 200ms ease;
-}
-
-.downloadingCoverWrapper {
-    position: relative;
-    width: 200px;
-    flex-shrink: 0;
-    aspect-ratio: 1;
-    border-radius: var(--radius-sm, 4px);
-    overflow: hidden;
-}
-
-.downloadingCoverBadge {
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    padding: 4px 8px;
-    background: rgba(0, 0, 0, 0.75);
-    color: var(--color-primary);
-    font-size: 11px;
-    font-weight: 600;
-    text-align: center;
-    backdrop-filter: blur(2px);
-}
-
-.downloadingHeader {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-}
-
-.downloadingOverallBadge {
-    font-size: var(--font-sm, 12px);
-    color: var(--color-primary);
-    background: color-mix(in srgb, var(--color-primary) 12%, transparent);
-    border: 1px solid color-mix(in srgb, var(--color-primary) 30%, transparent);
-    padding: 2px 8px;
-    border-radius: var(--radius-full, 9999px);
-    font-weight: 500;
-}
-
 .downloadingSong {
     cursor: default !important;
     user-select: none;
@@ -197,6 +151,36 @@
     min-width: 0;
     font-size: var(--font-sm);
     color: var(--color-muted);
+}
+
+.albumUpgradingBadge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 8px;
+    border-radius: var(--radius-full, 9999px);
+    font-size: var(--font-xs);
+    font-weight: 600;
+    color: var(--color-primaryLight);
+    background-color: color-mix(in srgb, var(--color-primaryLight) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--color-primaryLight) 30%, transparent);
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+.albumUpgradingSpinner {
+    width: 10px;
+    height: 10px;
+    border: 1.5px solid color-mix(in srgb, var(--color-primaryLight) 30%, transparent);
+    border-top-color: var(--color-primaryLight);
+    border-radius: 50%;
+    animation: albumUpgradingSpin 700ms linear infinite;
+}
+
+@keyframes albumUpgradingSpin {
+    to {
+        transform: rotate(360deg);
+    }
 }
 
 .songs {

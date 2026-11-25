@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import {
+  buildCanonicalQualityPlan,
+  downloadButtonLabel,
   expectedQualityOf,
   formatDetails,
   getExpectedQuality,
@@ -103,5 +105,70 @@ describe("formatDetails", () => {
 
   it("is empty when yt-dlp gave no sample rate and the format is lossy", () => {
     expect(formatDetails(format({ sample_rate_hz: null, lossless: false }))).toBe("");
+  });
+});
+
+describe("buildCanonicalQualityPlan", () => {
+  it("falls back to semantic tiers before candidates finish resolving", () => {
+    const plan = buildCanonicalQualityPlan([]);
+    expect(plan.hasDiscoveredCandidates).toBe(false);
+    expect(plan.best.id).toBe("best");
+    expect(plan.best.lossless).toBe(false);
+    expect(plan.options.map((o) => o.id)).toEqual(["high", "standard"]);
+  });
+
+  it("reports honest opus summary instead of claiming lossless when only opus exists", () => {
+    const plan = buildCanonicalQualityPlan([
+      {
+        index: 0,
+        title: "Track 1",
+        artists: ["Aphex Twin"],
+        track_number: 1,
+        url: "https://youtube.com/watch?v=1",
+        available: true,
+        note: null,
+        selected_candidate_idx: 0,
+        candidates: [
+          {
+            source: { kind: "http_stream", platform: "youtube", url: "https://youtube.com/watch?v=1" },
+            quality_tier: "high_lossy",
+            codec: "Opus",
+            bitrate_kbps: 160,
+            duration_ms: 200_000,
+            match_confidence: 0.95,
+            is_strict_match: true,
+            display_label: "YouTube · Opus 160 kbps",
+          },
+          {
+            source: { kind: "http_stream", platform: "bandcamp", url: "https://a.bandcamp.com/track/1" },
+            quality_tier: "standard_lossy",
+            codec: "MP3",
+            bitrate_kbps: 128,
+            duration_ms: 200_000,
+            match_confidence: 0.95,
+            is_strict_match: true,
+            display_label: "Bandcamp · MP3 128 kbps",
+          },
+        ],
+      },
+    ]);
+
+    expect(plan.hasDiscoveredCandidates).toBe(true);
+    expect(plan.best.lossless).toBe(false);
+    expect(plan.best.details).toContain("Opus 160 kbps (YOUTUBE)");
+    expect(plan.options.map((o) => o.id)).toEqual(["source:youtube:high", "source:bandcamp:standard"]);
+    expect(plan.options[0].platform).toBe("youtube");
+    expect(plan.options[1].platform).toBe("bandcamp");
+  });
+});
+
+describe("downloadButtonLabel", () => {
+  it("labels best-quality option accurately and uses plain Download for other presets", () => {
+    expect(downloadButtonLabel(true, "best", [])).toBe("Download in the best quality");
+    expect(downloadButtonLabel(true, "high", [])).toBe("Download");
+    expect(downloadButtonLabel(true, "standard", [])).toBe("Download");
+    expect(downloadButtonLabel(true, "source:bandcamp:standard", [])).toBe("Download");
+    expect(downloadButtonLabel(false, null, [])).toBe("Download in the best quality");
+    expect(downloadButtonLabel(false, "251", [format()])).toBe("Download");
   });
 });

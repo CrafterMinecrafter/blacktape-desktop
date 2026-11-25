@@ -58,6 +58,10 @@ export interface MissingTracks {
 export const getDownloadStatus = (items: RemoteRef[]): Promise<Record<string, DownloadState>> =>
   invoke<Record<string, DownloadState>>("get_download_status", { items });
 
+/** Local library song IDs matching remote track refs. Keyed by `item.url` as sent. */
+export const getLibraryTrackIds = (items: RemoteRef[]): Promise<Record<string, number>> =>
+  invoke<Record<string, number>>("get_library_track_ids", { items });
+
 /** Library state of album urls (from the albums the app downloaded before). Keyed by the url as sent. */
 export const getAlbumStatus = (items: RemoteRef[]): Promise<Record<string, AlbumStatus>> =>
   invoke<Record<string, AlbumStatus>>("get_album_status", { items });

@@ -23,8 +23,8 @@ import { useModalStore } from "@/shared/store/modalStore.ts";
 import { WelcomeModal } from "@/features/onboarding";
 import { useOnboardingStore } from "@/features/onboarding/model/onboardingStore.ts";
 import {
-  applyNavEntry,
   initNavigationListener,
+  useNavigationStore,
 } from "@/features/navigation/model/navigationStore.ts";
 import { useGlobalShortcuts } from "@/features/keymaps/lib/useGlobalShortcuts.ts";
 import { initKeymapsSyncListener } from "@/features/keymaps/model/keymapStore.ts";
@@ -58,7 +58,7 @@ function PlayerView() {
 
     const savedNav = loadSavedNavEntry();
     if (savedNav && (savedNav.view !== "ARTIST_ALBUMS" || savedNav.artistName)) {
-      void applyNavEntry(savedNav);
+      void useNavigationStore.getState().restoreSavedNav(savedNav);
     }
 
     useFavoritesStore

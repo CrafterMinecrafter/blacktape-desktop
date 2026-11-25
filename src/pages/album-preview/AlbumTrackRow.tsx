@@ -1,15 +1,19 @@
 import { useState, useRef, useEffect, type MouseEvent } from "react";
 import clsx from "clsx";
+import { HiOutlineMusicNote } from "react-icons/hi";
+import { HiMiniPause } from "react-icons/hi2";
 import { DownloadSplitButton } from "@/shared/ui/download-split-button/DownloadSplitButton.tsx";
 import { MdKeyboardArrowDown, MdPause, MdPlayArrow } from "react-icons/md";
 import { FiCheck } from "react-icons/fi";
 import rowStyles from "@/features/library/ui/song-list-item/song-list-item.module.css";
-import { isStreamingUrl, useStreamStore } from "@/features/preview/model/streamStore.ts";
+import { useStreamStore } from "@/features/preview/model/streamStore.ts";
 import { DownloadStatusBadge } from "@/shared/ui/download-status-badge/DownloadStatusBadge.tsx";
 import { flyToLibrary } from "@/shared/lib/ui/flyAnimation.ts";
 import {
+  isTrackRowActive,
   trackRowStatus,
   type AlbumTrackInfo,
+  type EstimatedTrackQuality,
   type TrackTaskState,
 } from "@/shared/lib/remote/albumPreview.ts";
 import type { AudioCandidate } from "@/shared/types/canonical.ts";
@@ -33,18 +37,35 @@ const tierClass = (tier: string) => {
   }
 };
 
+const shortPlatformTag = (cand: AudioCandidate): string => {
+  const plat = cand.source.kind === "http_stream" ? cand.source.platform.toLowerCase() : cand.source.kind;
+  switch (plat) {
+    case "youtube":
+      return "YT";
+    case "bandcamp":
+      return "BC";
+    case "soundcloud":
+      return "SC";
+    case "torrent":
+      return "P2P";
+    default:
+      return plat.toUpperCase();
+  }
+};
+
 const candidateShortBadge = (cand: AudioCandidate) => {
+  const plat = shortPlatformTag(cand);
   const codec = cand.codec.toUpperCase();
   switch (cand.quality_tier) {
     case "lossless":
-      return `${codec} · Lossless`;
+      return `${plat} · ${codec} · Lossless`;
     case "high_lossy":
-      return `${codec} · High`;
+      return `${plat} · ${codec} · High`;
     case "standard_lossy":
-      return `${codec} · Standard`;
+      return `${plat} · ${codec} · Standard`;
     case "low":
     default:
-      return `${codec} · Low`;
+      return `${plat} · ${codec} · Low`;
   }
 };
 
@@ -145,6 +166,12 @@ export interface AlbumTrackRowProps {
   /** Download task that serves this row, when there is one. */
   task: TrackTaskState | undefined;
   cover: string | null;
+  albumTitle?: string | null;
+  resolving?: boolean;
+  estimate?: EstimatedTrackQuality;
+  localSongId?: number;
+  editing?: boolean;
+  onChangeTitle?: (title: string) => void;
   onSelect: (e: MouseEvent) => void;
   onPlay: () => void;
   onDownload: () => void;
@@ -164,6 +191,12 @@ export const AlbumTrackRow = ({
   libraryState,
   task,
   cover,
+  albumTitle,
+  resolving = false,
+  estimate,
+  localSongId,
+  editing = false,
+  onChangeTitle,
   onSelect,
   onPlay,
   onDownload,
@@ -176,14 +209,16 @@ export const AlbumTrackRow = ({
   const isPlaying = useAudioStore((s) => s.isPlaying);
   const streamLoading = useAudioStore((s) => s.streamLoading);
   const loadingUrl = useStreamStore((s) => s.pendingUrl);
-  const active = track.available && isStreamingUrl(currentSong, isStreaming, track.url);
-  const playing = active && isPlaying && !streamLoading;
-  const loading = track.available && (loadingUrl === track.url || (active && streamLoading));
+  const active = isTrackRowActive(track, localSongId, currentSong, albumTitle);
+  const playing = active && isPlaying && !(isStreaming && streamLoading);
+  const loading = track.available && (loadingUrl === track.url || (active && isStreaming && streamLoading));
   const status = trackRowStatus(track, libraryState, task);
 
   return (
     <div
       className={clsx(rowStyles.song, styles.trackRow, {
+        [rowStyles.playing]: active,
+        [styles.playing]: active,
         [rowStyles.selected]: selected,
         [rowStyles.selectedTop]: selected && !selectedAbove,
         [rowStyles.selectedBottom]: selected && !selectedBelow,
@@ -196,21 +231,29 @@ export const AlbumTrackRow = ({
       role="button"
       tabIndex={0}
       onClick={(e) => track.available && onSelect(e)}
-      onDoubleClick={() => track.available && onPlay()}
+      onDoubleClick={() => track.available && !editing && onPlay()}
       onContextMenu={track.available ? onContextMenu : undefined}
     >
       <div className={rowStyles.songLeft}>
         <div className={rowStyles.numSlot}>
-          <div className={clsx(rowStyles.numContent, (active || loading) && styles.numHidden)}>
-            <div className={rowStyles.songTrackNumber}>
-              {String(track.track_number ?? position + 1).padStart(2, "0")}
-            </div>
+          <div className={clsx(rowStyles.numContent, loading && styles.numHidden)}>
+            {active ? (
+              isPlaying ? (
+                <HiOutlineMusicNote className={rowStyles.playingIcon} />
+              ) : (
+                <HiMiniPause className={rowStyles.pauseIcon} />
+              )
+            ) : (
+              <div className={rowStyles.songTrackNumber}>
+                {String(track.track_number ?? position + 1).padStart(2, "0")}
+              </div>
+            )}
           </div>
           {track.available && (
             <button
-              className={clsx(rowStyles.rowPlayButton, (active || loading) && styles.alwaysShown)}
-              title={playing ? "Pause" : "Play preview"}
-              aria-label={playing ? "Pause" : "Play preview"}
+              className={clsx(rowStyles.rowPlayButton, loading && styles.alwaysShown)}
+              title={playing ? "Pause" : localSongId !== undefined ? "Play" : "Play preview"}
+              aria-label={playing ? "Pause" : localSongId !== undefined ? "Play" : "Play preview"}
               onClick={(e) => {
                 e.stopPropagation();
                 onPlay();
@@ -227,23 +270,54 @@ export const AlbumTrackRow = ({
             </button>
           )}
         </div>
-        <div className={clsx(rowStyles.songTitle, "truncate")}>
-          {decodeHtmlEntities(track.title)}
-          {track.artists.length > 0 && (
-            <span className={styles.trackArtist}> · {track.artists.join(", ")}</span>
-          )}
-        </div>
+        {editing ? (
+          <input
+            type="text"
+            className={styles.inlineTrackInput}
+            value={track.title}
+            onClick={(e) => e.stopPropagation()}
+            onDoubleClick={(e) => e.stopPropagation()}
+            onChange={(e) => onChangeTitle?.(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === "Escape") {
+                e.currentTarget.blur();
+              }
+            }}
+            aria-label={`Track ${track.track_number ?? position + 1} title`}
+          />
+        ) : (
+          <div className={styles.trackTitleWrap}>
+            <span className={styles.trackTitleText}>{decodeHtmlEntities(track.title)}</span>
+            {track.artists.length > 0 && (
+              <span className={styles.trackArtist}>
+                {track.artists.join(", ")}
+              </span>
+            )}
+          </div>
+        )}
       </div>
       <div className={rowStyles.songRight}>
         {!track.available && track.note && (
           <div className={clsx(styles.note, "truncate")}>{track.note}</div>
         )}
-        {track.candidates && track.candidates.length > 0 && (
+        {track.candidates && track.candidates.length > 0 ? (
           <CandidateSelector
             candidates={track.candidates}
             selectedIdx={track.selected_candidate_idx ?? 0}
             onSelect={onSelectCandidate}
           />
+        ) : (
+          resolving &&
+          track.available &&
+          estimate && (
+            <span
+              className={clsx(styles.estimateBadge, styles[estimate.tier])}
+              title="Checking exact multi-source audio quality…"
+            >
+              <span className={styles.miniSpinner} aria-hidden="true" />
+              <span>{estimate.label}</span>
+            </span>
+          )
         )}
         <span className={styles.duration}>{formatTrackDuration(track.duration_ms)}</span>
         <div className={styles.rowAction}>

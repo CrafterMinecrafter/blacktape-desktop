@@ -6,9 +6,14 @@ import {
   albumAction,
   albumInfoLine,
   albumLibraryState,
+  albumMetadataSourceBadge,
   albumMetaLine,
   downloadLabel,
+  estimatedPlatformQuality,
+  formatEditionSubtext,
   getAlbumPreview,
+  isTrackRowActive,
+  partitionEditions,
   selectableIndexes,
   selectableTracks,
   selectedUrls,
@@ -602,5 +607,121 @@ describe("albumMetaLine", () => {
       { year: 2020, genres: [], total_duration_ms: null },
     );
     expect(albumMetaLine(p)).toBe("2020 · 3 tracks · 1 unavailable");
+  });
+});
+
+describe("albumMetadataSourceBadge and estimatedPlatformQuality", () => {
+  it("maps MusicBrainz and platform metadata sources", () => {
+    expect(albumMetadataSourceBadge({ platform: "youtube", metadata_source: "musicbrainz", url: "canonical:rg:1" }))
+      .toEqual({ label: "MusicBrainz", kind: "musicbrainz" });
+    expect(albumMetadataSourceBadge({ platform: "bandcamp", metadata_source: "bandcamp", url: "https://a.bandcamp.com/album/x" }))
+      .toEqual({ label: "Bandcamp", kind: "bandcamp" });
+    expect(albumMetadataSourceBadge({ platform: "soundcloud", metadata_source: "soundcloud", url: "https://soundcloud.com/a/sets/b" }))
+      .toEqual({ label: "SoundCloud", kind: "soundcloud" });
+  });
+
+  it("estimates lossless only for free Bandcamp albums and Opus High for YouTube", () => {
+    expect(estimatedPlatformQuality({ platform: "youtube" }, "https://youtube.com/watch?v=1"))
+      .toEqual({ label: "~ YT · OPUS (High)", tier: "high" });
+    expect(estimatedPlatformQuality({ platform: "bandcamp", is_free_download: true }, "https://a.bandcamp.com/track/1"))
+      .toEqual({ label: "~ BC · Lossless", tier: "lossless" });
+    expect(estimatedPlatformQuality({ platform: "bandcamp", is_free_download: false }, "https://a.bandcamp.com/track/1"))
+      .toEqual({ label: "~ BC · MP3 128k", tier: "standard" });
+  });
+});
+
+describe("formatEditionSubtext and isTrackRowActive", () => {
+  it("formats edition year, track count, and media format cleanly", () => {
+    expect(
+      formatEditionSubtext({ year: 2001, track_count: 30, format: "Digital Media" }),
+    ).toBe("2001 · 30 tracks · Digital Media");
+    expect(
+      formatEditionSubtext({ year: null, track_count: 1, format: null }),
+    ).toBe("1 track");
+  });
+
+  it("matches only local ID or active track URL, never unselected candidates", () => {
+    const culDeSac = {
+      available: true,
+      title: "Cul-de-sac",
+      url: "https://youtube.com/watch?v=culdesac",
+    };
+    // Playing Track 1 (Coelacanth) must NOT highlight Track 6 even if Coelacanth appeared as an unselected candidate elsewhere.
+    expect(
+      isTrackRowActive(culDeSac, undefined, { id: -1, title: "Coelacanth", album: "Plastic Death", source_url: "https://youtube.com/watch?v=coelacanth" }, "Plastic Death"),
+    ).toBe(false);
+    expect(
+      isTrackRowActive(culDeSac, undefined, { id: -1, source_url: "https://youtube.com/watch?v=culdesac" }),
+    ).toBe(true);
+    expect(
+      isTrackRowActive(culDeSac, 42, { id: 42, source_url: null }),
+    ).toBe(true);
+  });
+
+  it("preserves highlight across release switches via album+track title when candidate matches or URL is still resolving", () => {
+    const resolvingTrack = {
+      available: true,
+      title: "Jynweythek",
+      url: "",
+      candidates: [],
+    };
+    expect(
+      isTrackRowActive(
+        resolvingTrack,
+        undefined,
+        { id: -1, title: "Jynweythek", album: "Drukqs", source_url: "https://youtube.com/watch?v=old-release" },
+        "Drukqs",
+      ),
+    ).toBe(true);
+
+    const switchedTrackWithCandidate = {
+      available: true,
+      title: "Jynweythek",
+      url: "https://bandcamp.com/track/jynweythek",
+      candidates: [
+        { source: { kind: "http_stream" }, url: "https://bandcamp.com/track/jynweythek" },
+        { source: { kind: "http_stream" }, url: "https://youtube.com/watch?v=old-release" },
+      ] as any,
+    };
+    expect(
+      isTrackRowActive(
+        switchedTrackWithCandidate,
+        undefined,
+        { id: -1, title: "Jynweythek", album: "Drukqs", source_url: "https://youtube.com/watch?v=old-release" },
+        "Drukqs",
+      ),
+    ).toBe(true);
+
+    // Different album with same track name should NOT highlight when URL differs
+    expect(
+      isTrackRowActive(
+        resolvingTrack,
+        undefined,
+        { id: -1, title: "Jynweythek", album: "Other Album", source_url: "https://youtube.com/watch?v=other" },
+        "Drukqs",
+      ),
+    ).toBe(false);
+  });
+
+  it("partitions MusicBrainz alternate editions and reveals all when expanded or selected", () => {
+    const editions = [
+      { id: "orig", title: "The Doors", edition_label: "Original edition", year: 1967, track_count: 11, disc_count: 1, format: "CD", is_default: true, is_alternate: false, source_kind: "musicbrainz" },
+      { id: "mono", title: "The Doors", edition_label: "Mono", year: 1967, track_count: 11, disc_count: 1, format: '12" Vinyl', is_default: false, is_alternate: true, source_kind: "musicbrainz" },
+      { id: "4cd", title: "The Doors", edition_label: "50th Anniversary", year: 2017, track_count: 41, disc_count: 4, format: "4×CD", is_default: false, is_alternate: false, source_kind: "musicbrainz" },
+      { id: "yt", title: "The Doors", edition_label: "YouTube Music", year: 1967, track_count: 0, disc_count: 1, format: "Opus High", is_default: false, is_alternate: false, source_kind: "youtube" },
+    ];
+
+    const collapsed = partitionEditions(editions, "orig", false);
+    expect(collapsed.visibleMb.map((e) => e.id)).toEqual(["orig", "4cd"]);
+    expect(collapsed.hiddenMbCount).toBe(1);
+    expect(collapsed.platformEditions.map((e) => e.id)).toEqual(["yt"]);
+
+    const selectedAlt = partitionEditions(editions, "mono", false);
+    expect(selectedAlt.visibleMb.map((e) => e.id)).toEqual(["orig", "mono", "4cd"]);
+    expect(selectedAlt.hiddenMbCount).toBe(0);
+
+    const expanded = partitionEditions(editions, "orig", true);
+    expect(expanded.visibleMb.map((e) => e.id)).toEqual(["orig", "mono", "4cd"]);
+    expect(expanded.hiddenMbCount).toBe(1);
   });
 });
