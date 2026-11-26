@@ -333,6 +333,14 @@ export const resolveCanonicalCandidates = (
     fallbackArtist,
   });
 
+export const probeDownloadStreams = (
+  artist: string,
+  album: string,
+  tracks: ExpectedTorrentTrackInput[],
+  onMatch: (match: { index: number; candidates: AudioCandidate[] }) => void,
+): Promise<void> =>
+  invoke("probe_download_streams", { artist, album, tracks, progress: new Channel(onMatch) });
+
 export const probeUpgradeCandidates = (
   songIds: number[],
 ): Promise<Array<{

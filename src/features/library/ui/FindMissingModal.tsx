@@ -156,7 +156,7 @@ const FindMissingModal = ({ albumArtist, album, excludeUrl, failedSong }: FindMi
         )}
         {failedSong?.retry && explained?.kind !== "no-stream" && (
           <button
-            className={styles.cancelButton}
+            className={styles.retryButton}
             disabled={linking}
             onClick={() => {
               failedSong.retry?.();
@@ -168,7 +168,7 @@ const FindMissingModal = ({ albumArtist, album, excludeUrl, failedSong }: FindMi
         )}
         {failedSong && (
           <button
-            className={styles.cancelButton}
+            className={styles.alternativeButton}
             disabled={linking}
             onClick={() =>
               openModal(

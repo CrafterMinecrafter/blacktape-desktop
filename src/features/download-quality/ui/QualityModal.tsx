@@ -6,10 +6,11 @@ import { ItemType, useLibraryStore, type DownloadOverrides, type StartDownloadPa
 import { useAlbumPreviewStore } from "@/features/album-preview/model/albumPreviewStore.ts";
 import {
   probeUpgradeCandidates,
+  probeDownloadStreams,
   type ExpectedTorrentTrackInput,
 } from "@/shared/lib/audio.ts";
 import { useTorrentDiscovery } from "@/features/download-quality/lib/useTorrentDiscovery.ts";
-import type { AlbumTrackInfo } from "@/shared/lib/remote/albumPreview.ts";
+import { getAlbumPreview, type AlbumTrackInfo } from "@/shared/lib/remote/albumPreview.ts";
 import { platformLabel } from "@/shared/lib/remote/platforms.ts";
 import { PlatformBadge } from "@/shared/ui/platform-badge/PlatformBadge.tsx";
 import {
@@ -21,13 +22,18 @@ import {
   formatByteSize,
   formatDetails,
   mergeTorrentResolutionsIntoTracks,
+  mergeScopedQualityTracks,
   probeAudioFormats,
   tierSuffixFor,
+  torrentQualityLabel,
   type AudioFormat,
 } from "@/features/download-quality/lib/downloadQuality.ts";
 import styles from "./quality-modal.module.css";
 
 export interface QualityMenuOptions {
+  displayTitle?: string;
+  /** The exact rows selected in ArtistAlbums when its album preview is not open. */
+  scopeTracks?: AlbumTrackInfo[];
   /** Called once the download was started (e.g. the fly-to-library animation of the caller). */
   onStarted?: () => void;
   /** Starts the download in `format` instead of `startDownload({...params, format})` (album preview rows). */
@@ -55,13 +61,15 @@ export function submitQualityDownload(params: StartDownloadParams, { start, onSt
  * picks. The probe takes a few seconds; the text says so. When it fails the download still runs in the best
  * quality.
  */
-const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
+const QualityModal = ({ params, onStarted, start, scopeTracks: selectedScope, displayTitle }: QualityModalProps) => {
   const closeModal = useModalStore((s) => s.closeModal);
   const goBack = useModalStore((s) => s.goBack);
   const canGoBack = useModalStore((s) => s.stack.length > 0);
   const [formats, setFormats] = useState<AudioFormat[] | null>(null);
   const [resolvedUpgradeTracks, setResolvedUpgradeTracks] = useState<AlbumTrackInfo[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [scopedCandidates, setScopedCandidates] = useState<AlbumTrackInfo[]>([]);
+  const [searchingStreams, setSearchingStreams] = useState(false);
   const [picked, setPicked] = useState<string | null>(null);
   const [hintOpen, setHintOpen] = useState(false);
   const previewState = useAlbumPreviewStore((s) => s.preview);
@@ -70,7 +78,12 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
   const platform = String(params.platform).toLowerCase();
 
   const isResolveUpgrade = params.url.startsWith("resolve:");
-  const isMultiSource = params.url.startsWith("canonical:") || isResolveUpgrade;
+  const isDirectTrack = !album && !isResolveUpgrade && !!params.title && !!params.artistName;
+  const scopeTracks = useMemo(() => selectedScope ?? (isDirectTrack ? [{
+    index: 0, title: params.placement?.title ?? params.title!, artists: [params.artistName!], url: params.url,
+    available: true, track_number: params.placement?.track_number ?? null, note: null,
+  }] : undefined), [selectedScope, isDirectTrack, params]);
+  const isMultiSource = params.url.startsWith("canonical:") || isResolveUpgrade || !!scopeTracks;
   const resolveSongIds = useMemo(
     () => (isResolveUpgrade ? extractResolveSongIds(params.url, params.trackUrls) : []),
     [isResolveUpgrade, params.url, params.trackUrls],
@@ -78,6 +91,20 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
   const resolveSongIdsKey = resolveSongIds.join(",");
   const waitingUpgradeProbe =
     isResolveUpgrade && resolveSongIds.length > 0 && resolvedUpgradeTracks === null;
+
+  useEffect(() => {
+    if (!scopeTracks || !params.url.startsWith("canonical:")) return;
+    if (platform !== "youtube" && platform !== "bandcamp" && platform !== "soundcloud") return;
+    let current = true;
+    void getAlbumPreview(platform, params.url).then((preview) => {
+      if (current) setScopedCandidates((rows) =>
+        mergeScopedQualityTracks(rows.length ? rows : mergeScopedQualityTracks(scopeTracks, []), preview.tracks));
+    }).catch(() => {});
+    return () => { current = false; };
+  }, [scopeTracks, platform, params.url]);
+
+  const scopedTracks = useMemo(() => scopeTracks && mergeScopedQualityTracks(scopeTracks, scopedCandidates),
+    [scopeTracks, scopedCandidates]);
 
   const torrentScope = useMemo<{
     artist: string;
@@ -108,6 +135,18 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
           disc_number: song.disc_number ?? null,
           track_number: song.track_number ?? null,
           duration_ms: song.duration_ms > 0 ? song.duration_ms : null,
+        })),
+      };
+    }
+
+    if (scopeTracks && params.artistName?.trim() && params.title?.trim()) {
+      return {
+        artist: params.artistName,
+        title: params.placement?.album || params.title,
+        expected: scopeTracks.map((track) => ({
+          index: track.index, title: track.title, artist: track.artists[0] ?? params.artistName,
+          disc_number: track.disc_number ?? null, track_number: track.track_number ?? null,
+          duration_ms: track.duration_ms ?? null,
         })),
       };
     }
@@ -150,7 +189,25 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
               },
             ],
     };
-  }, [isResolveUpgrade, resolveSongIds, localAlbums, previewState, params, album]);
+  }, [isResolveUpgrade, resolveSongIds, localAlbums, previewState, params, album, scopeTracks]);
+
+  useEffect(() => {
+    if (!scopeTracks?.length || !torrentScope) return;
+    let current = true;
+    setSearchingStreams(true);
+    void probeDownloadStreams(torrentScope.artist, torrentScope.title, torrentScope.expected, (match) => {
+      if (!current) return;
+      const track = scopeTracks.find((row) => row.index === match.index);
+      if (!track) return;
+      setScopedCandidates((rows) => mergeScopedQualityTracks(
+        rows.length ? rows : mergeScopedQualityTracks(scopeTracks, []),
+        [{ ...track, candidates: match.candidates }],
+      ));
+    }).catch(() => {}).finally(() => {
+      if (current) setSearchingStreams(false);
+    });
+    return () => { current = false; };
+  }, [scopeTracks, torrentScope]);
 
   const torrentDiscovery = useTorrentDiscovery(params.url, torrentScope);
   const torrentPhase = torrentDiscovery.phase;
@@ -165,9 +222,9 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
     if (!isMultiSource) return null;
     const baseTracks = isResolveUpgrade
       ? (resolvedUpgradeTracks ?? [])
-      : previewState && previewState.url === params.url
+      : scopedTracks ?? (previewState && previewState.url === params.url
         ? previewState.tracks
-        : [];
+        : []);
     const mergedTracks = mergeTorrentResolutionsIntoTracks(baseTracks, torrentResolutions);
     return buildCanonicalQualityPlan(
       mergedTracks,
@@ -182,6 +239,7 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
     params.url,
     params.trackUrls,
     torrentResolutions,
+    scopedTracks,
   ]);
 
   const pickedCanonicalOption = useMemo(() => {
@@ -192,7 +250,7 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
   const upgradeNotNeeded = pickedCanonicalOption?.upgradableCount === 0;
 
   useEffect(() => {
-    if (isMultiSource) {
+    if (isMultiSource && !isDirectTrack) {
       setPicked("best");
       setFormats([]);
       if (!isResolveUpgrade || resolveSongIds.length === 0) {
@@ -215,11 +273,12 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
     }
 
     let cancelled = false;
+    if (isDirectTrack) setPicked("best");
     probeAudioFormats(params.platform, params.url, album, params.trackUrls?.[0])
       .then((found) => {
         if (cancelled) return;
         setFormats(found);
-        setPicked(found[0]?.id ?? null);
+        if (!isDirectTrack) setPicked(found[0]?.id ?? null);
       })
       .catch((e) => {
         if (cancelled) return;
@@ -230,12 +289,24 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
     return () => {
       cancelled = true;
     };
-  }, [params.platform, params.url, params.trackUrls, album, isMultiSource, isResolveUpgrade, resolveSongIdsKey]);
+  }, [params.platform, params.url, params.trackUrls, album, isMultiSource, isDirectTrack, isResolveUpgrade, resolveSongIdsKey]);
 
   const download = () => {
     const format = picked ?? undefined;
     let overrides: DownloadOverrides | undefined = params.overrides;
-    if (torrentResolutions.some((r) => r.matched_count > 0)) {
+    if (scopedTracks && !(isDirectTrack && formats?.some((option) => option.id === format))) {
+      overrides = {
+        ...params.overrides,
+        tracks: mergeTorrentResolutionsIntoTracks(scopedTracks, torrentResolutions).map((track) => ({
+          index: track.index,
+          original_url: params.url.startsWith("canonical:") ? undefined : track.url,
+          title: track.title,
+          candidates: track.candidates,
+          selected_candidate_idx: format === "best" ? 0 : track.selected_candidate_idx,
+        })),
+      };
+    }
+    if (!scopedTracks && torrentResolutions.some((r) => r.matched_count > 0)) {
       if (isResolveUpgrade) {
         const merged = mergeTorrentResolutionsIntoTracks(resolvedUpgradeTracks ?? [], torrentResolutions);
         overrides = {
@@ -335,7 +406,7 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
     <div className={styles.container}>
       <h2 className={styles.title}>Download quality</h2>
       <span className={styles.subtitle}>
-        {params.title || "Download"}
+        {displayTitle || params.title || "Download"}
         {params.artistName ? ` · ${params.artistName}` : ""}
         {!isMultiSource ? ` · ${platformLabel(params.platform)}` : ""}
       </span>
@@ -350,6 +421,12 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
         </div>
       ) : isMultiSource && canonicalPlan ? (
         <div className={styles.list} role="radiogroup" aria-label="Formats">
+          {searchingStreams && (
+            <div className={clsx(styles.option, styles.optionDisabled)} role="status">
+              <span className={styles.miniSpinner} aria-hidden="true" />
+              Checking YouTube, Bandcamp and SoundCloud…
+            </div>
+          )}
           <button
             key={canonicalPlan.best.id}
             type="button"
@@ -413,6 +490,24 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
                 </button>
               ))}
               {torrentPendingBlock}
+            </>
+          )}
+          {isDirectTrack && !!formats?.length && (
+            <>
+              <div className={styles.sectionDivider}><span>Formats on {platformLabel(params.platform)}</span></div>
+              {formats.map((format) => (
+                <button key={format.id} type="button" role="radio" aria-checked={picked === format.id}
+                  className={clsx(styles.option, picked === format.id && styles.picked)} onClick={() => setPicked(format.id)}>
+                  <span className={styles.radio} aria-hidden="true">{picked === format.id && <MdCheck />}</span>
+                  <span className={styles.optionText}>
+                    <span className={styles.optionLabel}>
+                      <PlatformBadge platform={params.platform} />
+                      <span>{format.label}</span>
+                    </span>
+                    <span className={styles.muted}>{formatDetails(format)}</span>
+                  </span>
+                </button>
+              ))}
             </>
           )}
         </div>
@@ -498,7 +593,7 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
                     <span className={styles.optionText}>
                       <span className={styles.optionLabel}>
                         <PlatformBadge platform="torrent" />
-                        <span>{res.display_label}</span>
+                        <span>{torrentQualityLabel(res)}</span>
                       </span>
                       {metaParts.length > 0 && <span className={styles.muted}>{metaParts.join(" · ")}</span>}
                       {res.layout_warning && <span className={styles.optionWarn}>{res.layout_warning}</span>}
@@ -540,7 +635,7 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
           type="button"
           className={styles.primary}
           onClick={download}
-          disabled={formats === null || waitingUpgradeProbe || upgradeNotNeeded}
+          disabled={(!isMultiSource && formats === null) || waitingUpgradeProbe || upgradeNotNeeded}
         >
           {upgradeNotNeeded
             ? "Already up to date"
@@ -553,7 +648,7 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
 
 /** Opens the quality menu for `params` (on top of an open modal, which "Back" returns to). */
 export function openQualityMenu(params: StartDownloadParams, options: QualityMenuOptions = {}) {
-  useModalStore.getState().openModal(<QualityModal params={params} {...options} />);
+  useModalStore.getState().openModal(<QualityModal key={JSON.stringify([params.url, params.trackUrls])} params={params} {...options} />);
 }
 
 export default QualityModal;

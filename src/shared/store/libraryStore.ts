@@ -55,6 +55,7 @@ export interface DownloadProgress {
 
 interface TrackOverride {
   index?: number;
+  original_url?: string;
   title?: string;
   url?: string;
   fallback_urls?: string[];

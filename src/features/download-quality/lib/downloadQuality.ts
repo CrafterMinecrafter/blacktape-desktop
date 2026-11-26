@@ -3,6 +3,7 @@ import type { TorrentTierResolution } from "@/shared/lib/audio.ts";
 import { audioTierRank, type AlbumTrackInfo } from "@/shared/lib/remote/albumPreview.ts";
 import type { Platform } from "@/shared/types.ts";
 import type { AudioCandidate } from "@/shared/types/canonical.ts";
+import { sameUrl } from "@/shared/lib/remote/urlKey.ts";
 
 /** Mirrors the Rust `quality::AudioFormat` (snake_case on the wire). */
 export interface AudioFormat {
@@ -114,11 +115,67 @@ function tierDisplayLabel(
 ): string {
   const upper = codec.toUpperCase();
   const displayCodec = upper === "OPUS" ? "Opus" : upper === "VORBIS" ? "Vorbis" : upper;
-  if (tier === "lossless") return `${displayCodec} (Lossless)`;
+  if (tier === "lossless") {
+    return /^(FLAC|WAV|ALAC|AIFF|APE|WAVPACK|WV|DSF|DFF|TAK|TTA|SHN|PCM)$/.test(upper)
+      ? `${displayCodec} (Lossless)`
+      : "Lossless";
+  }
   if (bitrateKbps) return `${displayCodec} ${bitrateKbps} kbps`;
   if (tier === "high_lossy") return `${displayCodec} (High)`;
   if (tier === "standard_lossy") return `${displayCodec} (Standard)`;
   return displayCodec;
+}
+
+export function torrentQualityLabel(release: TorrentTierResolution): string {
+  return release.tier === "lossless"
+    ? tierDisplayLabel(release.codec, release.tier, release.bitrate_kbps)
+    : release.display_label;
+}
+
+export function mergeScopedQualityTracks(
+  selected: readonly AlbumTrackInfo[],
+  resolved: readonly AlbumTrackInfo[],
+): AlbumTrackInfo[] {
+  return selected.map((track) => {
+    const match = resolved.find((candidate) => candidate.index === track.index &&
+      candidate.title.trim().toLowerCase() === track.title.trim().toLowerCase() &&
+      candidate.disc_number === track.disc_number && candidate.track_number === track.track_number)
+      ?? resolved.find((candidate) => candidate.title.trim().toLowerCase() === track.title.trim().toLowerCase() &&
+        sameUrl(candidate.url, track.url));
+    if (match?.candidates?.length) {
+      const merged = [...match.candidates];
+      for (const candidate of track.candidates ?? []) {
+        if (!merged.some((other) => other.source.kind === "http_stream" && candidate.source.kind === "http_stream" &&
+          sameUrl(other.source.url, candidate.source.url)) &&
+          !merged.some((other) => other === candidate)) merged.push(candidate);
+      }
+      return { ...track, candidates: merged.sort(compareCandidates), selected_candidate_idx: 0 };
+    }
+    if (track.candidates?.length) return track;
+
+    // The linked track's existing URL still provides its platform option while candidates load.
+    let url: URL;
+    try { url = new URL(track.url); } catch { return track; }
+    if (url.protocol !== "https:") return track;
+    const youtube = url.hostname === "youtu.be" ||
+      (["www.youtube.com", "music.youtube.com", "youtube.com"].includes(url.hostname) && url.searchParams.has("v"));
+    const bandcamp = url.hostname.endsWith(".bandcamp.com") && url.pathname.startsWith("/track/");
+    const soundcloud = ["soundcloud.com", "www.soundcloud.com"].includes(url.hostname) &&
+      url.pathname.split("/").filter(Boolean).length === 2;
+    if (!youtube && !bandcamp && !soundcloud) return track;
+    const platform = youtube ? "youtube" : bandcamp ? "bandcamp" : "soundcloud";
+    return {
+      ...track,
+      candidates: [{
+        source: { kind: "http_stream", platform, url: track.url },
+        quality_tier: youtube ? "high_lossy" : "standard_lossy", codec: youtube ? "Opus" : "MP3",
+        bitrate_kbps: youtube ? 160 : 128,
+        duration_ms: track.duration_ms ?? 0, match_confidence: 1, is_strict_match: true,
+        display_label: platform,
+      }],
+      selected_candidate_idx: 0,
+    };
+  });
 }
 
 /** Extracts unique numeric song IDs from `resolve:` URLs (`resolve:song:42`, `resolve:batch:...`, `resolve:album:...`). Pure. */
@@ -433,7 +490,7 @@ export function buildCanonicalQualityPlan(
     }
     return {
       id: `source:${src.platform}${tierSuffix}`,
-      label: torrentRes?.display_label ?? tierDisplayLabel(src.codec, src.tier, src.bitrate),
+      label: torrentRes ? torrentQualityLabel(torrentRes) : tierDisplayLabel(src.codec, src.tier, src.bitrate),
       details: metaParts.join(" · "),
       platform: src.platform,
       lossless: src.tier === "lossless",

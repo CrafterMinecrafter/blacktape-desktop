@@ -180,18 +180,9 @@ pub async fn resolve_bandcamp_candidates(
     }
 
     let mut top = keep_top_candidates(candidates);
-    if !top.is_empty() {
-        let free_url = top.first().map(|c| c.source.primary_url().to_string());
-        if let Some(u) = free_url {
-            if crate::download::bandcamp::page_has_free_download(&u).await {
-                for cand in &mut top {
-                    cand.quality_tier = AudioQualityTier::Lossless;
-                    cand.codec = "FLAC".into();
-                    cand.bitrate_kbps = None;
-                    cand.sample_rate_hz = Some(44100);
-                    cand.display_label = "Bandcamp · FLAC (Lossless)".into();
-                }
-            }
+    if let Some(url) = top.first().map(|candidate| candidate.source.primary_url().to_owned()) {
+        if crate::download::bandcamp::page_has_free_download(&url).await {
+            mark_bandcamp_lossless(&mut top, &url);
         }
     }
     debug!(
@@ -201,6 +192,16 @@ pub async fn resolve_bandcamp_candidates(
         title
     );
     top
+}
+
+fn mark_bandcamp_lossless(candidates: &mut [AudioCandidate], verified_url: &str) {
+    for candidate in candidates.iter_mut().filter(|candidate| candidate.source.primary_url() == verified_url) {
+        candidate.quality_tier = AudioQualityTier::Lossless;
+        candidate.codec = "FLAC".into();
+        candidate.bitrate_kbps = None;
+        candidate.sample_rate_hz = Some(44100);
+        candidate.display_label = "Bandcamp · FLAC (Lossless)".into();
+    }
 }
 
 /// Queries SoundCloud for candidate streams matching the target track.
@@ -515,5 +516,24 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    #[test]
+    fn only_the_bandcamp_page_confirmed_to_offer_a_free_download_is_lossless() {
+        let candidate = |url: &str| AudioCandidate {
+            source: AudioSource::HttpStream {
+                platform: "bandcamp".into(), url: url.into(), format_id: None,
+                direct_stream_url: None, expires_at: None,
+            },
+            quality_tier: AudioQualityTier::StandardLossy, codec: "MP3".into(), bitrate_kbps: Some(128),
+            sample_rate_hz: None, duration_ms: 0, match_confidence: 1., is_strict_match: true,
+            display_label: "MP3".into(), matched_title: None, matched_artist: None,
+        };
+        let free = "https://artist.bandcamp.com/track/free";
+        let paid = "https://artist.bandcamp.com/track/paid";
+        let mut candidates = [candidate(free), candidate(paid)];
+        mark_bandcamp_lossless(&mut candidates, free);
+        assert_eq!(candidates[0].quality_tier, AudioQualityTier::Lossless);
+        assert_eq!(candidates[1].quality_tier, AudioQualityTier::StandardLossy);
     }
 }

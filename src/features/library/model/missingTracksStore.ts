@@ -226,7 +226,7 @@ export interface MissingTracksState {
   unlink: (artist: string, album: string) => Promise<void>;
   /** Starts one album download of the missing songs of `album` that are not already downloading. */
   /** `format`: the yt-dlp format picked in the quality menu (the best when omitted). */
-  downloadMissing: (album: string, format?: string, overrides?: DownloadOverrides) => Promise<void>;
+  downloadMissing: (album: string, format?: string, overrides?: DownloadOverrides, selectedUrls?: readonly string[]) => Promise<void>;
   /** Starts the album download of one missing song of `album`. Ignored when it is no longer missing or is downloading. */
   downloadOne: (album: string, track: AlbumTrackInfo, format?: string, overrides?: DownloadOverrides) => Promise<void>;
   /** Starts one album download of the given missing songs of `album` (those no longer missing or pending are skipped). */
@@ -378,12 +378,13 @@ export const useMissingTracksStore = create<MissingTracksState>((set, get) => {
       void reloadMissing(album);
     },
 
-    downloadMissing: async (album, format, overrides) => {
+    downloadMissing: async (album, format, overrides, selectedUrls) => {
       const missing = await reloadMissing(album);
       if (!missing) return;
       const pending = get().pendingUrls;
       const dead = get().unavailable;
-      const urls = missingTrackUrls(missing).filter((url) => !pending.has(url) && !dead.has(url));
+      const selected = selectedUrls && new Set(selectedUrls);
+      const urls = missingTrackUrls(missing).filter((url) => (!selected || selected.has(url)) && !pending.has(url) && !dead.has(url));
       if (urls.length === 0) return;
       // Show the songs in the album: they get their download percents there.
       set({ shown: new Set(get().shown).add(album) });

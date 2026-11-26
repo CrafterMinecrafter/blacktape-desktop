@@ -708,6 +708,7 @@ async fn download(
         },
     };
 
+    let automatic_quality = format.as_deref().is_none_or(|value| value.trim().is_empty());
     let resolved_format = match format {
         Some(f) if !f.trim().is_empty() => Some(f),
         _ => db_default_quality,
@@ -715,6 +716,7 @@ async fn download(
 
     task_registry.register_task(initial_state).await;
     task_registry.set_format(&id, resolved_format).await;
+    task_registry.set_automatic_quality(&id, automatic_quality).await;
     task_registry.set_overrides(&id, overrides).await;
     task_registry.set_replace_song_id(&id, replace_song_id).await;
 
@@ -888,7 +890,7 @@ async fn cancel_download(
 
             if let (Some(target_dir), Some(root_dir)) = (info.target_dir, info.root_dir) {
                 if target_dir.exists() {
-                    let _ = crate::utils::force_remove_dir_all(&target_dir);
+                    crate::trash::remove_dir_if_empty(&target_dir);
                     crate::utils::remove_empty_parents_up_to(&target_dir, &root_dir);
                 }
             }
@@ -1194,6 +1196,7 @@ pub fn run() {
             metadata::commands::resolve_canonical_candidates,
             metadata::commands::prewarm_album_previews,
             download::album::probe_upgrade_candidates,
+            download::discovery::probe_download_streams,
             // Library index (status of remote items, missing tracks)
             library_index::commands::get_download_status,
             library_index::commands::get_library_track_details,

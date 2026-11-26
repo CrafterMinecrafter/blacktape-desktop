@@ -400,6 +400,13 @@ fn score_file_match(
         return None;
     }
 
+    // A joined hidden track cannot substitute for either of its standalone files, or vice versa.
+    if target_clean != file_clean
+        && (expected.title.contains(" / ") || stripped_file.contains(" / "))
+    {
+        return None;
+    }
+
     // A bare filename cannot identify which of several separately listed versions it contains.
     if target_clean != file_clean && version_base.is_some_and(|base|
         file_clean == base || parenthetical_base(&stripped_file).as_deref() == Some(base)
@@ -578,8 +585,6 @@ pub fn match_release_to_expected(
     let mut ambiguous_titles = Vec::new();
     let mut total_matched_bytes = 0u64;
     let mut tier_counts: BTreeMap<AudioQualityTier, usize> = BTreeMap::new();
-    let mut codec_counts: HashMap<String, usize> = HashMap::new();
-    let mut bitrates: Vec<u32> = Vec::new();
 
     for (exp_pos, exp) in expected.iter().enumerate() {
         let opts = &ranked_per_expected[exp_pos];
@@ -595,10 +600,6 @@ pub fn match_release_to_expected(
                 title_hint.as_ref(),
             );
             *tier_counts.entry(tier).or_insert(0) += 1;
-            *codec_counts.entry(codec.clone()).or_insert(0) += 1;
-            if let Some(b) = bitrate_kbps {
-                bitrates.push(b);
-            }
             total_matched_bytes = total_matched_bytes.saturating_add(file.size_bytes);
             if is_ambiguous {
                 ambiguous_titles.push(exp.title.clone());
@@ -641,10 +642,6 @@ pub fn match_release_to_expected(
                 title_hint.as_ref(),
             );
             *tier_counts.entry(tier).or_insert(0) += 1;
-            *codec_counts.entry(codec.clone()).or_insert(0) += 1;
-            if let Some(b) = bitrate_kbps {
-                bitrates.push(b);
-            }
             total_matched_bytes = total_matched_bytes.saturating_add(file.size_bytes);
             matched_tracks.push(MatchedTorrentTrack {
                 expected_index: pos,
@@ -679,6 +676,12 @@ pub fn match_release_to_expected(
         .or_else(|| title_hint.as_ref().map(|h| h.tier))
         .unwrap_or(AudioQualityTier::StandardLossy);
 
+    let mut codec_counts = BTreeMap::new();
+    let mut bitrates = Vec::new();
+    for track in matched_tracks.iter().filter(|track| track.candidate.quality_tier == dominant_tier) {
+        *codec_counts.entry(track.candidate.codec.clone()).or_insert(0) += 1;
+        bitrates.extend(track.candidate.bitrate_kbps);
+    }
     let dominant_codec = codec_counts
         .into_iter()
         .max_by_key(|(_, count)| *count)
@@ -1020,7 +1023,7 @@ fn inspection_order(hits: &[SearchHit]) -> Vec<&SearchHit> {
     ordered
 }
 
-fn sorted_resolutions(mut resolutions: Vec<TorrentTierResolution>) -> Vec<TorrentTierResolution> {
+pub(super) fn sorted_resolutions(mut resolutions: Vec<TorrentTierResolution>) -> Vec<TorrentTierResolution> {
     resolutions.sort_by_cached_key(|release| {
         let web_seed = super::web_seed::archive_item(&release.magnet_uri)
             .and_then(|item| {
@@ -1201,6 +1204,23 @@ mod tests {
     }
 
     #[test]
+    fn nevermind_joined_hidden_track_requires_the_joined_file() {
+        let joined = ExpectedTrackInput {
+            index: 11, title: "Something in the Way / Endless, Nameless".into(),
+            artist: Some("Nirvana".into()), disc_number: Some(1), track_number: Some(12),
+            duration_ms: Some(1_235_000),
+        };
+        let file = InspectedTrack {
+            file_index: 11, file_path: "12 Something in the Way.flac".into(),
+            title: "Something in the Way".into(), codec: "FLAC", size_bytes: 30_000_000,
+            disc_number: Some(1), track_number: Some(12), folder: None, is_sample: false,
+        };
+        assert!(score_file_match(&joined, &file, None, None).is_none());
+        let exact = InspectedTrack { title: joined.title.clone(), ..file };
+        assert!(score_file_match(&joined, &exact, None, None).unwrap().1);
+    }
+
+    #[test]
     fn album_tagged_filenames_require_matching_artist_album_and_track_number() {
         let file = InspectedTrack {
             file_index: 8,
@@ -1241,6 +1261,23 @@ mod tests {
         file.title = "Just What I Needed , Not Just What I Needed".into();
         file.codec = "FLAC";
         assert!(score_file_match(&expected, &file, None, None).is_none());
+    }
+
+    #[test]
+    fn mixed_torrent_reports_a_codec_from_the_dominant_quality_tier() {
+        let release = InspectedRelease {
+            info_hash: "0123456789abcdef0123456789abcdef01234567".into(),
+            name: "Mixed".into(), layout: ReleaseLayout::MultiDiscAlbum,
+            total_size_bytes: 80_000_000, total_file_count: 4,
+            tracks: ["FLAC", "WAV", "MP3", "MP3"].into_iter().enumerate().map(|(index, codec)| InspectedTrack {
+                file_index: index, file_path: format!("{index}.{codec}"), title: format!("Song {index}"),
+                codec, size_bytes: 20_000_000, disc_number: None, track_number: None, folder: None, is_sample: false,
+            }).collect(),
+            cover_art: Vec::new(), cue_sheets: Vec::new(), rip_logs: Vec::new(),
+        };
+        let result = match_release_to_expected(&release, &hit("Artist - Mixed", "Archive.org", None, 3), &[]);
+        assert_eq!(result.tier, AudioQualityTier::Lossless);
+        assert!(matches!(result.codec.as_str(), "FLAC" | "WAV"));
     }
 
     #[test]

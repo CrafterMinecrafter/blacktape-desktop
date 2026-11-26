@@ -8,7 +8,7 @@ import { FiCheck } from "react-icons/fi";
 import { MdKeyboardArrowDown, MdSettings } from "react-icons/md";
 import placeholderAlbumImage from "@/assets/images/album_cover_placeholder_dark.jpg";
 import artistStyles from "@/pages/artist-albums/artist-albums.module.css";
-import { useAlbumPreviewStore } from "@/features/album-preview/model/albumPreviewStore.ts";
+import { buildDownloadOverrides, useAlbumPreviewStore } from "@/features/album-preview/model/albumPreviewStore.ts";
 import { StreamActionRow } from "@/features/preview/ui/StreamActionRow.tsx";
 import { toStreamRequest, useStreamStore } from "@/features/preview/model/streamStore.ts";
 import { useTrackStatuses } from "@/shared/hooks/useDownloadStatus.ts";
@@ -258,6 +258,10 @@ const AlbumPreview = () => {
           }
         : undefined,
       format: "best",
+      overrides: buildDownloadOverrides({
+        ...preview,
+        tracks: items.map(({ track }, index) => ({ ...track, index })),
+      }),
     });
   };
 

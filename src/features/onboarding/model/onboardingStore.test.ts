@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { useOnboardingStore } from "./onboardingStore.ts";
 
 vi.mock("@/shared/lib/audio.ts", () => ({
+  setDefaultDownloadQuality: vi.fn().mockResolvedValue(undefined),
   setTelemetryEnabled: vi.fn().mockResolvedValue(undefined),
   setOnboardingCompleted: vi.fn().mockResolvedValue(undefined),
   scanMusic: vi.fn().mockResolvedValue([]),
@@ -83,6 +84,17 @@ describe("onboardingStore", () => {
     expect(setTelemetryEnabled).toHaveBeenCalledWith(true);
     expect(setOnboardingCompleted).toHaveBeenCalledWith(true);
     expect(closeModalMock).toHaveBeenCalled();
+  });
+
+  it("persists the selected quality from the new download step", async () => {
+    const { setDefaultDownloadQuality } = await import("@/shared/lib/audio.ts");
+    const state = useOnboardingStore.getState();
+    state.nextStep();
+    state.nextStep();
+    expect(useOnboardingStore.getState().step).toBe(3);
+    state.setDownloadQuality("standard");
+    await state.finishOnboarding();
+    expect(setDefaultDownloadQuality).toHaveBeenCalledWith("standard");
   });
 
   it("skips onboarding without setting library folder but marking completed", async () => {

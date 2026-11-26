@@ -93,6 +93,14 @@ const MissingTrackRow = ({
   const isCurrent = isStreamingUrl(currentSong, isStreaming, remote.url);
   const playing = isCurrent && isPlaying;
   const title = decodeHtmlEntities(track.title);
+  const chooseQuality = () => openQualityMenu(
+    missingDownloadParams(missing, [track.url]),
+    {
+      displayTitle: title,
+      scopeTracks: [track],
+      start: (format, overrides) => void downloadOne(album, track, format, overrides),
+    },
+  );
 
   const play = () => {
     if (onPlay) return onPlay();
@@ -118,6 +126,8 @@ const MissingTrackRow = ({
         openMenu(e, remote, {
           list: queue,
           downloadState: "none",
+          onDownload: () => void downloadOne(album, track),
+          onDownloadAs: chooseQuality,
           extraItems:
             trashId === undefined ? undefined : [{ label: "Restore from trash", action: () => void restoreTrash([trashId]) }],
         });
@@ -201,12 +211,7 @@ const MissingTrackRow = ({
               className={styles.downloadSplit}
               title={`Download ${title}`}
               onDownload={() => void downloadOne(album, track)}
-              onChooseQuality={() =>
-                openQualityMenu(
-                  { ...missingDownloadParams(missing, [track.url]), title },
-                  { start: (format, overrides) => void downloadOne(album, track, format, overrides) },
-                )
-              }
+              onChooseQuality={chooseQuality}
             />
           </span>
         )}

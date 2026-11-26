@@ -19,6 +19,58 @@ enum TransferError {
     Other(String),
 }
 
+struct TorrentJob {
+    dir: PathBuf,
+    torrent: Option<(Arc<Session>, usize)>,
+    cleaned: bool,
+}
+
+async fn remove_torrent_directory(dir: &std::path::Path) {
+    for attempt in 0..8 {
+        match tokio::fs::remove_dir_all(dir).await {
+            Ok(()) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) if attempt == 7 => {
+                tracing::warn!(%error, "Failed cleaning torrent temporary directory");
+                return;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+}
+
+pub(crate) struct TorrentStagingCleanup(pub PathBuf);
+
+impl Drop for TorrentStagingCleanup {
+    fn drop(&mut self) {
+        let dir = std::mem::take(&mut self.0);
+        tokio::spawn(async move { remove_torrent_directory(&dir).await; });
+    }
+}
+
+impl TorrentJob {
+    async fn clean(&mut self) {
+        if let Some((session, id)) = &self.torrent {
+            let _ = session.delete((*id).into(), true).await;
+        }
+        remove_torrent_directory(&self.dir).await;
+        self.cleaned = true;
+    }
+}
+
+impl Drop for TorrentJob {
+    fn drop(&mut self) {
+        if self.cleaned { return; }
+        let mut cleanup = Self {
+            dir: self.dir.clone(),
+            torrent: self.torrent.take(),
+            cleaned: false,
+        };
+        self.cleaned = true;
+        tokio::spawn(async move { cleanup.clean().await; });
+    }
+}
+
 impl From<String> for TransferError {
     fn from(message: String) -> Self {
         Self::Other(message)
@@ -278,16 +330,22 @@ async fn download_archive_seed(
     if is_task_cancelled(app, task_id).await {
         return Err("Task cancelled".into());
     }
-    let target = requests.first().and_then(|request| request.track.torrent_target.as_ref())
-        .and_then(|target| std::iter::once(target).chain(&target.alternatives).find(|source| source.magnet_uri == locator))
+    let target = requests.first().and_then(|request| target_for_request(request, locator))
         .ok_or("Archive web seed requires a matched torrent.")?;
     if super::inspect::cached_torrent_bytes(locator).is_none() {
         super::inspect::inspect(locator).await?;
     }
     let bytes = super::inspect::cached_torrent_bytes(locator).ok_or("Missing Archive torrent metadata.")?;
+    let inspected = super::inspect::parse_metainfo(&bytes, Some(&target.info_hash))?;
+    for request in requests {
+        let file = inspected.tracks.iter().find(|file| file.file_index == request.file_index);
+        if !file.is_some_and(|file| selected_file_matches(request, locator, &file.file_path, file.size_bytes)) {
+            return Err("The selected track no longer matches the torrent file list.".into());
+        }
+    }
     let seed = super::web_seed::ArchiveSeed::parse(&bytes, item, &target.info_hash)?;
     let staging = torrent_staging_dir(&torrent_cache_root(library_dir), task_id);
-    tokio::fs::create_dir_all(&staging).await.map_err(|_| "Could not create web seed staging folder.")?;
+    std::fs::create_dir_all(&staging).map_err(|_| "Could not create web seed staging folder.")?;
     emit_task_progress(app, task_id, counter.load(Ordering::SeqCst), total_tracks, "Downloading from Archive web seed…").await;
     let mut completed: Vec<(PathBuf, TrackDownload, usize)> = Vec::new();
     for request in requests {
@@ -322,6 +380,23 @@ async fn download_archive_seed(
     Ok(TorrentTransferResult { completed, failed_tracks: Vec::new(), failure: None })
 }
 
+fn selected_file_matches(request: &TorrentFileRequest, locator: &str, path: &str, size: u64) -> bool {
+    if request.track.torrent_target.is_none() { return true; }
+    let Some(expected) = target_for_request(request, locator) else { return false };
+    let actual = path.replace('\\', "/");
+    let expected_path = expected.file_path.replace('\\', "/");
+    size == expected.file_size
+        && (actual == expected_path || actual.strip_suffix(&expected_path).is_some_and(|prefix| prefix.ends_with('/')))
+}
+
+fn target_for_request<'a>(
+    request: &'a TorrentFileRequest, locator: &str,
+) -> Option<&'a crate::download::types::TorrentTarget> {
+    let target = request.track.torrent_target.as_ref()?;
+    std::iter::once(target).chain(&target.alternatives)
+        .find(|item| item.magnet_uri == locator && item.file_index == request.file_index)
+}
+
 async fn transfer_attempt(
     app: Option<&AppHandle>,
     task_id: &str,
@@ -348,7 +423,7 @@ async fn transfer_attempt(
     }
     let rutracker_bytes = if let Some(topic) = super::rutracker::topic(locator) {
         let app = app.ok_or("RuTracker browser session is unavailable.".to_string())?;
-        let expected = requests.first().and_then(|request| request.track.torrent_target.as_ref())
+        let expected = requests.first().and_then(|request| target_for_request(request, locator))
             .ok_or("RuTracker track has no verified torrent metadata.".to_string())?;
         Some(super::rutracker::torrent(app, topic, Some(&expected.info_hash)).await?.1)
     } else {
@@ -362,11 +437,11 @@ async fn transfer_attempt(
     let _ = crate::utils::set_hidden(&temp_root, true);
     let cache_root = torrent_cache_root(library_dir);
     let job_dir = cache_root.join(format!("job-{}", Uuid::new_v4()));
-    tokio::fs::create_dir_all(&job_dir)
-        .await
+    let mut job = TorrentJob { dir: job_dir.clone(), torrent: None, cleaned: false };
+    std::fs::create_dir_all(&job_dir)
         .map_err(|e| format!("Failed creating torrent job folder: {e}"))?;
     let staging_dir = torrent_staging_dir(&cache_root, task_id);
-    let _ = tokio::fs::create_dir_all(&staging_dir).await;
+    let _ = std::fs::create_dir_all(&staging_dir);
 
     let mut only_files: Vec<usize> = requests.iter().map(|r| r.file_index).collect();
     only_files.sort_unstable();
@@ -400,11 +475,18 @@ async fn transfer_attempt(
     let (session, handle) = match added {
         Ok(added) => added,
         Err(error) => {
-            let _ = tokio::fs::remove_dir_all(&job_dir).await;
+            job.clean().await;
             return Err(error.into());
         }
     };
-    let torrent_id = handle.id();
+    job.torrent = Some((session, handle.id()));
+    let hash = handle.info_hash().as_string();
+    if requests.iter().filter_map(|request| target_for_request(request, locator))
+        .any(|target| !target.info_hash.eq_ignore_ascii_case(&hash))
+    {
+        job.clean().await;
+        return Err("Torrent metadata has changed since the tracks were matched.".to_string().into());
+    }
 
     let init_started = Instant::now();
     let mut last_status_at = Instant::now();
@@ -438,8 +520,7 @@ async fn transfer_attempt(
     };
 
     if let Err(msg) = init_res {
-        let _ = session.delete(torrent_id.into(), true).await;
-        let _ = tokio::fs::remove_dir_all(&job_dir).await;
+        job.clean().await;
         return Err(msg.into());
     }
 
@@ -463,16 +544,14 @@ async fn transfer_attempt(
     }) {
         Ok(map) => map,
         Err(e) => {
-            let _ = session.delete(torrent_id.into(), true).await;
-            let _ = tokio::fs::remove_dir_all(&job_dir).await;
+            job.clean().await;
             return Err(format!("Torrent metadata unavailable: {e}").into());
         }
     };
 
     for (rel, _) in file_rel_paths.values() {
         if let Err(err) = validate_relative_path(rel) {
-            let _ = session.delete(torrent_id.into(), true).await;
-            let _ = tokio::fs::remove_dir_all(&job_dir).await;
+            job.clean().await;
             return Err(err.into());
         }
     }
@@ -545,6 +624,12 @@ async fn transfer_attempt(
                 failed_tracks.push((req.track_index, req.track.clone()));
                 continue;
             };
+            if !selected_file_matches(req, locator, &rel_path.to_string_lossy(), *meta_len) {
+                done_indices.insert(req.track_index);
+                failed_tracks.push((req.track_index, req.track.clone()));
+                transfer_failure = Some("The selected track no longer matches the torrent file list.".into());
+                continue;
+            }
 
             let target_bytes = (*meta_len).max(req.file_size);
             let done_bytes = stats.file_progress.get(req.file_index).copied().unwrap_or(0);
@@ -610,8 +695,7 @@ async fn transfer_attempt(
         }
     }
 
-    let _ = session.delete(torrent_id.into(), true).await;
-    let _ = tokio::fs::remove_dir_all(&job_dir).await;
+    job.clean().await;
 
     if cancelled {
         return Err("Task cancelled".to_string().into());
@@ -893,6 +977,26 @@ pub(crate) fn torrent_staging_dir(cache_root: &std::path::Path, task_id: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reject_mismatched_nevermind_file_at_the_selected_index() {
+        let locator = "magnet:?xt=urn:btih:test";
+        let request = TorrentFileRequest {
+            track_index: 12, file_index: 6, file_size: 60,
+            track: TrackDownload {
+                title: "Endless, Nameless".into(),
+                torrent_target: Some(crate::download::types::TorrentTarget {
+                    info_hash: "test".into(), magnet_uri: locator.into(), file_index: 6,
+                    file_path: "13 Endless, Nameless.flac".into(), file_size: 60,
+                    quality_tier: crate::metadata::types::AudioQualityTier::Lossless,
+                    alternatives: Vec::new(),
+                }),
+                ..Default::default()
+            },
+        };
+        assert!(!selected_file_matches(&request, locator, "07 Territorial Pissings.flac", 60));
+        assert!(selected_file_matches(&request, locator, "Nevermind/13 Endless, Nameless.flac", 60));
+    }
     use std::path::Path;
 
     #[tokio::test]
@@ -1033,6 +1137,46 @@ mod tests {
             }).await;
             assert_eq!(result.unwrap_err(), message);
         }
+    }
+
+    #[tokio::test]
+    async fn aborted_job_removes_managed_torrent_and_its_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("job-cancel");
+        let staging = root.path().join("staged-cancel");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::create_dir(&staging).unwrap();
+        let session = Session::new_with_opts(root.path().to_owned(), SessionOptions {
+            disable_dht: true,
+            disable_upload: true,
+            ..Default::default()
+        }).await.unwrap();
+        let mut metadata = b"d4:infod6:lengthi3e4:name9:song.flac12:piece lengthi16384e6:pieces20:".to_vec();
+        metadata.extend_from_slice(&[0; 20]);
+        metadata.extend_from_slice(b"ee");
+        let handle = session.add_torrent(AddTorrent::from_bytes(metadata), Some(AddTorrentOptions {
+            output_folder: Some(dir.to_string_lossy().into_owned()),
+            ..Default::default()
+        })).await.unwrap().into_handle().unwrap();
+        let id = handle.id();
+        let job = TorrentJob { dir: dir.clone(), torrent: Some((session.clone(), id)), cleaned: false };
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let staging_cleanup = TorrentStagingCleanup(staging.clone());
+        let task = tokio::spawn(async move {
+            let _job = job;
+            let _staging = staging_cleanup;
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        ready.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while session.get(id.into()).is_some() || dir.exists() || staging.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.unwrap();
+        session.stop().await;
     }
 
     #[tokio::test]

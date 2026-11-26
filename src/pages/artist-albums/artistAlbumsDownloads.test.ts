@@ -1,13 +1,24 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   downloadingAlbumMetaLine,
   isActiveLibraryDownload,
   normalizeAlbumTitle,
   matchDownloadToLibraryAlbum,
+  prepareAlbumDeletion,
+  groupMissingSelection,
   extraDownloadingTracksForAlbum,
   unifiedAlbumKey,
 } from "./artistAlbumsDownloads.ts";
 import { ItemType, type DownloadProgress } from "@/shared/store/libraryStore.ts";
+import type { Song } from "@/shared/types.ts";
+
+it("groups only selected, available missing tracks by album without mixing their positions", () => {
+  const first = { album: "In Utero", track: { index: 11, url: "missing-one" } };
+  const second = { album: "Nevermind", track: { index: 11, url: "missing-two" } };
+  const pending = { album: "Nevermind", track: { index: 12, url: "pending" } };
+  expect([...groupMissingSelection([first, second, pending], (url) => url !== "pending")])
+    .toEqual([["In Utero", [first]], ["Nevermind", [second]]]);
+});
 
 function dl(over: Partial<DownloadProgress> = {}): DownloadProgress {
   return {
@@ -31,6 +42,27 @@ function dl(over: Partial<DownloadProgress> = {}): DownloadProgress {
 }
 
 describe("artistAlbumsDownloads", () => {
+  it("drains matching downloads before reading the songs to delete", async () => {
+    const album = { title: "Morrison Hotel", songs: [{ id: 1 }] };
+    let finish!: () => void;
+    const drain = new Promise<void>((resolve) => { finish = resolve; });
+    const cancel = vi.fn(() => drain);
+    const saved = { id: 2 } as Song;
+    const fetchAlbums = vi.fn(async () => [{
+      title: album.title, album_artist: "The Doors", cover_url: null, songs: [saved],
+    }]);
+    const deletion = prepareAlbumDeletion(album, "The Doors", [
+      dl({ id: "linked", status: "idle", albumTitle: "Original title" }),
+      dl({ id: "upgrade", url: "resolve:song:1", albumTitle: "" }),
+      dl({ id: "other", url: "https://example.test/other", artistName: "Different artist" }),
+      dl({ id: "completed", status: "completed" }),
+    ], dl().url, cancel, fetchAlbums);
+    expect(cancel.mock.calls).toEqual([["linked"], ["upgrade"]]);
+    expect(fetchAlbums).not.toHaveBeenCalled();
+    finish();
+    await expect(deletion).resolves.toEqual([saved]);
+  });
+
   it("detects active downloads and ignores completed/failed/cancelled or resolve URLs", () => {
     expect(isActiveLibraryDownload(dl({ status: "downloading" }))).toBe(true);
     expect(isActiveLibraryDownload(dl({ status: "idle" }))).toBe(true);

@@ -283,9 +283,35 @@ fn remove_trashed_file(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Removes `dir` only when it is empty (D16, same rule as `delete_song_files`).
-fn remove_dir_if_empty(dir: &Path) {
+/// Removes an album directory containing only Blacktape's generated cover, or no files.
+pub(crate) fn remove_dir_if_empty(dir: &Path) {
+    if !fs::symlink_metadata(dir).is_ok_and(|meta| meta.file_type().is_dir()) {
+        return;
+    }
+    if let Ok(entries) = fs::read_dir(dir) {
+        let mut entries = entries;
+        if let Some(Ok(entry)) = entries.next() {
+            if entry.file_name() == "cover.jpg" && entries.next().is_none() {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
     let _ = fs::remove_dir(dir);
+}
+
+#[cfg(test)]
+#[test]
+fn removing_last_track_folder_cleans_cover_but_preserves_other_files() {
+    let root = tempfile::tempdir().unwrap();
+    let album = root.path().join("album");
+    fs::create_dir(&album).unwrap();
+    fs::write(album.join("cover.jpg"), b"cover").unwrap();
+    fs::write(album.join("notes.txt"), b"notes").unwrap();
+    remove_dir_if_empty(&album);
+    assert!(album.join("cover.jpg").is_file());
+    fs::remove_file(album.join("notes.txt")).unwrap();
+    remove_dir_if_empty(&album);
+    assert!(!album.exists());
 }
 
 // ---------------------------------------------------------------------------
@@ -463,33 +489,41 @@ pub async fn delete_items(db: &DbLock, ids: &[i64]) -> Result<TrashOutcome, Stri
                 .push(format!("Item {id} is no longer in the trash")),
         }
     }
-    purge(db, &rows, &mut outcome).await;
+    purge(db, &rows, &mut outcome, None).await;
     Ok(outcome)
 }
 
 /// Permanently deletes everything in the trash.
 pub async fn empty_items(db: &DbLock) -> Result<TrashOutcome, String> {
-    let rows = db
-        .lock()
-        .await
-        .list_trash_rows()
-        .await
-        .map_err(|e| e.to_string())?;
+    let (rows, library_root) = {
+        let guard = db.lock().await;
+        let rows = guard.list_trash_rows().await.map_err(|e| e.to_string())?;
+        let root = guard.get_app_setting(LIBRARY_DIR_KEY).await.map_err(|e| e.to_string())?
+            .filter(|root| !root.trim().is_empty()).and_then(|root| fs::canonicalize(root).ok());
+        (rows, root)
+    };
     let mut outcome = TrashOutcome::default();
-    purge(db, &rows, &mut outcome).await;
+    purge(db, &rows, &mut outcome, library_root.as_deref()).await;
     Ok(outcome)
 }
 
 /// Deletes each item's file, then its row. An item whose file cannot be deleted keeps
 /// its row and is reported. Rows already removed stay removed even if a later item
 /// fails, which is why the caller still reports the change.
-async fn purge(db: &DbLock, rows: &[TrashRow], outcome: &mut TrashOutcome) {
+async fn purge(db: &DbLock, rows: &[TrashRow], outcome: &mut TrashOutcome, library_root: Option<&Path>) {
     for row in rows {
         match remove_trashed_file(Path::new(&row.trash_path)) {
             Ok(()) => {
                 let stored = db.lock().await.delete_trash_item(row.id).await;
                 match stored {
-                    Ok(()) => outcome.done += 1,
+                    Ok(()) => {
+                        outcome.done += 1;
+                        if let (Some(root), Some(parent)) = (library_root, Path::new(&row.original_path).parent()) {
+                            if fs::canonicalize(parent).is_ok_and(|path| path != root && path.starts_with(root)) {
+                                remove_dir_if_empty(parent);
+                            }
+                        }
+                    }
                     Err(e) => outcome.failures.push(format!("{}: {e}", row.original_path)),
                 }
             }
@@ -525,7 +559,7 @@ pub async fn auto_clean_sparing(
             .list_trash_rows()
             .await
             .map_err(|e| e.to_string())?;
-        purge(db, &expired_rows(&rows, cutoff), &mut outcome).await;
+        purge(db, &expired_rows(&rows, cutoff), &mut outcome, None).await;
     }
 
     if let Some(max_mb) = settings.max_size_mb {
@@ -536,7 +570,7 @@ pub async fn auto_clean_sparing(
             .await
             .map_err(|e| e.to_string())?;
         let limit = max_mb.saturating_mul(1024 * 1024);
-        purge(db, &rows_over_limit_sparing(&rows, limit, spare_from), &mut outcome).await;
+        purge(db, &rows_over_limit_sparing(&rows, limit, spare_from), &mut outcome, None).await;
     }
 
     Ok(outcome)
@@ -930,6 +964,21 @@ mod tests {
             size_bytes,
             trashed_at,
         }
+    }
+
+    #[tokio::test]
+    async fn empty_trash_cleans_legacy_cover_only_albums_inside_the_library() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = DbLock::new(Database::new(":memory:").await);
+        let trash = temp.path().join("trash");
+        let album = trash.join("library");
+        db.lock().await.set_app_setting(LIBRARY_DIR_KEY, &s(temp.path())).await.unwrap();
+        let (_, stored) = add_trash_item(&db, &trash, "track.flac", 7, 1).await;
+        fs::create_dir(&album).unwrap();
+        fs::write(album.join("cover.jpg"), b"cover").unwrap();
+        assert_eq!(empty_items(&db).await.unwrap().done, 1);
+        assert!(!stored.exists());
+        assert!(!album.exists());
     }
 
     // --- pure helpers -----------------------------------------------------

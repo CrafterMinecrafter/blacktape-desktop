@@ -11,7 +11,8 @@ import { Album, Song } from "@/shared/types.ts";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { ContextMenu, ContextMenuPosition, MenuItemOption } from "@/shared/ui/context-menu";
 import { useModalStore } from "@/shared/store/modalStore.ts";
-import { AddNextToQueue, AddToQueue } from "@/shared/lib/audio.ts";
+import { AddNextToQueue, AddToQueue, getArtistAlbums } from "@/shared/lib/audio.ts";
+import { invoke } from "@tauri-apps/api/core";
 import {
   EMPTY_SELECTION,
   nextSelection,
@@ -27,6 +28,7 @@ import { setDragGhost } from "@/pages/artist-albums/dragGhost.ts";
 import { AddToPlaylistModal } from "@/features/library/ui/playlists/AddToPlaylistModal.tsx";
 import { MdWarningAmber } from "react-icons/md";
 import { listTrash, TRASH_CHANGED_EVENT, type TrashItem } from "@/shared/lib/library/trash.ts";
+import { getMissingTracks } from "@/shared/lib/library/libraryIndex.ts";
 import { listen } from "@tauri-apps/api/event";
 import { EmptyLibraryHub } from "@/features/library/ui/EmptyLibraryHub.tsx";
 import { shouldShowEmptyHub } from "@/features/library/ui/emptyLibraryHubHelper.ts";
@@ -43,6 +45,7 @@ import { startMixedPlayback, type MixedEntry } from "@/shared/lib/remote/stream.
 import SongListItem from "@/features/library/ui/song-list-item/SongListItem.tsx";
 import {
   playableMissingTracks,
+  missingDownloadParams,
   sourceOfAlbum,
   useMissingTracksStore,
   withoutUnavailable,
@@ -62,12 +65,14 @@ import {
   findTrashItem,
   albumHasTrackGaps,
 } from "@/features/library/ui/missing-track-row/missingTrackRow.ts";
-import { albumHasMultipleDiscs, rowDiscNumber } from "./artistAlbumsDisc.ts";
+import { albumHasMultipleDiscs, playableRowsFrom, rowDiscNumber } from "./artistAlbumsDisc.ts";
 import {
   downloadingAlbumMetaLine,
   extraDownloadingTracksForAlbum,
+  groupMissingSelection,
   isActiveLibraryDownload,
   matchDownloadToLibraryAlbum,
+  prepareAlbumDeletion,
   unifiedAlbumKey,
 } from "./artistAlbumsDownloads.ts";
 
@@ -121,6 +126,7 @@ const ArtistAlbums = () => {
 
   // Songs of all albums in display order.
   const allSongs = useMemo(() => albums.flatMap((a) => a.songs), [albums]);
+  const songById = useMemo(() => new Map(allSongs.map((song) => [song.id, song])), [allSongs]);
 
   // Every row of every album in display order: the songs and the shown missing songs. Missing songs have no
   // library id, so they get negative ones (-1, -2, ...) to be selectable together with the songs.
@@ -366,16 +372,20 @@ const ArtistAlbums = () => {
     | { kind: "song"; song: Song }
     | { kind: "missing"; album: string; track: AlbumTrackInfo; missing: MissingTracks };
 
+  const pickForRow = (id: number): Pick | undefined => {
+    const song = songById.get(id);
+    const missing = missingById.get(id);
+    if (song) return { kind: "song", song };
+    if (missing) return { kind: "missing", ...missing };
+  };
+
   /** The rows with these ids (songs and missing songs) in list order. */
   const picksOf = (include: (id: number) => boolean): Pick[] => {
-    const songById = new Map(allSongs.map((s) => [s.id, s]));
     const picks: Pick[] = [];
     for (const id of orderedIds) {
       if (!include(id)) continue;
-      const song = songById.get(id);
-      const m = missingById.get(id);
-      if (song) picks.push({ kind: "song", song });
-      else if (m) picks.push({ kind: "missing", ...m });
+      const pick = pickForRow(id);
+      if (pick) picks.push(pick);
     }
     return picks;
   };
@@ -421,10 +431,9 @@ const ArtistAlbums = () => {
    */
   const playFromRow = async (id: number) => {
     try {
-      const at = orderedIds.indexOf(id);
-      if (at < 0) return;
-      // every row is a pick, so the picks line up with orderedIds
-      await startMixedPlayback(mixedEntries(picksOf(() => true)), at);
+      const { entries, index } = playableRowsFrom(orderedIds, id, pickForRow);
+      if (index < 0) return;
+      await startMixedPlayback(mixedEntries(entries), index);
     } catch (e) {
       console.error("Play error: ", e);
     }
@@ -439,6 +448,8 @@ const ArtistAlbums = () => {
     const picks = picksOf((id) => state.selected.has(id));
     const songs = picks.flatMap((p) => (p.kind === "song" ? [p.song] : []));
     const missing = picks.flatMap((p) => (p.kind === "missing" ? [p] : []));
+    const groups = [...groupMissingSelection(missing, (url) => !pendingUrls.has(url) && !unavailable.has(url))];
+    const downloadableCount = groups.reduce((count, [, tracks]) => count + tracks.length, 0);
     const addPick = queuePick;
 
     const items: MenuItemOption[] = [
@@ -447,15 +458,29 @@ const ArtistAlbums = () => {
         action: () => void playPicks(picks),
       },
     ];
-    if (missing.length > 0) {
+    if (downloadableCount > 0) {
+      const label = `Download ${downloadableCount} missing song${downloadableCount === 1 ? "" : "s"}`;
+      const chooseAlbumQuality = (position: number) => {
+        const group = groups[position];
+        if (!group) return;
+        const [album, selection] = group;
+        const tracks = selection.map(({ track }) => track);
+        const urls = tracks.map((track) => track.url);
+        openQualityMenu(missingDownloadParams(selection[0].missing, urls), {
+          scopeTracks: tracks,
+          displayTitle: groups.length > 1 ? `${album} · Album ${position + 1} of ${groups.length}` : undefined,
+          start: (format, overrides) => {
+            void downloadMissing(album, format, overrides, urls);
+            chooseAlbumQuality(position + 1);
+          },
+        });
+      };
       items.push({
-        label: `Download ${missing.length} missing song${missing.length === 1 ? "" : "s"}`,
+        label,
         action: () => {
-          const byAlbum = new Map<string, AlbumTrackInfo[]>();
-          for (const m of missing) byAlbum.set(m.album, [...(byAlbum.get(m.album) ?? []), m.track]);
-          for (const [album, tracks] of byAlbum) void downloadMissingMany(album, tracks);
+          for (const [album, selection] of groups) void downloadMissingMany(album, selection.map(({ track }) => track));
         },
-      });
+      }, { label: `${label} as…`, action: () => chooseAlbumQuality(0) });
     }
     items.push(
       {
@@ -633,18 +658,18 @@ const ArtistAlbums = () => {
       ...missingAlbumMenuItems(sourceOf(album.title), isMissingShown(album.title), {
         toggle: () => toggleMissing(album.title),
         download: () => void downloadMissing(album.title),
-        downloadAs: () => {
-          const source = sourceOf(album.title);
-          if (!source) return;
+        downloadAs: async () => {
+          if (!selectedTab) return;
+          const missing = await getMissingTracks(selectedTab, album.title).catch(() => null);
+          if (!missing) return;
+          const { unavailable, pendingUrls } = useMissingTracksStore.getState();
+          const tracks = playableMissingTracks(missing).filter((track) =>
+            !unavailable.has(track.url) && !pendingUrls.has(track.url));
+          const urls = tracks.map((track) => track.url);
+          if (urls.length === 0) return;
           openQualityMenu(
-            {
-              platform: source.platform,
-              downloadType: ItemType.Album,
-              url: source.source_url,
-              artistName: selectedTab,
-              title: album.title,
-            },
-            { start: (format, overrides) => void downloadMissing(album.title, format, overrides) },
+            missingDownloadParams(missing, urls),
+            { scopeTracks: tracks, start: (format, overrides) => void downloadMissing(album.title, format, overrides, urls) },
           );
         },
         find: () =>
@@ -672,7 +697,18 @@ const ArtistAlbums = () => {
         danger: true,
         action: () =>
           openModal(
-            <DeleteSongModal songs={album.songs} albumTitle={album.title} />,
+            <DeleteSongModal
+              songs={album.songs}
+              albumTitle={album.title}
+              beforeDelete={() => prepareAlbumDeletion(
+                album,
+                selectedTab ?? album.songs[0]?.album_artist ?? "",
+                Object.values(useLibraryStore.getState().activeDownloads),
+                missingSources[album.title]?.source_url,
+                (taskId) => invoke("cancel_download", { taskId }),
+                getArtistAlbums,
+              )}
+            />,
           ),
       },
     ];

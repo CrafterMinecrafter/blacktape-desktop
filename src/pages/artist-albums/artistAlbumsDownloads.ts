@@ -5,12 +5,50 @@ import type { DownloadProgress } from "@/shared/store/libraryStore.ts";
 
 const ACTIVE_STATUSES = new Set(["downloading", "idle", "processing"]);
 
+export function groupMissingSelection<T extends { album: string; track: { url: string } }>(
+  tracks: readonly T[],
+  canDownload: (url: string) => boolean,
+): Map<string, T[]> {
+  const groups = new Map<string, T[]>();
+  for (const item of tracks) {
+    if (!canDownload(item.track.url)) continue;
+    const group = groups.get(item.album);
+    if (group) group.push(item);
+    else groups.set(item.album, [item]);
+  }
+  return groups;
+}
+
 export function isActiveLibraryDownload(d: Pick<DownloadProgress, "status" | "url">): boolean {
   return ACTIVE_STATUSES.has(d.status) && !d.url.startsWith("resolve:");
 }
 
 export function normalizeAlbumTitle(title: string): string {
   return title.trim().toLowerCase();
+}
+
+export async function prepareAlbumDeletion(
+  album: Pick<Album, "title"> & { songs: readonly Pick<Song, "id">[] },
+  artist: string,
+  downloads: readonly DownloadProgress[],
+  linkedSource: string | undefined,
+  cancel: (id: string) => Promise<void>,
+  fetchAlbums: (artist: string) => Promise<Album[]>,
+): Promise<Song[]> {
+  const songIds = new Set(album.songs.map((song) => song.id));
+  const matching = downloads.filter((task) => {
+    if (!ACTIVE_STATUSES.has(task.status)) return false;
+    if (task.replaceSongId !== undefined && songIds.has(task.replaceSongId)) return true;
+    if ([task.url, ...(task.trackUrls ?? [])].some((url) => {
+      const match = /^resolve:song:(\d+)$/.exec(url);
+      return match && songIds.has(Number(match[1]));
+    })) return true;
+    if (linkedSource && sameUrl(task.url, linkedSource)) return true;
+    return unifiedAlbumKey(task.artistName, task.albumTitle) === unifiedAlbumKey(artist, album.title);
+  });
+  await Promise.all(matching.map((task) => cancel(task.id)));
+  const albums = await fetchAlbums(artist);
+  return albums.find((item) => normalizeAlbumTitle(item.title) === normalizeAlbumTitle(album.title))?.songs ?? [];
 }
 
 /** Finds the library album title an active download belongs to (by linked source URL first, then normalized album title). */

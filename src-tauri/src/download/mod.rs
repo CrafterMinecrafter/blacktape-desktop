@@ -3,6 +3,7 @@ pub mod album_preview;
 pub mod bandcamp;
 pub mod cookies;
 pub mod deno;
+pub(crate) mod discovery;
 pub mod ffmpeg;
 pub mod opus_source;
 pub mod orchestrator;

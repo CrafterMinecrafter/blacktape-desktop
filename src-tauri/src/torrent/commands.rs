@@ -52,6 +52,106 @@ async fn enabled_indexers(db: &DbLock) -> Result<Vec<search::Provider>, String> 
     Ok(indexers(&db, &disabled).await?.into_iter().filter(|indexer| indexer.enabled).map(|indexer| indexer.id).collect())
 }
 
+fn alternate_track_query<'a>(
+    album: &str,
+    expected: &'a [matcher::ExpectedTrackInput],
+    releases: &[matcher::TorrentTierResolution],
+) -> Option<&'a matcher::ExpectedTrackInput> {
+    use crate::metadata::types::AudioQualityTier;
+    use crate::resolver::matcher::clean_title;
+    if expected.is_empty() || expected.len() > 3 {
+        return None;
+    }
+    let album = clean_title(album);
+    expected.iter().filter(|track| {
+        let title = clean_title(&track.title);
+        title != album && title.chars().filter(|ch| ch.is_alphabetic()).take(3).count() >= 3
+            && !releases.iter().flat_map(|release| &release.tracks).any(|matched| {
+                matched.expected_index == track.index && matched.candidate.is_strict_match
+                    && matched.candidate.quality_tier == AudioQualityTier::Lossless
+            })
+    }).max_by_key(|track| track.title.len())
+}
+
+fn keep_exact_song_releases(
+    releases: &mut Vec<matcher::TorrentTierResolution>,
+    expected: &matcher::ExpectedTrackInput,
+    artist: &str,
+) {
+    use crate::resolver::matcher::{clean_title, strip_leading_artist_from_title};
+    let title = clean_title(&expected.title);
+    releases.retain(|release| release.tracks.iter().any(|matched| {
+        matched.expected_index == expected.index && matched.candidate.is_strict_match
+            && matched.candidate.matched_title.as_ref().is_some_and(|name| {
+                clean_title(&strip_leading_artist_from_title(artist, name)) == title
+            })
+    }));
+}
+
+pub(crate) async fn resolve_enabled_torrents(
+    app: &tauri::AppHandle,
+    artist: &str,
+    title: &str,
+    expected: &[matcher::ExpectedTrackInput],
+    publish: impl Fn(matcher::TorrentResolveEvent),
+) -> Result<(Vec<matcher::TorrentTierResolution>, Vec<String>), String> {
+    let db = app.try_state::<DbLock>().ok_or("Torrent settings are unavailable.")?;
+    let enabled = enabled_indexers(&db).await?;
+    use matcher::TorrentResolveEvent::{Resolved, Verified};
+    if alternate_track_query(title, expected, &[]).is_none() || enabled.is_empty() {
+        return matcher::resolve_with_indexers(Some(app), artist, title, expected, &enabled, publish).await;
+    }
+
+    let combined = Mutex::new(Vec::<matcher::TorrentTierResolution>::new());
+    let update = |incoming: Vec<matcher::TorrentTierResolution>| {
+        let Ok(mut results) = combined.lock() else { return };
+        for release in incoming {
+            if let Some(previous) = results.iter_mut().find(|row| row.info_hash == release.info_hash && row.tier == release.tier) {
+                if release.matched_count > previous.matched_count {
+                    *previous = release;
+                }
+            } else {
+                results.push(release);
+            }
+        }
+        if !results.is_empty() {
+            publish(Verified { resolutions: matcher::sorted_resolutions(results.clone()) });
+        }
+    };
+    let primary = matcher::resolve_with_indexers(Some(app), artist, title, expected, &enabled, |event| match event {
+        Verified { resolutions } | Resolved { resolutions, .. } => update(resolutions),
+        other => publish(other),
+    });
+    let alternate = async {
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        let track = combined.lock().ok().and_then(|results| alternate_track_query(title, expected, &results));
+        let Some(track) = track else { return };
+        let artist = track.artist.as_deref().filter(|name| !name.trim().is_empty()).unwrap_or(artist);
+        let _ = matcher::resolve_with_indexers(Some(app), artist, &track.title, std::slice::from_ref(track), &enabled, |event| {
+            if let Verified { mut resolutions } | Resolved { mut resolutions, .. } = event {
+                keep_exact_song_releases(&mut resolutions, track, artist);
+                for resolution in &mut resolutions {
+                    resolution.total_expected = expected.len();
+                    resolution.missing_titles = expected.iter().filter(|other| other.index != track.index)
+                        .map(|other| other.title.clone()).collect();
+                }
+                if !resolutions.is_empty() {
+                    update(resolutions);
+                }
+            }
+        }).await;
+    };
+    let (primary, _) = tokio::join!(primary, alternate);
+    let resolutions = matcher::sorted_resolutions(combined.into_inner().unwrap_or_default());
+    let unavailable_providers = match primary {
+        Ok((_, unavailable)) => unavailable,
+        Err(error) if resolutions.is_empty() => return Err(error),
+        Err(_) => Vec::new(),
+    };
+    publish(Resolved { resolutions: resolutions.clone(), unavailable_providers: unavailable_providers.clone() });
+    Ok((resolutions, unavailable_providers))
+}
+
 async fn save_indexer(
     db: &Database,
     id: search::Provider,
@@ -223,6 +323,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_small_scoped_search_can_try_a_track_title_without_repeating_the_album_query() {
+        let track = |index, title: &str| matcher::ExpectedTrackInput {
+            index, title: title.into(), artist: None, disc_number: None, track_number: None, duration_ms: None,
+        };
+        let selected = [
+            track(4, "In Utero"), track(8, "All Apologies"), track(9, "X"),
+        ];
+        assert_eq!(alternate_track_query("in utero", &selected, &[]).unwrap().index, 8);
+        assert!(alternate_track_query("In Utero", &selected[..1], &[]).is_none());
+        assert!(alternate_track_query("In Utero", &[], &[]).is_none());
+        assert!(alternate_track_query("In Utero", &vec![selected[1].clone(); 4], &[]).is_none());
+    }
+
+    #[test]
     fn an_early_cancel_does_not_start_an_inspection_or_consume_a_job_slot() {
         let inspections = Inspections::default();
         let cancelled = Uuid::new_v4();
@@ -301,7 +415,6 @@ mod tests {
 pub(crate) async fn resolve_torrent_album(
     window: WebviewWindow,
     inspections: State<'_, Inspections>,
-    db: State<'_, DbLock>,
     request_id: Uuid,
     artist: String,
     title: String,
@@ -313,12 +426,9 @@ pub(crate) async fn resolve_torrent_album(
     let result = tokio::select! {
         biased;
         _ = cancelled => Err("Torrent resolution cancelled.".into()),
-        res = async {
-            let enabled = enabled_indexers(&db).await?;
-            matcher::resolve_with_indexers(Some(window.app_handle()), &artist, &title, &expected, &enabled, |event| {
-                let _ = progress.send(event);
-            }).await
-        } => res,
+        res = resolve_enabled_torrents(window.app_handle(), &artist, &title, &expected, |event| {
+            let _ = progress.send(event);
+        }) => res,
     };
     if let Ok(mut jobs) = inspections.0.lock() {
         jobs.pending.remove(&request_id);

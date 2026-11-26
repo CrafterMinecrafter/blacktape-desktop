@@ -24,6 +24,11 @@ pub async fn save_downloaded_track<R: tauri::Runtime>(
     task_id: &str,
     track_index: usize,
 ) -> Result<Song, String> {
+    // Let a save already moving files and updating the DB finish before cancellation.
+    let _saving = match app_handle.try_state::<crate::download::TaskRegistry>() {
+        Some(registry) => registry.begin_save(task_id).await?,
+        None => None,
+    };
     let replace_song_id = app_handle
         .try_state::<crate::download::TaskRegistry>()
         .map(|reg| async move { reg.replace_song_id_for(task_id, track_index).await });
@@ -409,7 +414,7 @@ pub async fn handle_download_task(task: DownloadTask, app_handle: AppHandle) -> 
             // yt-dlp failures are reported per track with full stderr/stdout in ytdlp.rs.
             // If the failure occurred outside yt-dlp (e.g. metadata parsing, album discovery, cover fetching),
             // report it here with the task's url and track context.
-            if e != super::youtube_sign_in::CANCELLED
+            if e != super::youtube_sign_in::CANCELLED && e != super::track::NO_TRACK_UPGRADE
                 && !e.starts_with("ERROR:") && !e.starts_with("[yt-dlp") && !e.contains("No such file or directory") {
                 crate::telemetry::report_download_error_with_context(
                     &format!("{:?}", task.platform).to_lowercase(),

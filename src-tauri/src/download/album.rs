@@ -14,11 +14,19 @@ use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager};
 
 /// Keeps only the tracks whose url is in `selected`, in album order. Pure.
-pub fn select_tracks(tracks: Vec<TrackDownload>, selected: &[String]) -> Vec<TrackDownload> {
-    tracks
-        .into_iter()
-        .filter(|t| selected.iter().any(|url| same_page(url, &t.url)))
-        .collect()
+#[cfg(test)]
+fn select_tracks(tracks: Vec<TrackDownload>, selected: &[String]) -> Vec<TrackDownload> {
+    let positions = selected_track_positions(&tracks, &[], selected);
+    tracks.into_iter().enumerate().filter_map(|(index, track)| positions.contains(&index).then_some(track)).collect()
+}
+
+fn selected_track_positions(
+    tracks: &[TrackDownload], canonical_urls: &[String], selected: &[String],
+) -> std::collections::HashSet<usize> {
+    tracks.iter().enumerate().filter_map(|(index, track)| {
+        let original = canonical_urls.get(index).map_or(track.url.as_str(), String::as_str);
+        selected.iter().any(|url| !url.is_empty() && same_page(url, original)).then_some(index)
+    }).collect()
 }
 
 fn same_page(a: &str, b: &str) -> bool {
@@ -289,7 +297,7 @@ pub(crate) fn apply_candidate_to_track(
                 quality_tier: chosen.quality_tier,
                 alternatives: torrent_alternatives(candidates, chosen_idx),
             });
-            // Keep HTTP identity URL if present so `select_tracks` stays intact while storing HTTP fallbacks.
+            // Keep HTTP identity URL if present while storing HTTP fallbacks.
             let mut fallbacks = Vec::new();
             if track.url.starts_with("http://") || track.url.starts_with("https://") {
                 fallbacks.push(track.url.clone());
@@ -394,7 +402,13 @@ pub fn apply_download_overrides_with_format(
 
     if let Some(ref track_overrides) = overrides.tracks {
         for ov in track_overrides {
-            let Some(idx) = ov.index else {
+            let index = match &ov.original_url {
+                Some(url) => ov.index
+                    .filter(|&index| album_info.tracks.get(index).is_some_and(|track| same_page(&track.url, url)))
+                    .or_else(|| album_info.tracks.iter().position(|track| same_page(&track.url, url))),
+                None => ov.index,
+            };
+            let Some(idx) = index else {
                 continue;
             };
             let Some(track) = album_info.tracks.get_mut(idx) else {
@@ -807,6 +821,7 @@ pub async fn process_album_url(
     let mut skipped_tracks: Vec<SkippedTrack> = Vec::new();
     let mut upgrade_target_dir: Option<PathBuf> = None;
 
+    let mut canonical_urls = Vec::new();
     let mut album_info = if is_upgrade {
         let (info, dir) = build_bulk_upgrade_album(
             app_handle,
@@ -874,6 +889,10 @@ pub async fn process_album_url(
                     fallback_urls: Vec::new(),
                     ..Default::default()
                 };
+                canonical_urls.push(t.candidates.get(t.selected_candidate_idx)
+                    .or_else(|| t.candidates.first())
+                    .map(|candidate| candidate.source.primary_url().to_string())
+                    .unwrap_or_default());
                 let _ = apply_candidate_to_track(
                     &mut td,
                     &t.candidates,
@@ -911,6 +930,9 @@ pub async fn process_album_url(
         }
     };
 
+    let selected_positions = (!is_upgrade).then(|| selected.map(|urls|
+        selected_track_positions(&album_info.tracks, &canonical_urls, urls)
+    )).flatten();
     if !is_upgrade {
         if let Some(ref overrides) = task_overrides {
             apply_download_overrides_with_format(
@@ -948,9 +970,14 @@ pub async fn process_album_url(
     }
 
     let mut tracks = album_info.tracks;
+    for (index, track) in tracks.iter_mut().enumerate() {
+        track.source_track_index = Some(index);
+    }
     if !is_upgrade {
-        if let Some(selected) = selected {
-            tracks = select_tracks(tracks, selected);
+        if let Some(positions) = selected_positions {
+            tracks = tracks.into_iter().enumerate().filter_map(|(index, track)|
+                positions.contains(&index).then_some(track)
+            ).collect();
             if tracks.is_empty() {
                 return Err("None of the selected tracks was found in the album.".into());
             }
@@ -959,6 +986,21 @@ pub async fn process_album_url(
             tracks = without_owned(platform, &album_info.album_artist, tracks, &index);
             if tracks.is_empty() {
                 return Err("All tracks of this album are already in your library.".into());
+            }
+        }
+    }
+
+    if !is_upgrade {
+        if let Some(registry) = &task_registry_opt {
+            if registry.uses_automatic_quality(task_id).await {
+                super::discovery::discover_automatic_sources(
+                    app_handle, task_id, &album_info.album_artist, &album_info.title, &mut tracks,
+                    |_, track| track.torrent_target.is_some() || task_overrides.as_ref()
+                        .and_then(|overrides| overrides.tracks.as_ref())
+                        .is_some_and(|overrides| overrides.iter().any(|item| item.index == track.source_track_index &&
+                            item.candidates.as_ref().is_some_and(|candidates| !candidates.is_empty()))),
+                    effective_format.as_deref().unwrap_or("best"),
+                ).await;
             }
         }
     }
@@ -1077,7 +1119,7 @@ pub async fn process_album_url(
         .unwrap_or_else(|_| PathBuf::from("covers"));
     let _ = fs::create_dir_all(&covers_dir);
 
-    let consumer = tokio::spawn(async move {
+    let consumer = async move {
         let mut songs = Vec::new();
         while let Some((temp_file, track, index)) = rx.recv().await {
             let track_platform = detect_platform_from_url(&track.url, platform);
@@ -1103,7 +1145,7 @@ pub async fn process_album_url(
             }
         }
         songs
-    });
+    };
 
     for (idx, t) in tracks.iter_mut().enumerate() {
         t.source_track_index = Some(idx);
@@ -1133,62 +1175,63 @@ pub async fn process_album_url(
         }
     }
 
-    let mut transfer_err: Option<String> = None;
-    for (_hash, (locator, requests)) in torrent_groups {
-        match crate::torrent::download::download_torrent_files(
-            app_handle,
-            task_id,
-            &root_library_dir,
-            &locator,
-            &requests,
-            total_tracks,
-            std::sync::Arc::clone(&completed_counter),
-            Some(tx.clone()),
-        )
-        .await
-        {
-            Ok(res) => {
-                if transfer_err.is_none() {
-                    transfer_err = torrent_transfer_error(&res);
-                }
-            }
-            Err(err) => {
-                if err == "Task cancelled" {
-                    transfer_err = Some(err);
-                    http_tracks.clear();
-                    break;
-                }
-                if transfer_err.is_none() {
-                    transfer_err = Some(err);
-                }
-            }
-        }
-    }
-
-    let download_res = if !http_tracks.is_empty() {
-        ytdlp::download_batch_streaming(
-            app_handle,
-            &http_tracks,
-            output_dir,
-            task_id,
-            Some(tx),
-        )
-        .await
-    } else {
-        drop(tx);
-        match transfer_err.as_ref() {
-            Some(err) => Err(err.clone()),
-            None => Ok(Vec::new()),
-        }
-    };
-
-    let saved_songs = consumer.await.unwrap_or_default();
-
     let torrent_staging = crate::torrent::download::torrent_cache_root(&root_library_dir);
     let task_staging = crate::torrent::download::torrent_staging_dir(&torrent_staging, task_id);
-    if task_staging.exists() {
-        let _ = fs::remove_dir_all(&task_staging);
-    }
+    let _staging = crate::torrent::download::TorrentStagingCleanup(task_staging);
+
+    let producer = async {
+        let mut transfer_err: Option<String> = None;
+        for (_hash, (locator, requests)) in torrent_groups {
+            match crate::torrent::download::download_torrent_files(
+                app_handle,
+                task_id,
+                &root_library_dir,
+                &locator,
+                &requests,
+                total_tracks,
+                std::sync::Arc::clone(&completed_counter),
+                Some(tx.clone()),
+            )
+            .await
+            {
+                Ok(res) => {
+                    if transfer_err.is_none() {
+                        transfer_err = torrent_transfer_error(&res);
+                    }
+                }
+                Err(err) => {
+                    if err == "Task cancelled" {
+                        transfer_err = Some(err);
+                        http_tracks.clear();
+                        break;
+                    }
+                    if transfer_err.is_none() {
+                        transfer_err = Some(err);
+                    }
+                }
+            }
+        }
+
+        let download_res = if !http_tracks.is_empty() {
+            ytdlp::download_batch_streaming(
+                app_handle,
+                &http_tracks,
+                output_dir,
+                task_id,
+                Some(tx),
+            )
+            .await
+        } else {
+            drop(tx);
+            match transfer_err.as_ref() {
+                Some(err) => Err(err.clone()),
+                None => Ok(Vec::new()),
+            }
+        };
+
+        (download_res, transfer_err)
+    };
+    let ((download_res, transfer_err), saved_songs) = tokio::join!(producer, consumer);
 
     match download_res {
         Ok(files) => {
@@ -1481,6 +1524,38 @@ mod tests {
         assert_eq!(album.tracks[1].title, "Edited Track 2");
         assert_eq!(album.tracks[1].url, "https://picked/2");
         assert_eq!(album.tracks[1].fallback_urls, vec!["https://fallback/2".to_string()]);
+    }
+
+    #[test]
+    fn selected_original_tracks_keep_their_indices_after_switching_platforms() {
+        let mut album = album_of(&["https://orig/1", "https://orig/2"]);
+        let urls = vec!["https://orig/2".to_string()];
+        let positions = selected_track_positions(&album.tracks, &[], &urls);
+        apply_download_overrides(&mut album, &crate::download::types::DownloadOverrides {
+            tracks: Some(vec![crate::download::types::TrackOverride {
+                index: Some(1), url: Some("https://youtube.com/watch?v=chosen".into()), ..Default::default()
+            }]), ..Default::default()
+        });
+        let result: Vec<_> = album.tracks.iter().enumerate().filter_map(|(index, track)|
+            positions.contains(&index).then_some(track.url.as_str())).collect();
+        assert_eq!(result, ["https://youtube.com/watch?v=chosen"]);
+        assert_eq!(selected_track_positions(&album.tracks, &["https://orig/1".into(), "https://orig/2".into()], &urls), positions);
+    }
+
+    #[test]
+    fn scoped_override_follows_its_url_past_unavailable_preview_rows() {
+        let mut album = album_of(&["https://orig/1", "https://orig/2"]);
+        apply_download_overrides(&mut album, &crate::download::types::DownloadOverrides {
+            tracks: Some(vec![crate::download::types::TrackOverride {
+                index: Some(2),
+                original_url: Some("https://orig/2".into()),
+                url: Some("https://youtube.com/watch?v=chosen".into()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        assert_eq!(album.tracks[0].url, "https://orig/1");
+        assert_eq!(album.tracks[1].url, "https://youtube.com/watch?v=chosen");
     }
 
     #[test]

@@ -88,6 +88,7 @@ pub struct AlbumDownload {
 #[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
 pub struct TrackOverride {
     pub index: Option<usize>,
+    pub original_url: Option<String>,
     pub title: Option<String>,
     pub url: Option<String>,
     pub fallback_urls: Option<Vec<String>>,

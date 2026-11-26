@@ -39,6 +39,7 @@ pub struct ActiveDownloadState {
 
 pub struct ActiveTaskInfo {
     pub abort_handle: Option<AbortHandle>,
+    saving_track: Arc<Mutex<()>>,
     pub temp_dir: Option<PathBuf>,
     pub target_dir: Option<PathBuf>,
     pub root_dir: Option<PathBuf>,
@@ -46,6 +47,7 @@ pub struct ActiveTaskInfo {
     pub is_cancelled: bool,
     /// yt-dlp format id the user picked in the quality menu (tried first; the platform's chain is the fallback).
     pub format: Option<String>,
+    automatic_quality: bool,
     /// Optional metadata & candidate overrides from AlbumPreview.
     pub overrides: Option<DownloadOverrides>,
     /// When upgrading an existing library song, stores its DB id for atomic swap + Trash cleanup.
@@ -94,14 +96,18 @@ impl TaskRegistry {
             .lock()
             .await
             .insert(task_id.to_string());
-        let (pids, handle) = {
+        let (pids, handle, saving_track) = {
             let mut tasks = self.tasks.lock().await;
             match tasks.get_mut(task_id) {
                 Some(info) => {
                     info.is_cancelled = true;
-                    (std::mem::take(&mut info.child_pids), info.abort_handle.take())
+                    (
+                        std::mem::take(&mut info.child_pids),
+                        info.abort_handle.clone(),
+                        Some(info.saving_track.clone()),
+                    )
                 }
-                None => (Vec::new(), None),
+                None => (Vec::new(), None, None),
             }
         };
 
@@ -117,9 +123,28 @@ impl TaskRegistry {
             .await;
         }
 
+        let _saving = match saving_track {
+            Some(lock) => Some(lock.lock_owned().await),
+            None => None,
+        };
         if let Some(handle) = handle {
             handle.abort();
+            while !handle.is_finished() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
         }
+    }
+
+    pub(super) async fn begin_save(&self, task_id: &str) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, String> {
+        let lock = self.tasks.lock().await.get(task_id).map(|task| task.saving_track.clone());
+        let guard = match lock {
+            Some(lock) => Some(lock.lock_owned().await),
+            None => None,
+        };
+        if self.is_cancelled(task_id).await {
+            return Err("Task cancelled".into());
+        }
+        Ok(guard)
     }
 
     pub async fn is_cancelled(&self, task_id: &str) -> bool {
@@ -136,12 +161,14 @@ impl TaskRegistry {
             state.id.clone(),
             ActiveTaskInfo {
                 abort_handle: None,
+                saving_track: Arc::new(Mutex::new(())),
                 temp_dir: None,
                 target_dir: None,
                 root_dir: None,
                 child_pids: Vec::new(),
                 is_cancelled: false,
                 format: None,
+                automatic_quality: false,
                 overrides: None,
                 replace_song_id: None,
                 replace_song_ids: HashMap::new(),
@@ -204,6 +231,8 @@ impl TaskRegistry {
             } else {
                 info.abort_handle = Some(handle);
             }
+        } else {
+            handle.abort();
         }
     }
 
@@ -215,6 +244,16 @@ impl TaskRegistry {
 
     pub async fn format(&self, task_id: &str) -> Option<String> {
         self.tasks.lock().await.get(task_id).and_then(|t| t.format.clone())
+    }
+
+    pub async fn set_automatic_quality(&self, task_id: &str, enabled: bool) {
+        if let Some(info) = self.tasks.lock().await.get_mut(task_id) {
+            info.automatic_quality = enabled;
+        }
+    }
+
+    pub async fn uses_automatic_quality(&self, task_id: &str) -> bool {
+        self.tasks.lock().await.get(task_id).is_some_and(|task| task.automatic_quality)
     }
 
     pub async fn set_overrides(&self, task_id: &str, overrides: Option<DownloadOverrides>) {
@@ -396,7 +435,9 @@ pub fn init_queue_worker(app: AppHandle) -> mpsc::UnboundedSender<DownloadTask> 
             let app_clone = app.clone();
             let task_id_for_log = task_id.clone();
 
+            let (start, ready) = tokio::sync::oneshot::channel();
             let join_handle = tokio::spawn(async move {
+                if ready.await.is_err() { return; }
                 if let Err(e) = handle_download_task(task, app_clone).await {
                     tracing::error!(task_id = %task_id_for_log, error = %e, "Download task failed");
                 }
@@ -407,11 +448,15 @@ pub fn init_queue_worker(app: AppHandle) -> mpsc::UnboundedSender<DownloadTask> 
                     .set_abort_handle(&task_id, join_handle.abort_handle())
                     .await;
             }
+            let _ = start.send(());
 
             let _ = join_handle.await;
 
             if let Some(registry) = app.try_state::<TaskRegistry>() {
-                registry.remove_task(&task_id).await;
+                let mut tasks = registry.tasks.lock().await;
+                if tasks.get(&task_id).is_some_and(|info| !info.is_cancelled) {
+                    tasks.remove(&task_id);
+                }
             }
         }
     });
@@ -480,6 +525,34 @@ mod tests {
             .await
             .expect_err("aborted task should not complete normally");
         assert!(err.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancelled_queue_entry_cannot_start_after_its_registry_row_is_removed() {
+        let registry = TaskRegistry::default();
+        registry.register_task(make_state("cancelled-queued")).await;
+        registry.mark_cancelled("cancelled-queued").await;
+        registry.remove_task("cancelled-queued").await;
+        let worker = tokio::spawn(std::future::pending::<()>());
+        registry.set_abort_handle("cancelled-queued", worker.abort_handle()).await;
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(1), worker)
+            .await.unwrap().unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancellation_waits_for_a_track_commit_and_rejects_new_saves() {
+        let registry = TaskRegistry::default();
+        registry.register_task(make_state("saving")).await;
+        let save = registry.begin_save("saving").await.unwrap().unwrap();
+        let other = registry.clone();
+        let stop = tokio::spawn(async move { other.mark_cancelled("saving").await });
+        while !registry.is_cancelled("saving").await {
+            tokio::task::yield_now().await;
+        }
+        assert!(!stop.is_finished());
+        drop(save);
+        stop.await.unwrap();
+        assert!(registry.begin_save("saving").await.is_err());
     }
 
     #[tokio::test]

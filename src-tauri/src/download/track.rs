@@ -6,6 +6,24 @@ use crate::types::Platform;
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, Manager};
 
+pub(super) const NO_TRACK_UPGRADE: &str = "No better audio source was found. Your current file was kept.";
+
+fn upgrade_candidate_index(
+    candidates: &[crate::metadata::types::AudioCandidate],
+    format: Option<&str>,
+    selected: usize,
+    local_tier: crate::types::QualityTier,
+    local_exists: bool,
+) -> Result<usize, String> {
+    let chosen = crate::download::album::pick_candidate_entry_for_tier(candidates, format, selected);
+    if !local_exists {
+        return Ok(chosen.map_or(0, |entry| entry.0));
+    }
+    chosen.filter(|(index, _, _)| crate::download::album::candidate_improves_local(
+        local_tier, true, candidates[*index].quality_tier
+    )).map(|entry| entry.0).ok_or_else(|| NO_TRACK_UPGRADE.into())
+}
+
 pub async fn process_track_url(
     platform: Platform,
     url: &str,
@@ -64,58 +82,29 @@ pub async fn process_track_url(
             .cloned()
             .unwrap_or_else(|| existing_song.album_artist.clone());
 
-        let mut candidates = crate::resolver::resolve_candidates_for_track(
-            &search_artist,
-            &existing_song.title,
-            existing_song.duration_ms,
-        )
-        .await;
-        if let Some(ref ov_list) = task_overrides.as_ref().and_then(|o| o.tracks.as_ref()) {
-            if let Some(ov) = ov_list.first() {
-                if let Some(ref ov_cands) = ov.candidates {
-                    for cand in ov_cands {
-                        if !candidates.iter().any(|c| c.source == cand.source) {
-                            candidates.push(cand.clone());
-                        }
-                    }
-                    crate::resolver::arbiter::rank_candidates(&mut candidates);
+        let local_exists = std::path::Path::new(&existing_song.path).exists();
+        let supplied = task_overrides.as_ref().and_then(|item| item.tracks.as_ref())
+            .and_then(|tracks| tracks.first());
+        let mut candidates = supplied.and_then(|item| item.candidates.clone()).unwrap_or_default();
+        let selected_source = supplied.and_then(|item| candidates.get(item.selected_candidate_idx.unwrap_or(0)))
+            .filter(|candidate| crate::download::album::candidate_improves_local(
+                existing_song.quality_tier, local_exists, candidate.quality_tier,
+            )).map(|candidate| candidate.source.clone());
+        if selected_source.is_none() || effective_format.as_deref().is_some_and(|format| format != "best") {
+            for candidate in crate::resolver::resolve_candidates_for_track(
+                &search_artist, &existing_song.title, existing_song.duration_ms,
+            ).await {
+                if !candidates.iter().any(|existing| existing.source == candidate.source) {
+                    candidates.push(candidate);
                 }
             }
         }
-
-        let local_exists = std::path::Path::new(&existing_song.path).exists();
-        let chosen = crate::download::album::pick_candidate_entry_for_tier(
-            &candidates,
-            effective_format.as_deref(),
-            0,
-        );
-        if let Some((chosen_idx, _, _)) = &chosen {
-            let cand_tier = candidates[*chosen_idx].quality_tier;
-            if !crate::download::album::candidate_improves_local(
-                existing_song.quality_tier,
-                local_exists,
-                cand_tier,
-            ) {
-                tracing::info!(
-                    title = %existing_song.title,
-                    local_tier = ?existing_song.quality_tier,
-                    candidate_tier = ?cand_tier,
-                    "Skipping single-track upgrade: local file already has equal or higher quality"
-                );
-                let _ = app_handle.emit(
-                    "download-task-progress",
-                    ProgressEvent {
-                        task_id: task_id.to_string(),
-                        current: 1,
-                        total: 1,
-                        track_title: "Already at the best available quality".into(),
-                    },
-                );
-                return Ok((PathBuf::from(output_dir), Vec::new(), None));
-            }
-        } else if local_exists {
-            return Ok((PathBuf::from(output_dir), Vec::new(), None));
-        }
+        crate::resolver::arbiter::rank_candidates(&mut candidates);
+        let selected = selected_source.and_then(|source| candidates.iter().position(|candidate| candidate.source == source))
+            .unwrap_or(0);
+        let chosen = upgrade_candidate_index(
+            &candidates, effective_format.as_deref(), selected, existing_song.quality_tier, local_exists,
+        )?;
 
         let mut td = crate::download::types::TrackDownload {
             url: String::new(),
@@ -141,7 +130,7 @@ pub async fn process_track_url(
             &mut td,
             &candidates,
             effective_format.as_deref(),
-            0,
+            chosen,
         );
 
         if let Some(ref orig_url) = existing_song.source_url {
@@ -187,6 +176,21 @@ pub async fn process_track_url(
         }
         parsed
     };
+
+    if !url.starts_with("resolve:") && task_overrides.as_ref().and_then(|item| item.tracks.as_ref())
+        .is_none_or(|items| items.is_empty())
+    {
+        if let Some(registry) = &registry {
+            if registry.uses_automatic_quality(task_id).await {
+                let artist = track_info.album_artist.clone();
+                let album = track_info.album.clone();
+                super::discovery::discover_automatic_sources(
+                    app_handle, task_id, &artist, &album, std::slice::from_mut(&mut track_info),
+                    |_, _| false, effective_format.as_deref().unwrap_or("best"),
+                ).await;
+            }
+        }
+    }
 
     // The library already has the album of this track (e.g. downloaded from another platform): file it there.
     if track_info.track_number.is_none() {
@@ -300,6 +304,31 @@ fn selected_torrent_track(
 mod torrent_selection_tests {
     use super::*;
     use crate::torrent::download::TorrentTransferResult;
+
+    #[test]
+    fn verified_album_lossless_can_upgrade_a_single_track_and_noop_explains_itself() {
+        use crate::metadata::types::{AudioCandidate, AudioQualityTier, AudioSource};
+        use crate::types::QualityTier;
+        let stream = AudioCandidate {
+            source: AudioSource::HttpStream { platform: "youtube".into(), url: "https://youtu.be/id".into(), format_id: None, direct_stream_url: None, expires_at: None },
+            quality_tier: AudioQualityTier::HighLossy, codec: "Opus".into(), bitrate_kbps: Some(160),
+            sample_rate_hz: None, duration_ms: 200_000, match_confidence: 1.0, is_strict_match: true,
+            matched_title: None, matched_artist: None, display_label: "Opus".into(),
+        };
+        assert_eq!(upgrade_candidate_index(&[stream.clone()], Some("best"), 0, QualityTier::High, true).unwrap_err(), NO_TRACK_UPGRADE);
+        let torrent = AudioCandidate {
+            source: AudioSource::Torrent {
+                info_hash: "hash".into(), magnet_uri: "magnet:hash".into(), file_index: 3,
+                file_path: "04 Sunshine.flac".into(), file_size: 1000, seeders: 3,
+            },
+            quality_tier: AudioQualityTier::Lossless, codec: "FLAC".into(), ..stream.clone()
+        };
+        let candidates = [stream, torrent];
+        let index = upgrade_candidate_index(&candidates, Some("best"), 1, QualityTier::High, true).unwrap();
+        let mut track = TrackDownload::default();
+        crate::download::album::apply_candidate_to_track(&mut track, &candidates, Some("best"), index);
+        assert_eq!(track.torrent_target.unwrap().file_index, 3);
+    }
 
     #[test]
     fn failed_selected_torrent_is_not_replaced_by_http() {

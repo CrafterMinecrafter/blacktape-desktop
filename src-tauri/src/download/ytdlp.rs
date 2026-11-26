@@ -285,14 +285,14 @@ pub fn checked_url(url: &str) -> Result<&str, String> {
 
 /// The site a download url belongs to, from its host (a "youtube.com" elsewhere in the url does not count).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DownloadSite {
+pub(super) enum DownloadSite {
     Youtube,
     Bandcamp,
     Soundcloud,
     Other,
 }
 
-fn download_site(url: &str) -> DownloadSite {
+pub(super) fn download_site(url: &str) -> DownloadSite {
     let host = url::Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
@@ -415,7 +415,8 @@ impl DownloadContext {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| e.to_string())?
             .as_millis();
-        let session_id = format!("{}_{}", session_prefix, timestamp);
+        let session_id = format!("{}_{}_{}", session_prefix, timestamp, uuid::Uuid::new_v4().simple());
+        let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
 
         let temp_root = PathBuf::from(output_dir).join(".temp");
         let _ = tokio::fs::create_dir_all(&temp_root).await;
@@ -440,7 +441,6 @@ impl DownloadContext {
             }
         }
 
-        let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
         let cookie_copies = crate::download::cookies::copies_dir(&app_data_dir);
         let format = match app.try_state::<crate::download::TaskRegistry>() {
             Some(registry) => registry.format(task_id).await,
@@ -1010,6 +1010,7 @@ pub async fn download_batch_streaming(
 
     // Nothing downloaded because every track failed: tell the user why instead of finishing silently.
     if downloaded.is_empty() {
+        discard_failed_batch(&ctx.temp_dir).await;
         if let Some(Err(error)) = ctx.youtube_sign_in.get() {
             return Err(error.clone());
         }
@@ -1020,6 +1021,28 @@ pub async fn download_batch_streaming(
     }
 
     Ok(downloaded)
+}
+
+async fn discard_failed_batch(temp_dir: &Path) {
+    if let Err(error) = tokio::fs::remove_dir_all(temp_dir).await {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(%error, "Failed removing temporary batch files");
+        }
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn removing_failed_batch_keeps_other_temporary_jobs() {
+    let root = tempfile::tempdir().unwrap();
+    let failed = root.path().join("batch_failed");
+    let other = root.path().join("batch_other");
+    tokio::fs::create_dir(&failed).await.unwrap();
+    tokio::fs::create_dir(&other).await.unwrap();
+    tokio::fs::write(failed.join("track.part"), b"partial").await.unwrap();
+    discard_failed_batch(&failed).await;
+    assert!(!failed.exists());
+    assert!(other.exists());
 }
 
 /// Helper function to match track index to the resulting file on disk

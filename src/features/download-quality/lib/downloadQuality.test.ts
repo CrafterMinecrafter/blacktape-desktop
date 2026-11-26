@@ -8,11 +8,58 @@ import {
   formatDetails,
   getExpectedQuality,
   mergeTorrentResolutionsIntoTracks,
+  mergeScopedQualityTracks,
   probeAudioFormats,
+  torrentQualityLabel,
   type AudioFormat,
 } from "./downloadQuality.ts";
+import type { TorrentTierResolution } from "@/shared/lib/audio.ts";
+import type { AlbumTrackInfo } from "@/shared/lib/remote/albumPreview.ts";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+
+it("keeps the missing-track scope and its YouTube option when an unrelated edition is returned", () => {
+  const missing: AlbumTrackInfo = {
+    index: 12, title: "Endless, Nameless", url: "https://www.youtube.com/watch?v=missing",
+    artists: ["Nirvana"], disc_number: 1, track_number: 13, available: true, note: null,
+  };
+  const unrelated: AlbumTrackInfo = {
+    ...missing, title: "Territorial Pissings",
+    candidates: [{
+      source: { kind: "http_stream", platform: "youtube", url: "https://www.youtube.com/watch?v=wrong" },
+      quality_tier: "high_lossy", codec: "Opus", duration_ms: 143_000, match_confidence: 1,
+      is_strict_match: true, display_label: "Opus",
+    }],
+  };
+  const scoped = mergeScopedQualityTracks([missing], [unrelated]);
+  expect(scoped).toHaveLength(1);
+  expect(scoped[0].candidates?.[0].source).toMatchObject({ url: missing.url });
+  expect(buildCanonicalQualityPlan(scoped, [missing.url]).options[0].id).toBe("source:youtube:high");
+});
+
+it("never labels an MP3 codec as lossless", () => {
+  const mixed = { tier: "lossless", codec: "MP3", display_label: "MP3 (Lossless)" } as TorrentTierResolution;
+  expect(torrentQualityLabel(mixed)).toBe("Lossless");
+  expect(torrentQualityLabel({ ...mixed, codec: "FLAC" })).toBe("FLAC (Lossless)");
+});
+
+it("accumulates later platforms for a scoped row and retains its original selection URL", () => {
+  const track: AlbumTrackInfo = {
+    index: 3, title: "Sunshine (Mirage)", artists: ["Heaven Pierce Her"], available: true,
+    url: "https://www.youtube.com/watch?v=linked", track_number: 4, note: null,
+  };
+  const [linked] = mergeScopedQualityTracks([track], []);
+  const [resolved] = mergeScopedQualityTracks([linked], [{
+    ...track, candidates: [{
+      source: { kind: "http_stream", platform: "bandcamp", url: "https://heavenpierceher.bandcamp.com/track/sunshine" },
+      quality_tier: "lossless", codec: "FLAC", is_strict_match: true, match_confidence: 1,
+      duration_ms: 0, display_label: "FLAC",
+    }],
+  }]);
+  expect(resolved.url).toBe(track.url);
+  expect(buildCanonicalQualityPlan([resolved], [track.url]).options.map((option) => option.id))
+    .toEqual(expect.arrayContaining(["source:bandcamp:lossless", "source:youtube:high"]));
+});
 
 const format = (over: Partial<AudioFormat> = {}): AudioFormat => ({
   id: "251",

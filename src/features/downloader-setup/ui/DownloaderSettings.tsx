@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { DefaultQualityDescription, DefaultQualitySelect } from "@/features/download-quality/ui/DefaultQualitySelect.tsx";
 import {
   getDefaultDownloadQuality,
   setDefaultDownloadQuality,
@@ -57,21 +58,14 @@ export const DownloaderSettings = ({
     <>
       <div className={rowClassName}>
         <label htmlFor="default-download-quality-select" className={styles.toolName}>
-          <span>Default Download Quality</span>
+          <span>Default Download Quality Tier</span>
           <span className={mutedClassName}>
-            Used when clicking Download directly without opening the quality picker.
+            Used by Quick Download across available sources.
           </span>
+          <DefaultQualityDescription className={mutedClassName} />
         </label>
-        <select
-          id="default-download-quality-select"
-          className={selectClassName}
-          value={defaultQuality}
-          onChange={(e) => void handleQualityChange(e.target.value as DownloadQualityPreset)}
-        >
-          <option value="best">Automatic Best Quality (Lossless / Opus 160k)</option>
-          <option value="high">High Quality (Opus 160k / AAC 256k)</option>
-          <option value="standard">Standard Quality (MP3 128k)</option>
-        </select>
+        <DefaultQualitySelect id="default-download-quality-select" className={selectClassName}
+          value={defaultQuality} onChange={(quality) => void handleQualityChange(quality)} />
       </div>
       {TOOL_NAMES.map((name) => {
         const tool = status?.[name];
