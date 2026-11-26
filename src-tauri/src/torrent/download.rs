@@ -9,8 +9,10 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 const TORRENT_INIT_TIMEOUT: Duration = Duration::from_secs(25);
-/// Nobody was found by then: announce to the trackers and ask the DHT again.
-const TORRENT_NO_PEERS_TIMEOUT: Duration = Duration::from_secs(20);
+/// The quick request gives up this soon without data and asks again.
+const TORRENT_QUICK_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long the patient request waits for anyone to be found.
+const TORRENT_NO_PEERS_TIMEOUT: Duration = Duration::from_secs(40);
 /// Peers are known but nothing has arrived: restarting would only throw them away, so they get longer.
 const TORRENT_SILENT_PEERS_TIMEOUT: Duration = Duration::from_secs(60);
 const TORRENT_STALL_TIMEOUT: Duration = Duration::from_secs(45);
@@ -21,7 +23,46 @@ const NO_TORRENT_PEERS: &str = "No peers were found for the selected torrent.";
 
 enum TransferError {
     NoPeers,
+    /// The other request for the same torrent received data first.
+    Superseded,
     Other(String),
+}
+
+impl TransferError {
+    fn into_message(self) -> String {
+        match self {
+            Self::NoPeers => NO_TORRENT_PEERS.into(),
+            Self::Superseded => "Another request for this torrent took over.".into(),
+            Self::Other(message) => message,
+        }
+    }
+}
+
+/// Two requests for one torrent run side by side, each in its own session. The patient one keeps its peers
+/// and the DHT; the quick one asks the trackers again and again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    Patient,
+    Quick,
+}
+
+/// The request the torrent belongs to: the first one that receives data.
+#[derive(Default)]
+struct Winner(OnceLock<Lane>);
+
+impl Winner {
+    fn holder(&self) -> Option<Lane> {
+        self.0.get().copied()
+    }
+
+    /// False when this request has to stop because the other one received data first.
+    fn keeps(&self, lane: Lane, has_data: bool) -> bool {
+        if has_data {
+            *self.0.get_or_init(|| lane) == lane
+        } else {
+            self.holder().is_none_or(|holder| holder == lane)
+        }
+    }
 }
 
 /// What the swarm of one torrent has shown so far.
@@ -43,14 +84,15 @@ enum Stall {
 }
 
 struct SwarmWatch {
+    lane: Lane,
     seen: SwarmSample,
     last_data: Instant,
     last_verified: Instant,
 }
 
 impl SwarmWatch {
-    fn new(now: Instant) -> Self {
-        Self { seen: SwarmSample::default(), last_data: now, last_verified: now }
+    fn new(now: Instant, lane: Lane) -> Self {
+        Self { lane, seen: SwarmSample::default(), last_data: now, last_verified: now }
     }
 
     fn observe(&mut self, sample: SwarmSample, now: Instant) {
@@ -80,10 +122,14 @@ impl SwarmWatch {
             return (idle >= TORRENT_STALL_TIMEOUT || unverified >= TORRENT_UNVERIFIED_TIMEOUT)
                 .then_some(Stall::Interrupted);
         }
+        let (no_peers, silent_peers) = match self.lane {
+            Lane::Patient => (TORRENT_NO_PEERS_TIMEOUT, TORRENT_SILENT_PEERS_TIMEOUT),
+            Lane::Quick => (TORRENT_QUICK_TIMEOUT, TORRENT_QUICK_TIMEOUT),
+        };
         if self.seen.found == 0 {
-            (idle >= TORRENT_NO_PEERS_TIMEOUT).then_some(Stall::NoPeers)
+            (idle >= no_peers).then_some(Stall::NoPeers)
         } else {
-            (idle >= TORRENT_SILENT_PEERS_TIMEOUT).then_some(Stall::SilentPeers)
+            (idle >= silent_peers).then_some(Stall::SilentPeers)
         }
     }
 
@@ -164,20 +210,47 @@ impl From<String> for TransferError {
     }
 }
 
-/// Starts the torrent a second time when nobody was found. The session, and with it the DHT, stays.
-async fn retry_when_no_peers<T, F, Fut>(mut attempt: F) -> Result<T, String>
+/// Runs the patient request once and repeats the quick one beside it while that finds nothing. The first
+/// finished download wins; a request that fails without data leaves the other one to finish.
+async fn race_lanes<T, P, Q, QuickFut>(winner: &Winner, patient: P, mut quick: Q) -> Result<T, String>
 where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, TransferError>>,
+    P: std::future::Future<Output = Result<T, TransferError>>,
+    Q: FnMut() -> QuickFut,
+    QuickFut: std::future::Future<Output = Result<T, TransferError>>,
 {
-    let result = match attempt().await {
-        Err(TransferError::NoPeers) => attempt().await,
-        result => result,
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let patient_failed = AtomicBool::new(false);
+    let repeated = async {
+        loop {
+            match quick().await {
+                Err(TransferError::NoPeers) if !patient_failed.load(Ordering::SeqCst) => continue,
+                result => return result,
+            }
+        }
     };
-    result.map_err(|error| match error {
-        TransferError::NoPeers => NO_TORRENT_PEERS.into(),
-        TransferError::Other(message) => message,
-    })
+    let mut patient = std::pin::pin!(patient);
+    let mut repeated = std::pin::pin!(repeated);
+    let result = tokio::select! {
+        result = &mut patient => match result {
+            Ok(done) => Ok(done),
+            Err(error) if winner.holder() == Some(Lane::Patient) => Err(error),
+            Err(error) => {
+                // The attempt already running may still succeed, but no new one is started.
+                patient_failed.store(true, Ordering::SeqCst);
+                match repeated.await {
+                    Err(_) if winner.holder() != Some(Lane::Quick) => Err(error),
+                    quick_result => quick_result,
+                }
+            }
+        },
+        result = &mut repeated => match result {
+            Ok(done) => Ok(done),
+            Err(error) if winner.holder() == Some(Lane::Quick) => Err(error),
+            Err(_) => patient.await,
+        },
+    };
+    result.map_err(TransferError::into_message)
 }
 
 #[derive(Debug, Clone)]
@@ -195,18 +268,18 @@ pub struct TorrentTransferResult {
     pub failure: Option<String>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct SessionConfig {
     cache_root: PathBuf,
     disable_dht: bool,
 }
 
-static SESSION: OnceLock<Mutex<Option<(SessionConfig, Arc<Session>)>>> = OnceLock::new();
+static SESSIONS: OnceLock<Mutex<HashMap<SessionConfig, Arc<Session>>>> = OnceLock::new();
 
-async fn reset_session() {
-    let lock = SESSION.get_or_init(|| Mutex::new(None));
-    let mut guard = lock.lock().await;
-    *guard = None;
+/// Forgets the sessions that use the DHT, so the next download starts a new one.
+async fn reset_dht_session() {
+    let mut sessions = SESSIONS.get_or_init(Default::default).lock().await;
+    sessions.retain(|config, _| config.disable_dht);
 }
 
 async fn get_or_init_session(cache_root: PathBuf, disable_dht: bool) -> Result<Arc<Session>, String> {
@@ -214,12 +287,9 @@ async fn get_or_init_session(cache_root: PathBuf, disable_dht: bool) -> Result<A
         cache_root: cache_root.clone(),
         disable_dht,
     };
-    let lock = SESSION.get_or_init(|| Mutex::new(None));
-    let mut guard = lock.lock().await;
-    if let Some((ref existing_cfg, ref session)) = *guard {
-        if *existing_cfg == desired {
-            return Ok(Arc::clone(session));
-        }
+    let mut sessions = SESSIONS.get_or_init(Default::default).lock().await;
+    if let Some(session) = sessions.get(&desired) {
+        return Ok(Arc::clone(session));
     }
 
     tokio::fs::create_dir_all(&cache_root)
@@ -249,7 +319,7 @@ async fn get_or_init_session(cache_root: PathBuf, disable_dht: bool) -> Result<A
         }
         Err(err) => return Err(format!("Failed starting BitTorrent session: {err}")),
     };
-    *guard = Some((desired, Arc::clone(&session)));
+    sessions.insert(desired, Arc::clone(&session));
     Ok(session)
 }
 
@@ -394,13 +464,18 @@ async fn download_one_torrent(
             Err(error) => tracing::debug!(task_id, %error, "Archive web seed unavailable; trying peers"),
         }
     }
-    retry_when_no_peers(|| {
+    let winner = Winner::default();
+    let attempt = |lane| {
         transfer_attempt(
             Some(app), task_id, library_dir, locator, requests, total_task_tracks,
-            Arc::clone(&completed_counter), track_sender.clone(),
+            Arc::clone(&completed_counter), track_sender.clone(), lane, &winner,
         )
-    })
-    .await
+    };
+    if super::rutracker::topic(locator).is_some() {
+        // RuTracker torrents share one session, where a second request would only collide with the first.
+        return attempt(Lane::Patient).await.map_err(TransferError::into_message);
+    }
+    race_lanes(&winner, attempt(Lane::Patient), || attempt(Lane::Quick)).await
 }
 
 async fn download_archive_seed(
@@ -494,6 +569,8 @@ async fn transfer_attempt(
     total_task_tracks: usize,
     completed_counter: Arc<std::sync::atomic::AtomicUsize>,
     track_sender: Option<tokio::sync::mpsc::Sender<(PathBuf, TrackDownload, usize)>>,
+    lane: Lane,
+    winner: &Winner,
 ) -> Result<TorrentTransferResult, TransferError> {
     use std::sync::atomic::Ordering;
 
@@ -538,13 +615,13 @@ async fn transfer_attempt(
         match get_or_init_session(cache_root.join("rutracker"), true).await {
             Ok(session) => try_add_torrent(
                 app, task_id, &session, locator, Some(bytes), &only_files, &job_dir,
-                total_task_tracks, "Connecting to RuTracker peers",
+                total_task_tracks, Some("Connecting to RuTracker peers"),
             ).await.map(|handle| (session, handle)),
             Err(error) => Err(error),
         }
     } else {
-        add_torrent_with_recovery(
-            app, task_id, &cache_root, &job_dir, locator, &only_files, total_task_tracks,
+        add_torrent(
+            app, task_id, &cache_root, &job_dir, locator, &only_files, total_task_tracks, lane,
         )
         .await
     };
@@ -582,7 +659,7 @@ async fn transfer_attempt(
         if elapsed >= TORRENT_INIT_TIMEOUT {
             break Err("Timed out waiting for torrent peers/metadata.".to_string());
         }
-        if last_status_at.elapsed() >= Duration::from_secs(2) {
+        if lane == Lane::Patient && last_status_at.elapsed() >= Duration::from_secs(2) {
             last_status_at = Instant::now();
             emit_task_progress(
                 app,
@@ -600,14 +677,16 @@ async fn transfer_attempt(
         return Err(msg.into());
     }
 
-    emit_task_progress(
-        app,
-        task_id,
-        completed_counter.load(Ordering::SeqCst),
-        total_task_tracks,
-        "Waiting for torrent seeders…",
-    )
-    .await;
+    if lane == Lane::Patient {
+        emit_task_progress(
+            app,
+            task_id,
+            completed_counter.load(Ordering::SeqCst),
+            total_task_tracks,
+            "Waiting for torrent seeders…",
+        )
+        .await;
+    }
 
     let file_rel_paths: HashMap<usize, (PathBuf, u64)> = match handle.with_metadata(|meta| {
         requests
@@ -636,11 +715,12 @@ async fn transfer_attempt(
     let mut last_pct: HashMap<usize, i32> = HashMap::new();
     let mut completed = Vec::new();
     let mut failed_tracks = Vec::new();
-    let mut watch = SwarmWatch::new(Instant::now());
+    let mut watch = SwarmWatch::new(Instant::now(), lane);
     let mut last_wait_notice_at = Instant::now();
     let mut cancelled = false;
     let mut transfer_failure: Option<String> = None;
     let mut no_peers = false;
+    let mut superseded = false;
 
     loop {
         if is_task_cancelled(app, task_id).await {
@@ -664,12 +744,24 @@ async fn transfer_attempt(
             found: live.map_or(0, |live| live.peer_stats.seen),
             connected: live.map_or(0, |live| live.peer_stats.live),
         }, now);
+        // Checked before any file is staged, so only one request ever hands tracks on.
+        let undecided = winner.holder().is_none();
+        if !winner.keeps(lane, watch.has_data() || stats.finished) {
+            superseded = true;
+            break;
+        }
+        if undecided && winner.holder().is_some() {
+            let SwarmSample { found, connected, .. } = watch.seen;
+            tracing::info!(task_id, ?lane, found, connected, "Torrent data arrived");
+        }
         if !stats.finished {
             if let Some(stall) = watch.stall(now) {
                 let SwarmSample { verified, fetched, found, connected } = watch.seen;
-                tracing::warn!(task_id, ?stall, found, connected, fetched, verified, "Torrent download stalled");
+                tracing::warn!(task_id, ?lane, ?stall, found, connected, fetched, verified, "Torrent download stalled");
                 match stall {
                     Stall::NoPeers => no_peers = true,
+                    // The quick request simply asks again.
+                    Stall::SilentPeers if lane == Lane::Quick => no_peers = true,
                     Stall::SilentPeers => transfer_failure = Some(
                         "Peers were found for the selected torrent, but none sent data.".into(),
                     ),
@@ -679,7 +771,8 @@ async fn transfer_attempt(
                 }
                 break;
             }
-            if watch.seen.verified == verified_before && last_wait_notice_at.elapsed() >= Duration::from_secs(3) {
+            let reports = winner.holder().unwrap_or(Lane::Patient) == lane;
+            if reports && watch.seen.verified == verified_before && last_wait_notice_at.elapsed() >= Duration::from_secs(3) {
                 last_wait_notice_at = now;
                 emit_task_progress(
                     app,
@@ -777,6 +870,9 @@ async fn transfer_attempt(
     if cancelled {
         return Err("Task cancelled".to_string().into());
     }
+    if superseded {
+        return Err(TransferError::Superseded);
+    }
     if no_peers {
         return Err(TransferError::NoPeers);
     }
@@ -793,87 +889,6 @@ async fn transfer_attempt(
     })
 }
 
-async fn add_torrent_with_recovery(
-    app: Option<&AppHandle>,
-    task_id: &str,
-    cache_root: &std::path::Path,
-    job_dir: &std::path::Path,
-    locator: &str,
-    only_files: &[usize],
-    total_task_tracks: usize,
-) -> Result<(Arc<Session>, Arc<ManagedTorrent>), String> {
-    emit_task_progress(
-        app,
-        task_id,
-        0,
-        total_task_tracks,
-        "Connecting to torrent peers…",
-    )
-    .await;
-
-    let primary = add_torrent(
-        app, task_id, cache_root, job_dir, locator, only_files, total_task_tracks,
-    )
-    .await;
-
-    match primary {
-        Ok(added) => return Ok(added),
-        Err(err) if err == "Task cancelled" => {
-            let _ = tokio::fs::remove_dir_all(job_dir).await;
-            return Err(err);
-        }
-        Err(primary_err) => {
-            tracing::warn!(
-                task_id,
-                error = %primary_err,
-                "Primary torrent session stalled or failed; resetting session and retrying without DHT"
-            );
-            // Reset shared session in case librqbit's DHT UDP actor exited (e.g. WSAEMSGSIZE 10040 on Windows).
-            reset_session().await;
-            emit_task_progress(
-                app,
-                task_id,
-                0,
-                total_task_tracks,
-                "Retrying torrent via trackers…",
-            )
-            .await;
-
-            let tracker_session = match get_or_init_session(cache_root.to_path_buf(), true).await {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = tokio::fs::remove_dir_all(job_dir).await;
-                    return Err(e);
-                }
-            };
-
-            match try_add_torrent(
-                app,
-                task_id,
-                &tracker_session,
-                locator,
-                None,
-                only_files,
-                job_dir,
-                total_task_tracks,
-                "Retrying via torrent trackers",
-            )
-            .await
-            {
-                Ok(handle) => return Ok((tracker_session, handle)),
-                Err(err) if err == "Task cancelled" => {
-                    let _ = tokio::fs::remove_dir_all(job_dir).await;
-                    return Err(err);
-                }
-                Err(tracker_err) => {
-                    let _ = tokio::fs::remove_dir_all(job_dir).await;
-                    return Err(tracker_err);
-                }
-            }
-        }
-    }
-}
-
 async fn add_torrent(
     app: Option<&AppHandle>,
     task_id: &str,
@@ -882,21 +897,30 @@ async fn add_torrent(
     locator: &str,
     only_files: &[usize],
     total_task_tracks: usize,
+    lane: Lane,
 ) -> Result<(Arc<Session>, Arc<ManagedTorrent>), String> {
-    let session = get_or_init_session(cache_root.to_path_buf(), false).await?;
-    let handle = try_add_torrent(
-        app,
-        task_id,
-        &session,
-        locator,
-        None,
-        only_files,
-        job_dir,
-        total_task_tracks,
-        "Connecting to torrent peers",
+    let status = (lane == Lane::Patient).then_some("Connecting to torrent peers");
+    if let Some(status) = status {
+        emit_task_progress(app, task_id, 0, total_task_tracks, &format!("{status}…")).await;
+    }
+    let session = get_or_init_session(cache_root.to_path_buf(), lane == Lane::Quick).await?;
+    let added = try_add_torrent(
+        app, task_id, &session, locator, None, only_files, job_dir, total_task_tracks, status,
     )
-    .await?;
-    Ok((session, handle))
+    .await;
+    match added {
+        Ok(handle) => Ok((session, handle)),
+        Err(error) => {
+            if error != "Task cancelled" {
+                tracing::warn!(task_id, ?lane, %error, "Failed adding the torrent");
+                if lane == Lane::Patient {
+                    // librqbit's DHT UDP actor can exit (e.g. WSAEMSGSIZE 10040 on Windows): start it anew.
+                    reset_dht_session().await;
+                }
+            }
+            Err(error)
+        }
+    }
 }
 
 /// The only source of what librqbit adds from a locator. It must never receive an HTTP(S) URL: librqbit
@@ -925,7 +949,7 @@ async fn try_add_torrent(
     only_files: &[usize],
     job_dir: &std::path::Path,
     total_task_tracks: usize,
-    status_prefix: &str,
+    status_prefix: Option<&str>,
 ) -> Result<Arc<ManagedTorrent>, String> {
     let add_opts = AddTorrentOptions {
         paused: false,
@@ -960,7 +984,7 @@ async fn try_add_torrent(
                 if elapsed >= TORRENT_INIT_TIMEOUT {
                     return Err("Timed out connecting to torrent peers or DHT.".into());
                 }
-                if last_notice.elapsed() >= Duration::from_secs(2) {
+                if let Some(status_prefix) = status_prefix.filter(|_| last_notice.elapsed() >= Duration::from_secs(2)) {
                     last_notice = Instant::now();
                     emit_task_progress(
                         app,
@@ -1199,36 +1223,89 @@ mod tests {
         assert!(result.failed_tracks.is_empty());
     }
 
-    #[tokio::test]
-    async fn a_swarm_without_peers_is_tried_once_more() {
-        let mut attempts = 0;
-        let result = retry_when_no_peers(|| {
-            attempts += 1;
-            std::future::ready(if attempts == 2 { Ok("downloaded") } else { Err(TransferError::NoPeers) })
-        }).await;
-        assert_eq!(result.unwrap(), "downloaded");
-        assert_eq!(attempts, 2);
-
-        attempts = 0;
-        let result = retry_when_no_peers(|| {
-            attempts += 1;
-            std::future::ready(Err::<(), _>(TransferError::NoPeers))
-        }).await;
-        assert_eq!(result.unwrap_err(), NO_TORRENT_PEERS);
-        assert_eq!(attempts, 2);
+    async fn after<T>(milliseconds: u64, value: T) -> T {
+        tokio::time::sleep(Duration::from_millis(milliseconds)).await;
+        value
     }
 
     #[tokio::test]
-    async fn cancellation_and_other_failures_do_not_restart_the_transfer() {
-        for message in ["Task cancelled", "Torrent download stalled while waiting for remaining data."] {
-            let mut attempts = 0;
-            let result = retry_when_no_peers(|| {
+    async fn the_quick_request_asks_again_while_the_patient_one_waits() {
+        let mut attempts = 0;
+        let result = race_lanes(&Winner::default(), std::future::pending(), || {
+            attempts += 1;
+            after(5, if attempts == 3 { Ok("quick") } else { Err(TransferError::NoPeers) })
+        }).await;
+        assert_eq!(result.unwrap(), "quick");
+        assert_eq!(attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn a_running_quick_attempt_may_still_succeed_after_the_patient_one_failed() {
+        let result = race_lanes(
+            &Winner::default(),
+            after(5, Err(TransferError::NoPeers)),
+            || after(40, Ok("quick")),
+        ).await;
+        assert_eq!(result.unwrap(), "quick");
+    }
+
+    #[tokio::test]
+    async fn no_new_quick_attempt_starts_once_the_patient_one_failed() {
+        let mut attempts = 0;
+        let result = race_lanes(
+            &Winner::default(),
+            after(5, Err::<(), _>(TransferError::Other("Task cancelled".into()))),
+            || {
                 attempts += 1;
-                std::future::ready(Err::<(), _>(TransferError::Other(message.into())))
-            }).await;
-            assert_eq!(result.unwrap_err(), message);
-            assert_eq!(attempts, 1);
-        }
+                after(40, Err(TransferError::NoPeers))
+            },
+        ).await;
+        assert_eq!(result.unwrap_err(), "Task cancelled");
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_quick_request_leaves_the_patient_one_to_finish() {
+        let result = race_lanes(
+            &Winner::default(),
+            after(40, Ok("patient")),
+            || after(5, Err(TransferError::Other("no trackers".into()))),
+        ).await;
+        assert_eq!(result.unwrap(), "patient");
+    }
+
+    #[tokio::test]
+    async fn the_request_that_received_data_decides_the_outcome() {
+        let winner = Winner::default();
+        assert!(winner.keeps(Lane::Quick, true));
+        assert!(!winner.keeps(Lane::Patient, false));
+        assert!(!winner.keeps(Lane::Patient, true));
+        let result = race_lanes(
+            &winner,
+            after(5, Err::<(), _>(TransferError::Superseded)),
+            || after(40, Err(TransferError::Other("stalled".into()))),
+        ).await;
+        assert_eq!(result.unwrap_err(), "stalled");
+
+        let winner = Winner::default();
+        assert!(winner.keeps(Lane::Patient, true));
+        let result = race_lanes(
+            &winner,
+            after(5, Err::<(), _>(TransferError::Other("interrupted".into()))),
+            std::future::pending,
+        ).await;
+        assert_eq!(result.unwrap_err(), "interrupted");
+    }
+
+    #[test]
+    fn the_quick_request_gives_up_sooner_than_the_patient_one() {
+        let start = Instant::now();
+        let mut quick = SwarmWatch::new(start, Lane::Quick);
+        assert_eq!(quick.stall(start + TORRENT_QUICK_TIMEOUT), Some(Stall::NoPeers));
+        quick.observe(SwarmSample { found: 3, ..Default::default() }, start);
+        assert_eq!(quick.stall(start + TORRENT_QUICK_TIMEOUT), Some(Stall::SilentPeers));
+        let patient = SwarmWatch::new(start, Lane::Patient);
+        assert_eq!(patient.stall(start + TORRENT_QUICK_TIMEOUT), None);
     }
 
     #[tokio::test]
@@ -1272,8 +1349,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_announce_downloads_and_stages_selected_file() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    async fn quick_request_asks_again_and_stages_the_selected_file() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let root = tempfile::tempdir().unwrap();
@@ -1303,8 +1380,8 @@ mod tests {
             ..Default::default()
         }).await.unwrap();
         let port = seed.tcp_listen_port().unwrap().to_be_bytes();
-        let peer_available = Arc::new(AtomicBool::new(false));
-        let availability = Arc::clone(&peer_available);
+        // The first announce of both requests finds nobody; only asking again finds the seed.
+        let seed_appears = Instant::now() + Duration::from_secs(10);
         let tracker = tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let mut request = [0; 4096];
@@ -1312,7 +1389,7 @@ mod tests {
                     continue;
                 }
                 let mut body = b"d8:completei1e10:incompletei0e8:intervali3600e5:peers".to_vec();
-                if availability.load(Ordering::SeqCst) {
+                if Instant::now() >= seed_appears {
                     body.extend_from_slice(&[b'6', b':', 127, 0, 0, 1, port[0], port[1]]);
                 } else {
                     body.extend_from_slice(b"0:");
@@ -1336,20 +1413,22 @@ mod tests {
         }];
         let counter = Arc::new(AtomicUsize::new(0));
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-        let mut attempts = 0;
-        let result = tokio::time::timeout(Duration::from_secs(60), retry_when_no_peers(|| {
-            attempts += 1;
-            peer_available.store(attempts > 1, Ordering::SeqCst);
+        let winner = Winner::default();
+        let attempt = |lane| {
             transfer_attempt(
-                None, "tracker-retry-test", root.path(), &locator, &requests,
-                1, Arc::clone(&counter), Some(sender.clone()),
+                None, "quick-request-test", root.path(), &locator, &requests,
+                1, Arc::clone(&counter), Some(sender.clone()), lane, &winner,
             )
-        })).await;
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            race_lanes(&winner, attempt(Lane::Patient), || attempt(Lane::Quick)),
+        ).await;
         tracker.abort();
         seed.stop().await;
 
         let result = result.unwrap().unwrap();
-        assert!(peer_available.load(Ordering::SeqCst));
+        assert_eq!(winner.holder(), Some(Lane::Quick));
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert!(result.failed_tracks.is_empty());
         let (path, track, index) = receiver.try_recv().unwrap();
@@ -1371,7 +1450,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_retry_adds_the_cached_metadata() {
+    async fn each_request_has_its_own_session_and_uses_cached_metadata() {
         let root = tempfile::tempdir().unwrap();
         let mut metadata = b"d4:infod6:lengthi3e4:name12:recovery.mp312:piece lengthi16384e6:pieces20:".to_vec();
         metadata.extend_from_slice(&[1; 20]);
@@ -1380,17 +1459,19 @@ mod tests {
         let locator = format!("magnet:?xt=urn:btih:{hash}");
         super::super::inspect::cache_torrent_bytes(&hash, &metadata);
         let cache_root = root.path().join("cache");
-        // The torrent is already managed by the first session, so the first attempt fails.
-        let first = get_or_init_session(cache_root.clone(), false).await.unwrap();
-        try_add_torrent(None, "recovery", &first, &locator, None, &[0], &root.path().join("a"), 1, "")
-            .await.unwrap();
-        let (second, handle) = add_torrent_with_recovery(
-            None, "recovery", &cache_root, &root.path().join("b"), &locator, &[0], 1,
+        let (patient, _) = add_torrent(
+            None, "lanes", &cache_root, &root.path().join("a"), &locator, &[0], 1, Lane::Patient,
+        ).await.unwrap();
+        // Without the cache this magnet has no tracker and no DHT to resolve it in the quick session.
+        let (quick, handle) = add_torrent(
+            None, "lanes", &cache_root, &root.path().join("b"), &locator, &[0], 1, Lane::Quick,
         ).await.unwrap();
         assert_eq!(handle.info_hash().as_string(), hash);
-        assert!(!Arc::ptr_eq(&first, &second));
-        first.stop().await;
-        second.stop().await;
+        assert!(!Arc::ptr_eq(&patient, &quick));
+        // The quick session did not replace the DHT session.
+        assert!(Arc::ptr_eq(&patient, &get_or_init_session(cache_root, false).await.unwrap()));
+        patient.stop().await;
+        quick.stop().await;
     }
 
     #[test]
@@ -1430,7 +1511,7 @@ mod tests {
     #[test]
     fn swarm_without_peers_stalls_at_the_no_peers_timeout() {
         let start = Instant::now();
-        let watch = SwarmWatch::new(start);
+        let watch = SwarmWatch::new(start, Lane::Patient);
         assert_eq!(watch.stall(start + TORRENT_NO_PEERS_TIMEOUT - Duration::from_secs(1)), None);
         assert_eq!(watch.stall(start + TORRENT_NO_PEERS_TIMEOUT), Some(Stall::NoPeers));
     }
@@ -1438,7 +1519,7 @@ mod tests {
     #[test]
     fn swarm_with_peers_but_no_bytes_stalls_at_the_silent_peers_timeout() {
         let start = Instant::now();
-        let mut watch = SwarmWatch::new(start);
+        let mut watch = SwarmWatch::new(start, Lane::Patient);
         watch.observe(SwarmSample { found: 3, connected: 1, ..Default::default() }, start + Duration::from_secs(1));
         // Peers are known, so the longer silent-peers timeout applies instead of the no-peers one.
         assert_eq!(watch.stall(start + TORRENT_NO_PEERS_TIMEOUT), None);
@@ -1452,7 +1533,7 @@ mod tests {
     #[test]
     fn unverified_bytes_keep_the_swarm_alive_until_fetching_stops() {
         let start = Instant::now();
-        let mut watch = SwarmWatch::new(start);
+        let mut watch = SwarmWatch::new(start, Lane::Patient);
         let last_growth = start + Duration::from_secs(30);
         watch.observe(SwarmSample { fetched: 100, found: 2, connected: 1, ..Default::default() }, last_growth);
         // Past the silent-peers timeout, but bytes are still arriving, so nothing is stalled yet.
@@ -1465,7 +1546,7 @@ mod tests {
     #[test]
     fn fetched_bytes_without_verified_pieces_interrupt_after_the_unverified_timeout() {
         let start = Instant::now();
-        let mut watch = SwarmWatch::new(start);
+        let mut watch = SwarmWatch::new(start, Lane::Patient);
         // Fetched bytes grow every 5 seconds, so the stall timeout never fires; verified never grows.
         for elapsed in (5..TORRENT_UNVERIFIED_TIMEOUT.as_secs()).step_by(5) {
             let now = start + Duration::from_secs(elapsed);
@@ -1479,7 +1560,7 @@ mod tests {
     #[test]
     fn waiting_message_reports_peers_before_data_and_data_after() {
         let start = Instant::now();
-        let mut watch = SwarmWatch::new(start);
+        let mut watch = SwarmWatch::new(start, Lane::Patient);
         watch.observe(SwarmSample { found: 4, connected: 2, ..Default::default() }, start);
         let message = watch.waiting_message(start + Duration::from_secs(3));
         assert!(message.starts_with("Waiting for torrent seeders"), "{message}");
