@@ -152,6 +152,13 @@
     min-width: 0;
 }
 
+.indexerActions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-left: 12px;
+}
+
 .libraryPath {
     color: var(--color-muted);
     font-size: var(--font-md);

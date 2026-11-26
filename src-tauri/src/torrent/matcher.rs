@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use strsim::jaro_winkler;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub struct ExpectedTrackInput {
     pub index: usize,
     pub title: String,
@@ -69,6 +69,9 @@ pub enum TorrentResolveEvent {
     InspectionProgress { checked: usize, total: usize },
     Estimated {
         estimates: Vec<TorrentTierEstimate>,
+    },
+    Verified {
+        resolutions: Vec<TorrentTierResolution>,
     },
     Resolved {
         resolutions: Vec<TorrentTierResolution>,
@@ -787,7 +790,7 @@ fn preferred_hits(hits: &[SearchHit]) -> Vec<&SearchHit> {
     ordered
 }
 
-type ResolveCacheKey = (String, String, Vec<(usize, String)>);
+type ResolveCacheKey = (String, String, Vec<ExpectedTrackInput>, Vec<search::Provider>);
 type ResolveCacheValue = (Vec<TorrentTierResolution>, Vec<String>, std::time::Instant);
 
 fn resolved_torrent_cache() -> &'static std::sync::Mutex<HashMap<ResolveCacheKey, ResolveCacheValue>> {
@@ -828,125 +831,196 @@ fn verified_inferred_release(resolution: &TorrentTierResolution, expected: &[Exp
 
 /// Searches providers, streams initial per-tier estimates, inspects top healthy hits per tier,
 /// and matches files against `expected`.
+#[cfg(test)]
 pub async fn resolve_album_torrents(
     artist: &str,
     title: &str,
     expected: &[ExpectedTrackInput],
     emit: impl Fn(TorrentResolveEvent),
 ) -> Result<(Vec<TorrentTierResolution>, Vec<String>), String> {
-    let cache_key: ResolveCacheKey = (
+    resolve_with_indexers(None, artist, title, expected, &search::Provider::ALL, emit).await
+}
+
+pub(super) async fn resolve_with_indexers(
+    app: Option<&tauri::AppHandle>,
+    artist: &str,
+    title: &str,
+    expected: &[ExpectedTrackInput],
+    enabled: &[search::Provider],
+    emit: impl Fn(TorrentResolveEvent),
+) -> Result<(Vec<TorrentTierResolution>, Vec<String>), String> {
+    // Account-backed results depend on the live session, including after a sign-in or sign-out.
+    let cache_key: Option<ResolveCacheKey> = (!enabled.contains(&search::Provider::RuTracker)).then(|| (
         clean_title(artist),
         clean_title(title),
-        expected
-            .iter()
-            .map(|e| (e.index, clean_title(&e.title)))
-            .collect(),
-    );
-    {
+        expected.to_vec(),
+        enabled.to_vec(),
+    ));
+    let cached = cache_key.as_ref().and_then(|cache_key| {
         let guard = resolved_torrent_cache()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some((cached_res, cached_unavail, at)) = guard.get(&cache_key) {
-            if at.elapsed() < std::time::Duration::from_secs(300) {
-                emit(TorrentResolveEvent::Resolved {
-                    resolutions: cached_res.clone(),
-                    unavailable_providers: cached_unavail.clone(),
-                });
-                return Ok((cached_res.clone(), cached_unavail.clone()));
-            }
+        guard.get(cache_key).cloned()
+    });
+    if let Some((resolutions, unavailable_providers, at)) = &cached {
+        if at.elapsed() < std::time::Duration::from_secs(300) && unavailable_providers.is_empty() {
+            emit(TorrentResolveEvent::Resolved {
+                resolutions: resolutions.clone(),
+                unavailable_providers: unavailable_providers.clone(),
+            });
+            return Ok((resolutions.clone(), unavailable_providers.clone()));
         }
     }
 
     emit(TorrentResolveEvent::Searching);
+    if let Some((resolutions, _, _)) = cached.filter(|(_, _, at)| at.elapsed() < std::time::Duration::from_secs(900)) {
+        if !resolutions.is_empty() {
+            emit(TorrentResolveEvent::Verified { resolutions });
+        }
+    }
+    let (reports, mut pending_reports) = tokio::sync::mpsc::unbounded_channel();
+    let search = search::search_with_app(app, artist, title, expected.len() >= 4, enabled, move |provider| {
+        let _ = reports.send(provider);
+    });
+    tokio::pin!(search);
 
-    let found = std::sync::Mutex::new((0, Vec::new()));
-    let report = search::search_for_release(artist, title, expected.len() >= 4, |provider| {
-        if let Ok(mut progress) = found.lock() {
-            progress.0 += 1;
-            emit(TorrentResolveEvent::SearchProgress {
-                checked: progress.0,
-                total: search::PROVIDER_COUNT,
+    let mut search_done = false;
+    let mut provider_count = 0;
+    let mut hits = Vec::new();
+    let mut unavailable_providers = Vec::new();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut started = HashSet::new();
+    let mut attempts = BTreeMap::new();
+    let mut inferred_attempts = 0;
+    let mut checked = 0;
+    let mut last_progress = None;
+    let mut resolutions = Vec::new();
+    let expected = std::sync::Arc::new(expected.to_vec());
+
+    loop {
+        // Leave capacity for candidates from indexers that are still searching.
+        let concurrency = if search_done { 4 } else { 2 };
+        let per_tier_budget = if search_done { 6 } else { 2 };
+        let mut remaining = 0;
+        let mut pending_attempts = attempts.clone();
+        let mut pending_inferred = inferred_attempts;
+        for hit in inspection_order(&hits) {
+            if !hit_is_healthy(hit) || started.contains(&hit.input) {
+                continue;
+            }
+            let bucket = hit_quality_bucket(hit);
+            if hit.rank >= 2 {
+                let count = pending_attempts.entry(bucket).or_insert(0);
+                if *count >= per_tier_budget { continue; }
+                *count += 1;
+            } else if !search_done || hit.rank != 1 || pending_inferred >= 2 {
+                continue;
+            } else {
+                pending_inferred += 1;
+            }
+            if tasks.len() >= concurrency {
+                remaining += 1;
+                continue;
+            }
+            if hit.rank >= 2 {
+                *attempts.entry(bucket).or_insert(0) += 1;
+            } else {
+                inferred_attempts += 1;
+            }
+            started.insert(hit.input.clone());
+            let hit = hit.clone();
+            let expected = expected.clone();
+            #[cfg(not(test))]
+            let app = app.cloned();
+            tasks.spawn(async move {
+                #[cfg(not(test))]
+                let release = inspect::inspect_with_app(app.as_ref(), &hit.input).await;
+                #[cfg(test)]
+                let release = inspect::inspect(&hit.input).await;
+                let release = release.ok()?;
+                if release.layout == ReleaseLayout::NonAudio { return None; }
+                let resolution = match_release_to_expected(&release, &hit, &expected);
+                let verified = if hit.rank == 1 {
+                    verified_inferred_release(&resolution, &expected)
+                } else {
+                    should_keep_resolution(&resolution, expected.len())
+                };
+                verified.then_some(resolution)
             });
-            if estimate_event(&provider.hits).is_some() {
-                progress.1.extend(provider.hits);
-                if let Some(event) = estimate_event(&progress.1) {
+        }
+        let total = checked + tasks.len() + remaining;
+        if total > 0 && last_progress != Some((checked, total)) {
+            last_progress = Some((checked, total));
+            emit(TorrentResolveEvent::InspectionProgress { checked, total });
+        }
+        if search_done && tasks.is_empty() { break; }
+
+        tokio::select! {
+            biased;
+            Some(provider) = pending_reports.recv(), if !search_done => {
+                provider_count += 1;
+                if started.is_empty() {
+                    emit(TorrentResolveEvent::SearchProgress { checked: provider_count, total: enabled.len() });
+                }
+                hits.extend(provider.hits);
+                hits = search::merge_hits(hits);
+                if let Some(event) = estimate_event(&hits) {
                     emit(event);
                 }
             }
-        }
-    }).await?;
-    let unavailable_providers: Vec<String> = report
-        .providers
-        .iter()
-        .filter_map(|p| p.error.as_ref().map(|_| p.provider.clone()))
-        .collect();
-
-    if let Some(event) = estimate_event(&report.hits) {
-        emit(event);
-    }
-
-    // Keep a bounded shortlist per advertised tier, including untagged releases.
-    let mut buckets: BTreeMap<Option<AudioQualityTier>, Vec<SearchHit>> = BTreeMap::new();
-    for hit in preferred_hits(&report.hits) {
-        if hit.rank < 2 || !hit_is_healthy(hit) {
-            continue;
-        }
-        let bucket = hit_quality_bucket(&hit);
-        let list = buckets.entry(bucket).or_default();
-        if list.len() < 6 {
-            list.push(hit.clone());
-        }
-    }
-    // Keep the fallback budget independent from confirmed artist/title matches.
-    for hit in report.hits.iter().filter(|hit| hit.rank == 1 && hit_is_healthy(hit)).take(2) {
-        buckets.entry(hit_quality_bucket(hit)).or_default().push(hit.clone());
-    }
-
-    let total = buckets.values().map(Vec::len).sum();
-    if total > 0 {
-        emit(TorrentResolveEvent::InspectionProgress { checked: 0, total });
-    }
-    let (finished, mut progress) = tokio::sync::mpsc::unbounded_channel();
-    // Inspect each bucket concurrently, picking the highest-coverage release in that tier.
-    let mut tasks = tokio::task::JoinSet::new();
-    for (_bucket, candidates) in buckets {
-        let expected_owned = expected.to_vec();
-        let finished = finished.clone();
-        tasks.spawn(async move {
-            let mut resolutions = Vec::new();
-            for hit in candidates {
-                if let Ok(release) = inspect::inspect(&hit.input).await {
-                    if release.layout != ReleaseLayout::NonAudio {
-                        let res = match_release_to_expected(&release, &hit, &expected_owned);
-                        let verified = if hit.rank == 1 {
-                            verified_inferred_release(&res, &expected_owned)
-                        } else {
-                            should_keep_resolution(&res, expected_owned.len())
-                        };
-                        if verified {
-                            resolutions.push(res);
-                        }
-                    }
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                checked += 1;
+                if let Some(Ok(Some(resolution))) = result {
+                    resolutions.push(resolution);
+                    emit(TorrentResolveEvent::Verified { resolutions: sorted_resolutions(resolutions.clone()) });
                 }
-                let _ = finished.send(());
             }
-            resolutions
-        });
-    }
-    drop(finished);
-    let mut checked = 0;
-    while progress.recv().await.is_some() {
-        checked += 1;
-        emit(TorrentResolveEvent::InspectionProgress { checked, total });
-    }
-
-    let mut resolutions = Vec::new();
-    while let Some(joined) = tasks.join_next().await {
-        if let Ok(batch) = joined {
-            resolutions.extend(batch);
+            result = &mut search, if !search_done => {
+                let report = result?;
+                hits = report.hits;
+                unavailable_providers = report.providers.into_iter()
+                    .filter(|provider| provider.error.is_some()).map(|provider| provider.provider).collect();
+                search_done = true;
+            }
         }
     }
+    let resolutions = sorted_resolutions(resolutions);
+    if let Some(cache_key) = cache_key {
+        let mut guard = resolved_torrent_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if guard.len() >= 32 {
+            guard.clear();
+        }
+        guard.insert(
+            cache_key,
+            (
+                resolutions.clone(),
+                unavailable_providers.clone(),
+                std::time::Instant::now(),
+            ),
+        );
+    }
 
+    emit(TorrentResolveEvent::Resolved {
+        resolutions: resolutions.clone(),
+        unavailable_providers: unavailable_providers.clone(),
+    });
+
+    Ok((resolutions, unavailable_providers))
+}
+
+fn inspection_order(hits: &[SearchHit]) -> Vec<&SearchHit> {
+    let mut ordered = preferred_hits(hits);
+    ordered.sort_by_key(|hit| (
+        std::cmp::Reverse(hit.rank),
+        hit.input.starts_with("magnet:") && !hit.input.contains("&xs="),
+        hit_quality_bucket(hit) != Some(AudioQualityTier::Lossless),
+    ));
+    ordered
+}
+
+fn sorted_resolutions(mut resolutions: Vec<TorrentTierResolution>) -> Vec<TorrentTierResolution> {
     resolutions.sort_by_cached_key(|release| {
         let web_seed = super::web_seed::archive_item(&release.magnet_uri)
             .and_then(|item| {
@@ -972,29 +1046,7 @@ pub async fn resolve_album_torrents(
         *count += 1;
         true
     });
-    {
-        let mut guard = resolved_torrent_cache()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if guard.len() >= 32 {
-            guard.clear();
-        }
-        guard.insert(
-            cache_key,
-            (
-                resolutions.clone(),
-                unavailable_providers.clone(),
-                std::time::Instant::now(),
-            ),
-        );
-    }
-
-    emit(TorrentResolveEvent::Resolved {
-        resolutions: resolutions.clone(),
-        unavailable_providers: unavailable_providers.clone(),
-    });
-
-    Ok((resolutions, unavailable_providers))
+    resolutions
 }
 
 #[cfg(test)]
@@ -1056,6 +1108,51 @@ mod tests {
         let ordered = preferred_hits(&hits);
         assert_eq!(ordered[0].provider, "Knaben");
         assert_eq!(build_tier_estimates(&hits)[0].provider, "Knaben");
+    }
+
+    #[test]
+    fn inspection_checks_exact_metadata_before_magnets_of_the_same_rank() {
+        let mut magnet = hit("Artist - Album FLAC", "Knaben", Some(100), 3);
+        magnet.input = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".into();
+        let mut exact = hit("Artist - Album FLAC", "RuTor", Some(2), 3);
+        exact.input = format!("{}&xs=https%3A%2F%2Fd.rutor.info%2Fdownload%2F1", magnet.input);
+        let mut inferred = exact.clone();
+        inferred.rank = 1;
+        let hits = [inferred, magnet, exact];
+        let order = inspection_order(&hits);
+        assert!(std::ptr::eq(order[0], &hits[2]));
+        assert!(std::ptr::eq(order[1], &hits[1]));
+        assert!(std::ptr::eq(order[2], &hits[0]));
+    }
+
+    #[tokio::test]
+    #[ignore = "measures progressive discovery using live providers for Nevermind"]
+    async fn live_nevermind_first_verified_lossless() {
+        let tracks = [
+            "Smells Like Teen Spirit", "In Bloom", "Come As You Are", "Breed", "Lithium",
+            "Polly", "Territorial Pissings", "Drain You", "Lounge Act", "Stay Away",
+            "On a Plain", "Something in the Way / Endless, Nameless",
+        ];
+        let expected: Vec<_> = tracks.iter().enumerate().map(|(index, title)| ExpectedTrackInput {
+            index,
+            title: (*title).into(),
+            artist: Some("Nirvana".into()),
+            disc_number: Some(1),
+            track_number: Some(index as u32 + 1),
+            duration_ms: None,
+        }).collect();
+        let started = std::time::Instant::now();
+        let first = std::sync::OnceLock::new();
+        let (resolutions, unavailable) = resolve_album_torrents("Nirvana", "Nevermind", &expected, |event| {
+            if let TorrentResolveEvent::Verified { resolutions } = event {
+                if let Some(release) = resolutions.iter().find(|r| r.tier == AudioQualityTier::Lossless && r.matched_count > 0) {
+                    first.get_or_init(|| (started.elapsed(), release.matched_count));
+                }
+            }
+        }).await.unwrap();
+        println!("Nevermind: first verified FLAC={:?}, completed={:?}, unavailable={unavailable:?}", first.get(), started.elapsed());
+        assert!(first.get().is_some(), "no verified FLAC was published during discovery");
+        assert!(resolutions.iter().any(|r| r.tier == AudioQualityTier::Lossless && r.matched_count > 0));
     }
 
     #[test]

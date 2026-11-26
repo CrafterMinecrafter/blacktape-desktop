@@ -115,14 +115,14 @@ const AlbumPreview = () => {
   const torrentDiscovery = useTorrentDiscovery(preview?.url, torrentScope);
   const sourceOptions = useMemo(() => albumSourceOptions(preview?.tracks ?? []), [preview?.tracks]);
   useEffect(() => {
-    if (!preview || resolvingCandidates || torrentDiscovery.phase !== "done") return;
+    if (!preview || !torrentDiscovery.resolutions?.length) return;
     const tracks = mergeTorrentResolutionsIntoTracks(preview.tracks, torrentDiscovery.resolutions);
     if (tracks.every((track, index) => track === preview.tracks[index])) return;
     useAlbumPreviewStore.setState((state) => {
       if (state.preview !== preview) return state;
       return { preview: { ...preview, tracks } };
     });
-  }, [preview, resolvingCandidates, torrentDiscovery]);
+  }, [preview, torrentDiscovery]);
 
   useEffect(() => {
     setEditionsOpen(false);

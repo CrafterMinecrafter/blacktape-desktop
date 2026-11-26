@@ -346,8 +346,16 @@ async fn transfer_attempt(
     if is_task_cancelled(app, task_id).await {
         return Err("Task cancelled".to_string().into());
     }
-    // Validate scheme before handing locator to librqbit.
-    super::inspect::normalize_locator_for_download(locator)?;
+    let rutracker_bytes = if let Some(topic) = super::rutracker::topic(locator) {
+        let app = app.ok_or("RuTracker browser session is unavailable.".to_string())?;
+        let expected = requests.first().and_then(|request| request.track.torrent_target.as_ref())
+            .ok_or("RuTracker track has no verified torrent metadata.".to_string())?;
+        Some(super::rutracker::torrent(app, topic, Some(&expected.info_hash)).await?.1)
+    } else {
+        // Validate scheme before handing locator to librqbit.
+        super::inspect::normalize_locator_for_download(locator)?;
+        None
+    };
 
     let temp_root = library_dir.join(".temp");
     let _ = tokio::fs::create_dir_all(&temp_root).await;
@@ -364,7 +372,15 @@ async fn transfer_attempt(
     only_files.sort_unstable();
     only_files.dedup();
 
-    let added = if trackers_only {
+    let added = if let Some(bytes) = rutracker_bytes {
+        match get_or_init_session(cache_root.join("rutracker"), true).await {
+            Ok(session) => try_add_torrent(
+                app, task_id, &session, AddTorrent::from_bytes(bytes), &only_files, &job_dir,
+                total_task_tracks, "Connecting to RuTracker peers",
+            ).await.map(|handle| (session, handle)),
+            Err(error) => Err(error),
+        }
+    } else if trackers_only {
         emit_task_progress(
             app, task_id, completed_counter.load(Ordering::SeqCst), total_task_tracks,
             "Retrying torrent via trackers…",

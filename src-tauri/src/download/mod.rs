@@ -14,6 +14,7 @@ pub mod tools;
 pub mod track;
 pub mod types;
 pub mod youtube;
+mod youtube_sign_in;
 pub mod ytdlp;
 
 pub use queue::{

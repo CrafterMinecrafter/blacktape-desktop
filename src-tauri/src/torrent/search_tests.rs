@@ -4,6 +4,158 @@ use serde_json::json;
 const HASH: &str = "1111111111111111111111111111111111111111";
 const OTHER_HASH: &str = "2222222222222222222222222222222222222222";
 
+#[tokio::test]
+#[ignore = "live RuTor search and metadata; upstream releases can change"]
+async fn live_rutor_search_and_inspection() {
+    for (artist, title, tracks) in [
+        ("Aphex Twin", "Syro", 12),
+        ("The Doors", "The Soft Parade", 25),
+        ("glass beach", "plastic death", 13),
+    ] {
+        let report = search_for_release(artist, title, true, &[Provider::Rutor], |_| {}).await.unwrap();
+        assert!(report.providers[0].error.is_none(), "{title}: {:?}", report.providers[0].error);
+        let candidate = report.hits.iter().find(|hit| hit.title.to_ascii_lowercase().contains("flac"))
+            .unwrap_or_else(|| panic!("{title}: no FLAC candidate"));
+        let release = crate::torrent::inspect::inspect(&candidate.input).await.unwrap();
+        assert_eq!(release.tracks.iter().filter(|track| track.codec == "FLAC" && !track.is_sample).count(), tracks, "{title}");
+        println!("{title}: verified {tracks} FLAC tracks");
+    }
+}
+
+#[test]
+fn rutracker_matches_genre_prefixed_releases_and_rejects_wrong_artists_and_urls() {
+    let rows = serde_json::from_value(json!([
+        {"title":"(Alternative Rock) [FLAC] Radiohead - OK Computer (1997)", "link":"dl.php?t=42", "seeders":8},
+        {"title":"Radiohead - OK Computer [FLAC]", "link":"//evil.test/forum/dl.php?t=43", "seeders":9},
+        {"title":"Different Artist - OK Computer [FLAC]", "link":"dl.php?t=44", "seeders":9}
+    ])).unwrap();
+    let hits = rutracker_hits(&Query::new("Radiohead", "OK Computer").unwrap(), rows);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].input, "rutracker:42");
+    assert_eq!(hits[0].seeders, Some(8));
+    assert_eq!(hits[0].info_hash, None);
+}
+
+#[tokio::test]
+#[ignore = "live SolidTorrents benchmark; swarm availability changes"]
+async fn live_solid_torrents_benchmark() {
+    use librqbit::{AddTorrent, AddTorrentOptions, Session, SessionOptions};
+
+    let directory = tempfile::tempdir().unwrap();
+    let session = Session::new_with_opts(
+        directory.path().to_path_buf(),
+        SessionOptions {
+            disable_dht_persistence: true,
+            disable_upload: true,
+            ..Default::default()
+        },
+    ).await.unwrap();
+    let mut jobs = JoinSet::new();
+    for (artist, title, hash) in [
+        ("Chris Christodoulou", "DEADBOLT", "5EBF808DA59CFAF0DCFEF42558F47E6EB831BA33"),
+        ("glass beach", "plastic death", "A5D12F556A8BE0CDD0F7645D27E4ACF6EB8D20CC"),
+        ("glass beach", "the first glass beach album", "763A9989CF157EB2F2B91FA4BBBEB3878A91F346"),
+        ("Car Seat Headrest", "Making a Door Less Open", "BCB814A0DB7679961B864487E02DDD8BB4EE8765"),
+        ("Car Seat Headrest", "Teens of Denial", "33A692A223C084B317A461EE9D6FEE97E843C3D2"),
+    ] {
+        let session = session.clone();
+        jobs.spawn(async move {
+            let baseline = search_for_release(artist, title, true, &[Provider::Archive, Provider::Knaben, Provider::ApiBay], |_| {}).await.unwrap();
+            println!("{title}: baseline duplicate={}, baseline hits={}, errors={:?}",
+                baseline.hits.iter().any(|hit| hit.info_hash.as_ref().is_some_and(|id| id.eq_ignore_ascii_case(hash))),
+                baseline.hits.len(), baseline.providers.iter().filter_map(|p| p.error.as_ref()).collect::<Vec<_>>());
+            let solid = search_for_release(artist, title, true, &[Provider::SolidTorrents], |_| {}).await.unwrap();
+            assert!(solid.providers[0].error.is_none(), "{title}: {:?}", solid.providers[0].error);
+            let Some(hit) = solid.hits.iter().find(|hit| hit.info_hash.as_ref().is_some_and(|id| id.eq_ignore_ascii_case(hash))) else {
+                println!("{title}: previous candidate was absent from the live results");
+                return;
+            };
+            let uri = &hit.input;
+            let release = match crate::torrent::inspect::inspect(uri).await {
+                Ok(release) => release,
+                Err(error) => {
+                    println!("{title}: inspection failed: {error}");
+                    return;
+                }
+            };
+            let flac = release.tracks.iter().filter(|track| track.codec == "FLAC" && !track.is_sample).collect::<Vec<_>>();
+            println!("{title}: Blacktape metadata confirms {} FLAC tracks", flac.len());
+            let Some(track) = flac.iter().min_by_key(|track| track.size_bytes) else { return; };
+            let source = crate::torrent::inspect::cached_torrent_bytes(uri)
+                .map(AddTorrent::from_bytes)
+                .unwrap_or_else(|| AddTorrent::from_url(uri.as_str()));
+            let transfer = tokio::time::timeout(Duration::from_secs(30), async {
+                let handle = session.add_torrent(source, Some(AddTorrentOptions {
+                    only_files: Some(vec![track.file_index]),
+                    ..Default::default()
+                })).await.map_err(|error| error.to_string())?.into_handle().ok_or("Missing torrent handle".to_string())?;
+                loop {
+                    let stats = handle.stats();
+                    if stats.progress_bytes > 0 {
+                        return Ok::<_, String>(stats.progress_bytes);
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }).await;
+            println!("{title}: transfer={transfer:?}");
+        });
+    }
+    while let Some(result) = jobs.join_next().await {
+        result.unwrap();
+    }
+    session.stop().await;
+}
+
+#[test]
+fn solid_torrents_search_keeps_misclassified_audio_but_rejects_video_and_bad_hashes() {
+    let query = Query::new("A+B", "One & Two").unwrap();
+    let client = Client::new();
+    let request = providers::solid_torrents::request(&client, &query, false).build().unwrap();
+    assert_eq!(request.url().host_str(), Some("solidtorrents.eu"));
+    let parameters: BTreeMap<_, _> = request.url().query_pairs().into_owned().collect();
+    assert_eq!(parameters.get("q").map(String::as_str), Some("A+B One & Two"));
+    assert_eq!(parameters.get("limit").map(String::as_str), Some("30"));
+    assert!(!parameters.contains_key("category"));
+
+    let rows = json!({"success": true, "results": [
+        {"title": "A+B - One & Two [FLAC]", "infohash": HASH, "category": 1, "subCategory": 3,
+         "seeders": 4, "size": 123, "magnetUri": "magnet:?tr=http://127.0.0.1"},
+        {"title": "A+B - One & Two [MP3]", "infohash": OTHER_HASH, "category": 7, "subCategory": 1},
+        {"title": "A+B - One & Two", "infohash": "3333333333333333333333333333333333333333", "category": 7, "subCategory": 4},
+        {"title": "A+B - One & Two", "infohash": "4444444444444444444444444444444444444444", "category": 2},
+        {"title": "Different Artist - One & Two", "infohash": "5555555555555555555555555555555555555555", "category": 7},
+        {"title": "A+B - One & Two", "infohash": "invalid", "category": 7},
+    ]});
+    let hits = providers::solid_torrents::parse(&rows, &query).unwrap();
+    assert_eq!(hits.len(), 2);
+    let flac = hits.iter().find(|hit| hit.info_hash.as_deref() == Some(HASH)).unwrap();
+    assert_eq!(flac.provider, "SolidTorrents");
+    assert_eq!(flac.seeders, Some(4));
+    assert_eq!(flac.size_bytes, Some(123));
+    assert_eq!(flac.input, format!("magnet:?xt=urn:btih:{HASH}"));
+}
+
+#[test]
+fn solid_torrents_distinguishes_empty_queries_from_upstream_errors() {
+    let query = Query::new("Artist", "Album").unwrap();
+    let parse = |root| providers::solid_torrents::parse(&root, &query);
+    assert!(parse(json!({"success": true, "results": []})).unwrap().is_empty());
+    assert!(matches!(parse(json!({"success": false, "results": []})), Err(ProviderError::Unavailable)));
+    for root in [json!({"success": true}), json!({"success": true, "results": [{}]}), json!({"results": []})] {
+        assert!(matches!(parse(root), Err(ProviderError::Malformed)));
+    }
+}
+
+#[tokio::test]
+#[ignore = "live indexer connection checks"]
+async fn live_indexer_settings_connection_checks() {
+    for id in Provider::ALL {
+        let result = test_provider(id, None).await.unwrap();
+        assert_eq!(result.provider, id.name());
+        println!("{}: {} sample results, {:?}", result.provider, result.hits.len(), result.error);
+    }
+}
+
 #[test]
 fn structured_identity_distinguishes_numeric_titles_artists_and_versions() {
     for (artist, title, candidate, matches) in [
@@ -282,8 +434,10 @@ async fn live_release_label_and_tracklist_coverage() {
             TorrentResolveEvent::InspectionProgress { checked, total } => Some((*checked, *total)),
             _ => None,
         }).collect();
-        if let Some(&(_, total)) = checked.first() {
-            assert_eq!(checked, (0..=total).map(|n| (n, total)).collect::<Vec<_>>());
+        if let Some(&(completed, total)) = checked.last() {
+            assert_eq!(completed, total);
+            assert!(checked.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+            assert!(checked.iter().all(|(checked, total)| checked <= total));
         }
     }
 }

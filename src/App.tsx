@@ -18,6 +18,7 @@ import Trash from "@/pages/trash/Trash.tsx";
 import Favorites from "@/pages/favorites/Favorites.tsx";
 import AlbumPreview from "@/pages/album-preview/AlbumPreview.tsx";
 import { SetupBanner } from "@/features/downloader-setup";
+import { YouTubeDownloadSignIn } from "@/features/accounts/ui/YouTubeDownloadSignIn.tsx";
 import { RemoteTrackMenuHost } from "@/features/remote-track-menu/ui/RemoteTrackMenuHost.tsx";
 import { useModalStore } from "@/shared/store/modalStore.ts";
 import { WelcomeModal } from "@/features/onboarding";
@@ -121,6 +122,7 @@ function PlayerView() {
       {activeView === "FAVORITES" && <Favorites />}
     </MainLayout>
     <RemoteTrackMenuHost />
+    <YouTubeDownloadSignIn />
     </>
   );
 }

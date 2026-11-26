@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   cancelTorrentInspection,
   resolveTorrentAlbum,
@@ -16,8 +17,8 @@ export interface TorrentScope {
 type DiscoveryProgress = { stage: "indexes" | "releases"; checked: number; total: number };
 
 export type TorrentDiscovery =
-  | { phase: "idle" | "searching"; progress?: DiscoveryProgress }
-  | { phase: "estimated"; estimates: TorrentTierEstimate[]; progress?: DiscoveryProgress }
+  | { phase: "idle" | "searching"; progress?: DiscoveryProgress; resolutions?: TorrentTierResolution[] }
+  | { phase: "estimated"; estimates: TorrentTierEstimate[]; progress?: DiscoveryProgress; resolutions?: TorrentTierResolution[] }
   | { phase: "done"; resolutions: TorrentTierResolution[]; unavailableProviders?: string[]; failed?: boolean };
 
 type Listener = (value: TorrentDiscovery) => void;
@@ -32,6 +33,22 @@ const idle: TorrentDiscovery = { phase: "idle" };
 const searching: TorrentDiscovery = { phase: "searching" };
 const entries = new Map<string, Entry>();
 const CACHE_MS = 5 * 60_000;
+let indexerRevision = 0;
+const indexerListeners = new Set<() => void>();
+
+function subscribeIndexerChanges(listener: () => void) {
+  indexerListeners.add(listener);
+  return () => { indexerListeners.delete(listener); };
+}
+
+const getIndexerRevision = () => indexerRevision;
+
+if (typeof window !== "undefined") {
+  void listen("torrent-indexers-changed", () => {
+    indexerRevision += 1;
+    indexerListeners.forEach((listener) => listener());
+  }).catch(() => {});
+}
 
 export function subscribeTorrentDiscovery(key: string, scope: TorrentScope, listener: Listener) {
   let entry = entries.get(key);
@@ -66,12 +83,22 @@ export function subscribeTorrentDiscovery(key: string, scope: TorrentScope, list
           },
         });
       }
-      if (event.kind === "estimated") publish({ phase: "estimated", estimates: event.estimates, progress: created.value.progress });
+      if (event.kind === "estimated") {
+        publish({ ...created.value, phase: "estimated", estimates: event.estimates });
+      }
+      if (event.kind === "verified") {
+        const keyOf = (release: TorrentTierResolution) => `${release.tier}:${release.info_hash}`;
+        const resolutions = new Map(event.resolutions.map((release) => [keyOf(release), release]));
+        for (const release of created.value.resolutions ?? []) {
+          if (!resolutions.has(keyOf(release))) resolutions.set(keyOf(release), release);
+        }
+        publish({ ...created.value, resolutions: [...resolutions.values()] });
+      }
       if (event.kind === "resolved") publish({ phase: "done", resolutions: event.resolutions, unavailableProviders: event.unavailable_providers });
     }).then(([resolutions, unavailableProviders]) => {
       if (created.value.phase !== "done") publish({ phase: "done", resolutions, unavailableProviders });
     }).catch(() => {
-      if (created.value.phase !== "done") publish({ phase: "done", resolutions: [], failed: true });
+      if (created.value.phase !== "done") publish({ phase: "done", resolutions: created.value.resolutions ?? [], failed: true });
       if (entries.get(key) === created) entries.delete(key);
     });
   }
@@ -91,7 +118,8 @@ export function subscribeTorrentDiscovery(key: string, scope: TorrentScope, list
 }
 
 export function useTorrentDiscovery(url: string | undefined, scope: TorrentScope | null): TorrentDiscovery {
-  const key = url && scope ? JSON.stringify([url, scope.artist, scope.title, scope.expected.map((track) =>
+  const revision = useSyncExternalStore(subscribeIndexerChanges, getIndexerRevision, getIndexerRevision);
+  const key = url && scope ? JSON.stringify([revision, url, scope.artist, scope.title, scope.expected.map((track) =>
     [track.index, track.title, track.artist, track.disc_number, track.track_number]
   )]) : "";
   const latestScope = useRef(scope);

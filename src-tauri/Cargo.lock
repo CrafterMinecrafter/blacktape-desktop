@@ -695,6 +695,7 @@ dependencies = [
 name = "blacktape-desktop"
 version = "0.7.0"
 dependencies = [
+ "base64 0.22.1",
  "criterion",
  "discord-rich-presence",
  "fastrand 2.3.0",

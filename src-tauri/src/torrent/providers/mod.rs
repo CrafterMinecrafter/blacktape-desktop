@@ -13,27 +13,36 @@ use url::Url;
 pub(super) mod apibay;
 pub(super) mod archive;
 pub(super) mod knaben;
+mod rutor;
+pub(super) mod solid_torrents;
 
 const MAX_ROWS: usize = 30;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const REQUEST_INTERVAL: Duration = Duration::from_millis(475);
 const PROVIDER_BUDGET: Duration = Duration::from_secs(15);
 
-#[derive(Clone, Copy)]
-pub(super) enum Provider {
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Provider {
     Archive,
     Knaben,
     ApiBay,
+    SolidTorrents,
+    Rutor,
+    RuTracker,
 }
 
 impl Provider {
-    pub(super) const ALL: [Self; 3] = [Self::Archive, Self::Knaben, Self::ApiBay];
+    pub(in crate::torrent) const ALL: [Self; 5] = [Self::Archive, Self::Knaben, Self::ApiBay, Self::SolidTorrents, Self::Rutor];
 
-    fn name(self) -> &'static str {
+    pub(in crate::torrent) fn name(self) -> &'static str {
         match self {
             Self::Archive => "Archive.org",
             Self::Knaben => "Knaben",
             Self::ApiBay => "ApiBay",
+            Self::SolidTorrents => "SolidTorrents",
+            Self::Rutor => "RuTor",
+            Self::RuTracker => "RuTracker",
         }
     }
 
@@ -41,30 +50,50 @@ impl Provider {
         static ARCHIVE: Gate = Gate::new();
         static KNABEN: Gate = Gate::new();
         static APIBAY: Gate = Gate::new();
+        static SOLID_TORRENTS: Gate = Gate::new();
+        static RUTOR: Gate = Gate::new();
 
         let gate = match self {
             Self::Archive => &ARCHIVE,
             Self::Knaben => &KNABEN,
             Self::ApiBay => &APIBAY,
+            Self::SolidTorrents => &SOLID_TORRENTS,
+            Self::Rutor => &RUTOR,
+            Self::RuTracker => return ProviderReport::from_hits(self.name().into(), Vec::new())
+                .with_error(ProviderError::Unavailable),
         };
         let deadline = Instant::now() + PROVIDER_BUDGET;
         let request = |title_only| match self {
             Self::Archive => archive::search_request(client, query, title_only),
             Self::Knaben => knaben::request(client, query, title_only),
             Self::ApiBay => apibay::request(client, query, title_only),
+            Self::SolidTorrents => solid_torrents::request(client, query, title_only),
+            Self::Rutor => rutor::request(client, query, title_only),
+            Self::RuTracker => unreachable!("RuTracker uses the signed-in browser"),
         };
         let parse = |root| match self {
             Self::Archive => archive::parse_search(&root, query),
             Self::Knaben => knaben::parse(&root, query),
             Self::ApiBay => apibay::parse(&root, query),
+            Self::SolidTorrents => solid_torrents::parse(&root, query),
+            Self::Rutor => unreachable!("RuTor returns HTML"),
+            Self::RuTracker => unreachable!("RuTracker uses the signed-in browser"),
         };
-        let first = gate.json(request(false), deadline).await.and_then(parse);
+        let fetch = |title_only| async move {
+            if self == Self::Rutor {
+                let bytes = gate.body(request(title_only), deadline).await?;
+                let html = std::str::from_utf8(&bytes).map_err(|_| ProviderError::Malformed)?;
+                return rutor::parse(html, query);
+            }
+            gate.json(request(title_only), deadline).await.and_then(parse)
+        };
+        let first = fetch(false).await;
         let (mut hits, mut error) = match first {
             Ok(hits) => (hits, None),
             Err(error) => (Vec::new(), Some(error)),
         };
         if should_search_title_only(query, &hits, error) {
-            match gate.json(request(true), deadline).await.and_then(parse) {
+            match fetch(true).await {
                 Ok(additional) => {
                     hits.extend(additional);
                     hits = merge_hits(hits);
@@ -103,6 +132,15 @@ impl Gate {
         request: RequestBuilder,
         deadline: Instant,
     ) -> Result<Value, ProviderError> {
+        let body = self.body(request, deadline).await?;
+        serde_json::from_slice(&body).map_err(|_| ProviderError::Malformed)
+    }
+
+    async fn body(
+        &self,
+        request: RequestBuilder,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, ProviderError> {
         let mut slot = timeout_at(deadline, self.0.lock())
             .await
             .map_err(|_| ProviderError::Timeout)?;
@@ -124,7 +162,7 @@ impl Gate {
                 .map_err(|_| ProviderError::Timeout)?
                 .map_err(transport_error)?;
             if response.status().is_success() {
-                return timeout_at(deadline, bounded_json(response))
+                return timeout_at(deadline, bounded_body(response))
                     .await
                     .map_err(|_| ProviderError::Timeout)?;
             }
@@ -176,7 +214,7 @@ fn transport_error(error: reqwest::Error) -> ProviderError {
     }
 }
 
-async fn bounded_json(mut response: reqwest::Response) -> Result<Value, ProviderError> {
+async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>, ProviderError> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
@@ -190,7 +228,7 @@ async fn bounded_json(mut response: reqwest::Response) -> Result<Value, Provider
         }
         body.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&body).map_err(|_| ProviderError::Malformed)
+    Ok(body)
 }
 
 fn count(value: Option<&Value>) -> Option<u64> {

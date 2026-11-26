@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { TorrentResolveEvent } from "@/shared/lib/audio.ts";
+import type { TorrentResolveEvent, TorrentTierResolution } from "@/shared/lib/audio.ts";
 import { subscribeTorrentDiscovery } from "@/features/download-quality/lib/useTorrentDiscovery.ts";
 
 const bridge = vi.hoisted(() => ({
@@ -61,6 +61,36 @@ describe("torrent discovery subscriptions", () => {
     expect(second).toHaveBeenLastCalledWith({ phase: "searching" });
     stop();
     await Promise.resolve();
+  });
+
+  it("publishes verified options during inspection and retains them as more sources arrive", () => {
+    const listener = vi.fn();
+    const stop = subscribeTorrentDiscovery("verified-while-inspecting", scope, listener);
+    const emit = bridge.resolve.mock.calls[0][4] as (event: TorrentResolveEvent) => void;
+    const flac: TorrentTierResolution = {
+      tier: "lossless", info_hash: "flac-hash", magnet_uri: "magnet:?xt=urn:btih:flac-hash",
+      release_title: "Aphex Twin - Syro", provider: "RuTor", seeders: 3,
+      codec: "FLAC", bitrate_kbps: null, display_label: "FLAC",
+      matched_count: 1, total_expected: 1, total_matched_bytes: 20_000_000,
+      missing_titles: [], ambiguous_titles: [], layout_warning: null, tracks: [],
+    };
+    const mp3: TorrentTierResolution = { ...flac, tier: "high_lossy", info_hash: "mp3-hash", codec: "MP3" };
+    emit({ kind: "inspection_progress", checked: 1, total: 4 });
+    emit({ kind: "verified", resolutions: [flac] });
+    expect(listener).toHaveBeenLastCalledWith({
+      phase: "searching", resolutions: [flac], progress: { stage: "releases", checked: 1, total: 4 },
+    });
+    emit({ kind: "estimated", estimates: [] });
+    emit({ kind: "verified", resolutions: [mp3] });
+    expect(listener).toHaveBeenLastCalledWith({
+      phase: "estimated", estimates: [], resolutions: [mp3, flac],
+      progress: { stage: "releases", checked: 1, total: 4 },
+    });
+    emit({ kind: "resolved", resolutions: [flac, mp3], unavailable_providers: [] });
+    expect(listener).toHaveBeenLastCalledWith({
+      phase: "done", resolutions: [flac, mp3], unavailableProviders: [],
+    });
+    stop();
   });
 
   it("keeps the request during a same-turn effect remount", async () => {

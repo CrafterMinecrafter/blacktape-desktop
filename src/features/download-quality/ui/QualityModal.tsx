@@ -42,6 +42,14 @@ interface QualityModalProps extends QualityMenuOptions {
 const isAlbumDownload = (params: StartDownloadParams) =>
   params.downloadType === ItemType.Album || String(params.downloadType).toLowerCase() === "album";
 
+export function submitQualityDownload(params: StartDownloadParams, { start, onStarted }: QualityMenuOptions) {
+  // Album Preview may open a confirmation before starting the download.
+  useModalStore.getState().closeModal();
+  if (start) start(params.format, params.overrides);
+  else void useLibraryStore.getState().startDownload(params);
+  onStarted?.();
+}
+
 /**
  * Asks yt-dlp which audio formats the track (or the album's first track) has and downloads in the one the user
  * picks. The probe takes a few seconds; the text says so. When it fails the download still runs in the best
@@ -51,7 +59,6 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
   const closeModal = useModalStore((s) => s.closeModal);
   const goBack = useModalStore((s) => s.goBack);
   const canGoBack = useModalStore((s) => s.stack.length > 0);
-  const startDownload = useLibraryStore((s) => s.startDownload);
   const [formats, setFormats] = useState<AudioFormat[] | null>(null);
   const [resolvedUpgradeTracks, setResolvedUpgradeTracks] = useState<AlbumTrackInfo[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -147,8 +154,12 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
 
   const torrentDiscovery = useTorrentDiscovery(params.url, torrentScope);
   const torrentPhase = torrentDiscovery.phase;
-  const torrentEstimates = torrentPhase === "estimated" ? torrentDiscovery.estimates : [];
-  const torrentResolutions = torrentPhase === "done" ? torrentDiscovery.resolutions : [];
+  const torrentResolutions = torrentDiscovery.resolutions ?? [];
+  const torrentEstimates = torrentPhase === "estimated"
+    ? torrentDiscovery.estimates.filter((estimate) =>
+        !torrentResolutions.some((release) => release.tier === estimate.tier && release.matched_count > 0),
+      )
+    : [];
 
   const canonicalPlan = useMemo(() => {
     if (!isMultiSource) return null;
@@ -270,19 +281,14 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
       }
     }
 
-    if (start) {
-      if (torrentResolutions.length > 0) {
-        useAlbumPreviewStore.setState((state) => {
-          if (!state.preview || state.preview.url !== params.url) return state;
-          const tracks = mergeTorrentResolutionsIntoTracks(state.preview.tracks, torrentResolutions);
-          return { preview: { ...state.preview, tracks } };
-        });
-      }
-      start(format, overrides);
+    if (start && torrentResolutions.length > 0) {
+      useAlbumPreviewStore.setState((state) => {
+        if (!state.preview || state.preview.url !== params.url) return state;
+        const tracks = mergeTorrentResolutionsIntoTracks(state.preview.tracks, torrentResolutions);
+        return { preview: { ...state.preview, tracks } };
+      });
     }
-    else void startDownload({ ...params, format, overrides });
-    onStarted?.();
-    closeModal();
+    submitQualityDownload({ ...params, format, overrides }, { start, onStarted });
   };
 
   const onlyLossy = formats !== null && formats.length > 0 && !formats.some((f) => f.lossless);
@@ -295,7 +301,7 @@ const QualityModal = ({ params, onStarted, start }: QualityModalProps) => {
         <span className={styles.optionText}>
           <span className={styles.optionLabel}>
             <PlatformBadge platform="torrent" />
-            <span>Lossless / MP3 320 kbps</span>
+            <span>{torrentResolutions.length > 0 ? "Checking more releases…" : "Lossless / MP3 320 kbps"}</span>
           </span>
           <span className={styles.muted}>{torrentPhase === "searching" ? "Searching torrent sources…" : "Matching torrent files…"}</span>
         </span>

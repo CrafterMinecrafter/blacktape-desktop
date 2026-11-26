@@ -259,6 +259,17 @@ async fn check_youtube(app: &AppHandle) -> AccountStatus {
     }
 }
 
+pub(crate) async fn youtube_download_session_ready(app: &AppHandle) -> Result<bool, String> {
+    let auth_lock = app.state::<AuthLock>();
+    let _guard = auth_lock.0.lock().await;
+    let status = check_youtube(app).await;
+    match status.state {
+        AccountState::Connected => Ok(true),
+        AccountState::Disconnected => Ok(false),
+        AccountState::Error => Err(status.message.unwrap_or_else(|| "Could not check the YouTube account.".into())),
+    }
+}
+
 /// Removes the Google session from the login profile (only in this app; the Google account itself stays signed in
 /// elsewhere).
 async fn clear_youtube_profile(app: &AppHandle) -> Result<(), String> {

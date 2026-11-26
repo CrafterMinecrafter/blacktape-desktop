@@ -88,6 +88,27 @@ const resolvedCandidatesByUrl = new Map<
   { tracks: Record<number, AlbumTrackInfo>; total_duration_ms: number | null; done: boolean }
 >();
 
+function hasNonTorrentCandidates(track: AlbumTrackInfo): boolean {
+  return track.candidates?.some((candidate) => candidate.source.kind !== "torrent") ?? false;
+}
+
+function withResolvedCandidates(
+  track: AlbumTrackInfo,
+  candidates: NonNullable<AlbumTrackInfo["candidates"]>,
+  selectedIndex: number,
+) {
+  const resolved = candidates.filter((candidate) => candidate.source.kind !== "torrent");
+  const torrents = track.candidates?.filter((candidate) => candidate.source.kind === "torrent") ?? [];
+  const selected = track.candidates?.[track.selected_candidate_idx ?? 0];
+  const retainedIndex = selected ? torrents.indexOf(selected) : -1;
+  return {
+    candidates: [...resolved, ...torrents],
+    selected_candidate_idx: retainedIndex < 0
+      ? Math.max(0, resolved.indexOf(candidates[selectedIndex]))
+      : resolved.length + retainedIndex,
+  };
+}
+
 function mergeTracksFromCache(preview: AlbumPreview): { preview: AlbumPreview; cacheDone: boolean } {
   const cached = resolvedCandidatesByUrl.get(preview.url);
   if (!cached) return { preview, cacheDone: false };
@@ -95,15 +116,15 @@ function mergeTracksFromCache(preview: AlbumPreview): { preview: AlbumPreview; c
   const tracks = preview.tracks.map((tr) => {
     const ct = cached.tracks[tr.index];
     if (!ct) return tr;
-    const hasFreshCands = ct.candidates && ct.candidates.length > 0;
-    const trMissingCands = !tr.candidates || tr.candidates.length === 0;
+    const hasFreshCands = hasNonTorrentCandidates(ct);
+    const trMissingCands = !hasNonTorrentCandidates(tr);
     if (!hasFreshCands && tr.duration_ms === ct.duration_ms) return tr;
     changed = true;
     return {
       ...tr,
-      candidates: trMissingCands && hasFreshCands ? ct.candidates : tr.candidates,
-      selected_candidate_idx:
-        trMissingCands && hasFreshCands ? ct.selected_candidate_idx : tr.selected_candidate_idx,
+      ...(trMissingCands && hasFreshCands && ct.candidates
+        ? withResolvedCandidates(tr, ct.candidates, ct.selected_candidate_idx ?? 0)
+        : {}),
       url: trMissingCands && hasFreshCands ? ct.url || tr.url : tr.url,
       duration_ms: tr.duration_ms && tr.duration_ms > 0 ? tr.duration_ms : ct.duration_ms,
     };
@@ -516,14 +537,14 @@ export const useAlbumPreviewStore = create<AlbumPreviewStore>((set, get) => ({
         const mergedTracks = cur.preview.tracks.map((tr, idx) => {
           const ft = fresh.tracks.find((x) => x.index === tr.index) ?? fresh.tracks[idx];
           if (!ft) return tr;
-          const trMissingCands = !tr.candidates || tr.candidates.length === 0;
-          const freshHasCands = ft.candidates && ft.candidates.length > 0;
+          const trMissingCands = !hasNonTorrentCandidates(tr);
+          const freshHasCands = hasNonTorrentCandidates(ft);
           if (!trMissingCands && (tr.duration_ms ?? 0) > 0) return tr;
           return {
             ...tr,
-            candidates: trMissingCands && freshHasCands ? ft.candidates : tr.candidates,
-            selected_candidate_idx:
-              trMissingCands && freshHasCands ? ft.selected_candidate_idx ?? 0 : tr.selected_candidate_idx,
+            ...(trMissingCands && freshHasCands && ft.candidates
+              ? withResolvedCandidates(tr, ft.candidates, ft.selected_candidate_idx ?? 0)
+              : {}),
             url: trMissingCands && freshHasCands ? ft.url || tr.url : tr.url,
             duration_ms: tr.duration_ms && tr.duration_ms > 0 ? tr.duration_ms : ft.duration_ms,
           };
@@ -541,7 +562,7 @@ export const useAlbumPreviewStore = create<AlbumPreviewStore>((set, get) => ({
         const doneNow =
           Boolean(fresh.candidates_resolved) ||
           Boolean(resolvedCandidatesByUrl.get(targetUrl)?.done) ||
-          !updatedPreview.tracks.some((t) => t.available && (!t.candidates || t.candidates.length === 0));
+          !updatedPreview.tracks.some((t) => t.available && !hasNonTorrentCandidates(t));
         if (doneNow) {
           const entry = resolvedCandidatesByUrl.get(targetUrl) ?? {
             tracks: {},
@@ -590,8 +611,7 @@ function applyCandidateEventToPreview(
 
   const updatedTrack: AlbumTrackInfo = {
     ...t,
-    candidates: payload.candidates,
-    selected_candidate_idx: payload.selected_candidate_idx,
+    ...withResolvedCandidates(t, payload.candidates, payload.selected_candidate_idx),
     duration_ms: nextDurationMs,
     url:
       bestCandidate && bestCandidate.source.kind === "http_stream"
@@ -609,7 +629,7 @@ function applyCandidateEventToPreview(
     total_duration_ms: totalSum > 0 ? totalSum : preview.total_duration_ms,
   };
   const resolvingCandidates = nextPreview.tracks.some(
-    (tr) => tr.available && (!tr.candidates || tr.candidates.length === 0),
+    (tr) => tr.available && !hasNonTorrentCandidates(tr),
   );
   return { nextPreview, resolvingCandidates, updatedTrack };
 }

@@ -616,6 +616,35 @@ describe("download formats", () => {
     expect(store().resolvingCandidates).toBe(false);
   });
 
+  it("keeps the selected torrent when streaming results arrive after restore", async () => {
+    const torrent: NonNullable<AlbumTrackInfo["candidates"]>[number] = {
+      source: {
+        kind: "torrent", info_hash: "test-hash", magnet_uri: "magnet:?xt=urn:btih:test-hash",
+        file_index: 0, file_path: "01 Track One.flac", file_size: 20_000_000, seeders: 3,
+      },
+      quality_tier: "lossless", codec: "FLAC", duration_ms: 180_000,
+      match_confidence: 1, is_strict_match: true, display_label: "Torrent FLAC",
+    };
+    const stream: typeof torrent = {
+      ...torrent, source: { kind: "http_stream", platform: "youtube", url: "https://yt/1" },
+      quality_tier: "high_lossy", codec: "Opus", display_label: "YT · Opus",
+    };
+    const preview: AlbumPreview = {
+      ...makePreview(), url: "canonical:album:progressive-torrent",
+      metadata_source: "musicbrainz", candidates_resolved: false,
+      tracks: [track(0, { candidates: [torrent], selected_candidate_idx: 0 })],
+    };
+    useAlbumPreviewStore.setState({ status: "ready", preview, resolvingCandidates: true });
+    getAlbumPreviewMock.mockResolvedValueOnce({
+      ...preview, candidates_resolved: true, tracks: [track(0, { candidates: [stream] })],
+    });
+    await store().resumeAfterRestore();
+    expect(store().preview?.tracks[0]).toMatchObject({
+      candidates: [stream, torrent], selected_candidate_idx: 1,
+    });
+    expect(store().resolvingCandidates).toBe(false);
+  });
+
   it("resumeAfterRestore clears resolvingCandidates and fetches missing editions when cache finished while away", async () => {
     const freshWithCandidates = {
       ...makePreview(),

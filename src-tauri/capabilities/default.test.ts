@@ -13,13 +13,26 @@ describe("Tauri default capabilities", () => {
 });
 
 describe("torrent capability", () => {
-  it("grants the main window only the metadata commands used by the frontend bridge", () => {
+  it("separates main-window discovery from Settings-only indexer management", () => {
     const capability = JSON.parse(fs.readFileSync(path.resolve(__dirname, "torrent.json"), "utf8"));
+    const settings = JSON.parse(fs.readFileSync(path.resolve(__dirname, "torrent-settings.json"), "utf8"));
     const bridge = fs.readFileSync(path.resolve(__dirname, "../../src/shared/lib/audio.ts"), "utf8");
     const invokes = [...bridge.matchAll(/invoke\("plugin:torrent\|([a-z_]+)"/g)]
       .map(([, command]) => `torrent:allow-${command.replaceAll("_", "-")}`);
     expect(capability.windows).toEqual(["main"]);
-    expect(invokes).toHaveLength(4);
-    expect(capability.permissions).toEqual(invokes);
+    expect(capability.permissions).toEqual([
+      "torrent:allow-search-torrent-releases",
+      "torrent:allow-inspect-torrent-release",
+      "torrent:allow-resolve-torrent-album",
+      "torrent:allow-cancel-torrent-inspection",
+    ]);
+    expect(settings.windows).toEqual(["settings"]);
+    expect(settings.permissions).toEqual([
+      "torrent:allow-list-torrent-indexers",
+      "torrent:allow-set-torrent-indexer-enabled",
+      "torrent:allow-test-torrent-indexer",
+      "torrent:allow-open-rutracker-login",
+    ]);
+    expect([...capability.permissions, ...settings.permissions].sort()).toEqual(invokes.sort());
   });
 });

@@ -631,7 +631,6 @@ async fn download(
     app_handle: AppHandle,
     queue_state: State<'_, DownloadQueue>,
     task_registry: State<'_, TaskRegistry>,
-    auth_lock: State<'_, AuthLock>,
     id: String,
     platform: Platform,
     download_type: DownloadType,
@@ -645,15 +644,6 @@ async fn download(
     overrides: Option<crate::download::types::DownloadOverrides>,
     replace_song_id: Option<i64>,
 ) -> Result<String, String> {
-    if platform == Platform::Youtube {
-        let res = launch_youtube_login(app_handle.clone(), false, auth_lock).await;
-        tracing::debug!("launch_youtube_login res: {res:?}");
-        if res.is_err() {
-            tracing::warn!("YouTube auth window closed or failed");
-            return Err("auth_window_closed".to_string());
-        }
-    }
-
     let (configured_library_dir, db_default_quality) =
         if let Some(db_state) = app_handle.try_state::<tokio::sync::Mutex<Database>>() {
             let db = db_state.lock().await;
@@ -1018,6 +1008,7 @@ fn quits_app(label: &str, event: &tauri::WindowEvent) -> bool {
 pub fn run() {
     telemetry::init_tracing();
     let _sentry_guard = telemetry::init();
+    let context = tauri::generate_context!();
 
     let mut builder = tauri::Builder::default()
         // Must come first: a second start only brings the running window forward. Two instances would both
@@ -1030,9 +1021,12 @@ pub fn run() {
             }
         }));
 
-    // 2. Register the Tauri Sentry bridge if a DSN was compiled in
+    // Register native telemetry and scope the JavaScript bridge to Blacktape pages.
     if let Some(ref client) = _sentry_guard {
-        builder = builder.plugin(tauri_plugin_sentry::init(client));
+        let dev_url = if tauri::is_dev() { context.config().build.dev_url.as_ref() } else { None };
+        builder = builder
+            .plugin(tauri_plugin_sentry::init_with_no_injection(client))
+            .plugin(telemetry::webview_bridge(dev_url));
     }
 
     builder
@@ -1069,6 +1063,10 @@ pub fn run() {
                     torrent::commands::inspect_torrent_release,
                     torrent::commands::resolve_torrent_album,
                     torrent::commands::cancel_torrent_inspection,
+                    torrent::commands::list_torrent_indexers,
+                    torrent::commands::set_torrent_indexer_enabled,
+                    torrent::commands::test_torrent_indexer,
+                    torrent::commands::open_rutracker_login,
                 ])
                 .build(),
         )
@@ -1292,7 +1290,7 @@ pub fn run() {
             get_default_download_quality,
             set_default_download_quality,
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }
 

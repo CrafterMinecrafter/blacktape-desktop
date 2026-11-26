@@ -41,6 +41,28 @@ export interface TorrentSearchReport {
   hits: TorrentReleaseHit[];
 }
 
+export interface TorrentIndexer {
+  id: "archive" | "knaben" | "api_bay" | "solid_torrents" | "rutor" | "ru_tracker";
+  name: string;
+  enabled: boolean;
+}
+
+export interface TorrentIndexerTest {
+  hits: number;
+  error: string | null;
+}
+
+export const listTorrentIndexers = (): Promise<TorrentIndexer[]> =>
+  invoke("plugin:torrent|list_torrent_indexers");
+
+export const setTorrentIndexerEnabled = (id: TorrentIndexer["id"], enabled: boolean): Promise<TorrentIndexer[]> =>
+  invoke("plugin:torrent|set_torrent_indexer_enabled", { id, enabled });
+
+export const testTorrentIndexer = (id: TorrentIndexer["id"]): Promise<TorrentIndexerTest> =>
+  invoke("plugin:torrent|test_torrent_indexer", { id });
+
+export const openRuTrackerLogin = (): Promise<void> => invoke("plugin:torrent|open_rutracker_login");
+
 export interface InspectedTorrentRelease {
   info_hash: string;
   name: string;
@@ -105,6 +127,7 @@ export type TorrentResolveEvent =
   | { kind: "searching" }
   | { kind: "search_progress" | "inspection_progress"; checked: number; total: number }
   | { kind: "estimated"; estimates: TorrentTierEstimate[] }
+  | { kind: "verified"; resolutions: TorrentTierResolution[] }
   | { kind: "resolved"; resolutions: TorrentTierResolution[]; unavailable_providers: string[] };
 
 export const inspectTorrentRelease = (input: string, requestId: string): Promise<InspectedTorrentRelease> =>

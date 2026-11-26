@@ -15,7 +15,7 @@ mod tests;
 
 const MAX_QUERY_FIELD_BYTES: usize = 512;
 const MAX_RESULT_TITLE_BYTES: usize = 1536;
-pub(super) const PROVIDER_COUNT: usize = providers::Provider::ALL.len();
+pub(crate) use providers::Provider;
 
 #[derive(Clone, Serialize)]
 pub struct SearchHit {
@@ -311,7 +311,7 @@ fn sort_hits(hits: &mut [SearchHit]) {
     });
 }
 
-fn merge_hits(mut hits: Vec<SearchHit>) -> Vec<SearchHit> {
+pub(super) fn merge_hits(mut hits: Vec<SearchHit>) -> Vec<SearchHit> {
     sort_hits(&mut hits);
     let mut unique = BTreeMap::<String, SearchHit>::new();
     for hit in hits {
@@ -354,24 +354,18 @@ async fn collect(
     SearchReport { providers, hits }
 }
 
+#[cfg(test)]
 pub async fn search(
     artist: &str,
     title: &str,
     progress: impl Fn(ProviderReport),
 ) -> Result<SearchReport, String> {
-    search_for_release(artist, title, false, progress).await
+    search_for_release(artist, title, false, &Provider::ALL, progress).await
 }
 
-pub(super) async fn search_for_release(
-    artist: &str,
-    title: &str,
-    verify_tracklist: bool,
-    progress: impl Fn(ProviderReport),
-) -> Result<SearchReport, String> {
+fn search_client() -> Result<&'static Client, String> {
     static CLIENT: OnceLock<Result<Client, reqwest::Error>> = OnceLock::new();
-    let mut query = Query::new(artist, title)?;
-    query.verify_tracklist = verify_tracklist;
-    let client = CLIENT
+    CLIENT
         .get_or_init(|| {
             Client::builder()
                 .user_agent(concat!("Blacktape/", env!("CARGO_PKG_VERSION")))
@@ -382,12 +376,100 @@ pub(super) async fn search_for_release(
                 .build()
         })
         .as_ref()
-        .map_err(|_| "Could not initialize torrent search.".to_string())?;
+        .map_err(|_| "Could not initialize torrent search.".to_string())
+}
 
+#[cfg(test)]
+pub(super) async fn search_for_release(
+    artist: &str, title: &str, verify_tracklist: bool, enabled: &[Provider], progress: impl Fn(ProviderReport),
+) -> Result<SearchReport, String> {
+    search_with_app(None, artist, title, verify_tracklist, enabled, progress).await
+}
+
+pub(super) async fn search_with_app(
+    app: Option<&tauri::AppHandle>,
+    artist: &str,
+    title: &str,
+    verify_tracklist: bool,
+    enabled: &[Provider],
+    progress: impl Fn(ProviderReport),
+) -> Result<SearchReport, String> {
+    let mut query = Query::new(artist, title)?;
+    query.verify_tracklist = verify_tracklist;
+    let client = search_client()?;
     let mut jobs = JoinSet::new();
-    for provider in providers::Provider::ALL {
+    for &provider in enabled {
         let query = query.clone();
+        #[cfg(not(test))]
+        if let (Provider::RuTracker, Some(app)) = (provider, app) {
+            let app = app.clone();
+            jobs.spawn(async move { search_rutracker(&app, &query).await });
+            continue;
+        }
+        #[cfg(test)]
+        let _ = app;
         jobs.spawn(async move { provider.search(client, &query).await });
     }
     Ok(collect(jobs, progress).await)
+}
+
+pub(super) async fn test_provider(provider: Provider, app: Option<&tauri::AppHandle>) -> Result<ProviderReport, String> {
+    let query = Query::new("The Beatles", "Abbey Road")?;
+    if let (Provider::RuTracker, Some(app)) = (provider, app) {
+        return Ok(search_rutracker(app, &query).await);
+    }
+    Ok(provider.search(search_client()?, &query).await)
+}
+
+async fn search_rutracker(app: &tauri::AppHandle, query: &Query) -> ProviderReport {
+    use super::rutracker::{self, Failure};
+    let provider = Provider::RuTracker.name().to_owned();
+    let mut report = ProviderReport::from_hits(provider, Vec::new());
+    let rows = match rutracker::search(app, &query.text(false)).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            report.error_kind = Some(match error {
+                Failure::RateLimited => ProviderError::RateLimited,
+                Failure::Timeout => ProviderError::Timeout,
+                Failure::Malformed => ProviderError::Malformed,
+                Failure::ResponseTooLarge => ProviderError::ResponseTooLarge,
+                _ => ProviderError::Unavailable,
+            });
+            report.error = Some(error.message().into());
+            return report;
+        }
+    };
+    report.hits = rutracker_hits(query, rows);
+    report
+}
+
+fn rutracker_hits(query: &Query, rows: Vec<super::rutracker::Row>) -> Vec<SearchHit> {
+    let provider = Provider::RuTracker.name().to_owned();
+    let hits = rows.into_iter().take(100).filter_map(|row| {
+        let topic = super::rutracker::topic_from_link(&row.link)?;
+        let title = clean_field(&row.title, MAX_RESULT_TITLE_BYTES)?;
+        // RuTracker commonly prefixes titles with bracketed format and parenthesized genre tags.
+        let candidate = title.trim_start();
+        let candidate = trim_release_prefixes(candidate);
+        let rank = query.identity(candidate, &[])?;
+        Some(SearchHit {
+            id: format!("rutracker:{topic}"), title, input: format!("rutracker:{topic}"),
+            provider: provider.clone(), providers: vec![provider.clone()], info_hash: None,
+            seeders: row.seeders, size_bytes: None, popularity: None, rank,
+        })
+    }).collect();
+    merge_hits(hits).into_iter().take(30).collect()
+}
+
+fn trim_release_prefixes(mut title: &str) -> &str {
+    while let Some(close) = match title.as_bytes().first() {
+        Some(b'[') => title.find(']'),
+        Some(b'(') => title.find(')'),
+        _ => None,
+    } {
+        let rest = title[close + 1..].trim_start();
+        if rest.is_empty() { break; }
+        title = rest;
+    }
+    title
 }

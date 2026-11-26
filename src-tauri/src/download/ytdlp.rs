@@ -197,13 +197,12 @@ pub async fn execute(app: &AppHandle, args: &[&str]) -> Result<String, String> {
 
 const MAX_CONCURRENT_DOWNLOADS: usize = 4;
 
-#[derive(Clone)]
 struct DownloadContext {
     app: AppHandle,
     task_id: String,
     binary_path: PathBuf,
-    /// The login window's session, if yt-dlp can read it (see `cookies::find`).
-    cookies: crate::download::cookies::CookieSource,
+    /// Only initialized when a track attempt actually uses YouTube.
+    youtube_sign_in: tokio::sync::OnceCell<Result<(), String>>,
     /// Where a run's private copy of a cookie file goes (see `CookieSource::args`).
     cookie_copies: PathBuf,
     /// Format the user picked for this download (see `quality::prefer_format`).
@@ -310,6 +309,17 @@ fn download_site(url: &str) -> DownloadSite {
     }
 }
 
+async fn sign_in_for_url(
+    url: &str,
+    session: &tokio::sync::OnceCell<Result<(), String>>,
+    ensure_session: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<(), String> {
+    if download_site(checked_url(url)?) == DownloadSite::Youtube {
+        session.get_or_init(|| ensure_session).await.clone()?;
+    }
+    Ok(())
+}
+
 /// yt-dlp's arguments to download one track: the url is checked and always comes last, after `--`. Pure.
 fn download_args(
     url: &str,
@@ -365,9 +375,7 @@ fn download_args(
                 "--audio-quality",
                 "0",
             ]
-            .map(String::from)
-            .into_iter()
-            .chain(cookie_args.iter().cloned()),
+            .map(String::from),
         ),
         DownloadSite::Soundcloud => args.extend(soundcloud_format_args()),
         DownloadSite::Other => args.extend(["-f", "bestaudio/best"].map(String::from)),
@@ -433,7 +441,6 @@ impl DownloadContext {
         }
 
         let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-        let cookies = crate::download::cookies::find(&crate::auth::youtube::profile_dir(app)?);
         let cookie_copies = crate::download::cookies::copies_dir(&app_data_dir);
         let format = match app.try_state::<crate::download::TaskRegistry>() {
             Some(registry) => registry.format(task_id).await,
@@ -444,7 +451,7 @@ impl DownloadContext {
             app: app.clone(),
             task_id: task_id.to_string(),
             binary_path,
-            cookies,
+            youtube_sign_in: tokio::sync::OnceCell::new(),
             cookie_copies,
             format,
             temp_dir,
@@ -490,10 +497,29 @@ async fn download_track_internal(
     track_num: usize,
     total_tracks: usize,
 ) -> Option<PathBuf> {
+    if let Err(error) = sign_in_for_url(
+        &track.url,
+        &ctx.youtube_sign_in,
+        super::youtube_sign_in::ensure_session(&ctx.app, &ctx.task_id),
+    ).await {
+        ctx.record_failure(error);
+        return None;
+    }
     let output_template = ctx.temp_dir.join(format!("{}.%(ext)s", track_num));
     // `_cookie_copy` deletes this run's cookie file copy when the track is done
     let copy_path = ctx.cookie_copies.join(format!("{}_{}.txt", ctx.session_id, track_num));
-    let (cookie_args, _cookie_copy) = match ctx.cookies.args(&copy_path) {
+    let cookie_source = if download_site(&track.url) == DownloadSite::Youtube {
+        match crate::auth::youtube::profile_dir(&ctx.app) {
+            Ok(profile) => crate::download::cookies::find(&profile),
+            Err(error) => {
+                ctx.record_failure(error);
+                return None;
+            }
+        }
+    } else {
+        super::cookies::CookieSource::None
+    };
+    let (cookie_args, _cookie_copy) = match cookie_source.args(&copy_path) {
         Ok(cookies) => cookies,
         Err(err) => {
             tracing::warn!(
@@ -984,6 +1010,9 @@ pub async fn download_batch_streaming(
 
     // Nothing downloaded because every track failed: tell the user why instead of finishing silently.
     if downloaded.is_empty() {
+        if let Some(Err(error)) = ctx.youtube_sign_in.get() {
+            return Err(error.clone());
+        }
         let reasons = ctx.failures.lock().map(|f| f.clone()).unwrap_or_default();
         if !reasons.is_empty() {
             return Err(reasons.join("; "));
@@ -1087,6 +1116,46 @@ mod hardening_tests {
         assert_eq!(download_site("https://notyoutube.com/x"), DownloadSite::Other);
     }
 
+    #[tokio::test]
+    async fn only_actual_youtube_attempts_check_the_session() {
+        let session = tokio::sync::OnceCell::new();
+        for url in [
+            "https://artist.bandcamp.com/track/a",
+            "https://soundcloud.com/artist/track",
+            "https://example.test/youtube.com?next=https://youtube.com",
+        ] {
+            assert!(sign_in_for_url(url, &session, async { panic!("unexpected YouTube sign-in") }).await.is_ok());
+        }
+        for url in ["canonical:album:youtube", "resolve:song:1", "magnet:?xt=urn:btih:abc", "ftp://youtube.com/a"] {
+            assert!(sign_in_for_url(url, &session, async { panic!("unexpected YouTube sign-in") }).await.is_err());
+        }
+        assert!(session.get().is_none());
+
+        // YouTube can be the fallback URL of a track from a different platform.
+        assert!(sign_in_for_url("https://youtu.be/abc", &session, async { Ok(()) }).await.is_ok());
+        assert!(sign_in_for_url(YT, &session, async { panic!("session already checked") }).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn declining_youtube_applies_to_parallel_tracks_but_keeps_other_sources_available() {
+        let session = tokio::sync::OnceCell::new();
+        let attempts = AtomicUsize::new(0);
+        let check = || async {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+            Err(super::super::youtube_sign_in::CANCELLED.to_string())
+        };
+        let (first, next) = tokio::join!(
+            sign_in_for_url(YT, &session, check()),
+            sign_in_for_url("https://youtu.be/abc", &session, check()),
+        );
+        assert_eq!(first, Err(super::super::youtube_sign_in::CANCELLED.into()));
+        assert_eq!(next, first);
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert!(sign_in_for_url("https://artist.bandcamp.com/track/a", &session, check()).await.is_ok());
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn youtube_args_end_with_separator_and_url_and_trust_the_system_store() {
         let args = download_args(YT, TEMPLATE, &cookie_args(), None).unwrap();
@@ -1109,8 +1178,10 @@ mod hardening_tests {
 
     #[test]
     fn non_youtube_urls_never_get_browser_cookies() {
-        let args = download_args("https://evil.com/?youtube.com", TEMPLATE, &cookie_args(), None).unwrap();
-        assert!(!args.iter().any(|a| a == "--cookies-from-browser"));
+        for url in ["https://evil.com/?youtube.com", "https://artist.bandcamp.com/track/a", "https://soundcloud.com/artist/track"] {
+            let args = download_args(url, TEMPLATE, &cookie_args(), None).unwrap();
+            assert!(!args.iter().any(|a| a.starts_with("--cookies")));
+        }
     }
 
     #[test]
@@ -1127,7 +1198,7 @@ mod hardening_tests {
     #[test]
     fn a_cookie_file_is_passed_before_the_separator() {
         let cookies = vec!["--cookies".to_string(), "/data/cookie-copies/1.txt".to_string()];
-        let args = download_args("https://artist.bandcamp.com/track/a", TEMPLATE, &cookies, None).unwrap();
+        let args = download_args(YT, TEMPLATE, &cookies, None).unwrap();
         let at = args.iter().position(|a| a == "--cookies").unwrap();
         assert_eq!(args[at + 1], "/data/cookie-copies/1.txt");
         assert!(at < args.iter().position(|a| a == "--").unwrap());

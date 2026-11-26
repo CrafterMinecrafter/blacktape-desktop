@@ -1,9 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
+import { invoke } from "@tauri-apps/api/core";
 import {
   searchCanonicalReleases,
   getCanonicalRelease,
   resolveCanonicalCandidates,
   prewarmAlbumPreviews,
+  listTorrentIndexers,
+  openRuTrackerLogin,
+  setTorrentIndexerEnabled,
+  testTorrentIndexer,
 } from "./audio";
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -51,5 +56,21 @@ describe("canonical audio IPC wrappers", () => {
 
   it("calls prewarm_album_previews", async () => {
     await expect(prewarmAlbumPreviews([["youtube", "https://test.com"]])).resolves.toBeUndefined();
+  });
+});
+
+describe("torrent indexer settings IPC", () => {
+  it("uses the torrent plugin and sends only the selected indexer and enabled state", async () => {
+    await listTorrentIndexers();
+    expect(invoke).toHaveBeenLastCalledWith("plugin:torrent|list_torrent_indexers");
+    await setTorrentIndexerEnabled("api_bay", false);
+    expect(invoke).toHaveBeenLastCalledWith("plugin:torrent|set_torrent_indexer_enabled", { id: "api_bay", enabled: false });
+    await testTorrentIndexer("archive");
+    expect(invoke).toHaveBeenLastCalledWith("plugin:torrent|test_torrent_indexer", { id: "archive" });
+  });
+
+  it("opens the RuTracker sign-in window without sending credentials to the bridge", async () => {
+    await openRuTrackerLogin();
+    expect(invoke).toHaveBeenLastCalledWith("plugin:torrent|open_rutracker_login");
   });
 });

@@ -22,6 +22,7 @@ import { DownloaderSettings } from "@/features/downloader-setup";
 import { TelemetrySettings } from "@/features/telemetry";
 import { KeymapSettings } from "@/features/keymaps/ui/KeymapSettings.tsx";
 import { SETTINGS_HEADER_HEIGHT, useChromeHeight } from "@/shared/ui/modal";
+import { TorrentIndexerSettings } from "@/pages/settings/TorrentIndexerSettings.tsx";
 
 type SettingsTab =
   | "appearance"
@@ -371,15 +372,18 @@ export const Settings = () => {
           )}
 
           {activeTab === "downloader" && (
-            <section className={styles.section}>
-              <h2>Downloader</h2>
-              <DownloaderSettings
-                rowClassName={styles.settingRow}
-                buttonClassName={styles.actionButton}
-                mutedClassName={styles.mutedText}
-                selectClassName={styles.select}
-              />
-            </section>
+            <>
+              <section className={styles.section}>
+                <h2>Downloader</h2>
+                <DownloaderSettings
+                  rowClassName={styles.settingRow}
+                  buttonClassName={styles.actionButton}
+                  mutedClassName={styles.mutedText}
+                  selectClassName={styles.select}
+                />
+              </section>
+              <TorrentIndexerSettings />
+            </>
           )}
 
           {activeTab === "about" && (

@@ -418,17 +418,21 @@ enum Provider {
     Archive,
     Knaben,
     ApiBay,
+    SolidTorrents,
+    Rutor,
     Other,
 }
 
 impl Provider {
-    const INDEXERS: [Self; 3] = [Self::Archive, Self::Knaben, Self::ApiBay];
+    const INDEXERS: [Self; 5] = [Self::Archive, Self::Knaben, Self::ApiBay, Self::SolidTorrents, Self::Rutor];
 
     fn parse(name: &str) -> Self {
         match normalize(name).as_str() {
             "archive org" | "archive" | "internet archive" => Self::Archive,
             "knaben" => Self::Knaben,
             "apibay" | "api bay" => Self::ApiBay,
+            "solidtorrents" | "solid torrents" => Self::SolidTorrents,
+            "rutor" => Self::Rutor,
             _ => Self::Other,
         }
     }
@@ -438,6 +442,8 @@ impl Provider {
             Self::Archive => "Archive.org",
             Self::Knaben => "Knaben",
             Self::ApiBay => "ApiBay",
+            Self::SolidTorrents => "SolidTorrents",
+            Self::Rutor => "RuTor",
             Self::Other => "Unknown provider",
         }
     }

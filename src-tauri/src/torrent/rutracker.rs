@@ -1,0 +1,280 @@
+use super::{inspect, release::InspectedRelease};
+use base64::Engine;
+use librqbit::{torrent_from_bytes_ext, ByteBuf};
+use serde::{de::DeserializeOwned, Deserialize};
+use tauri::AppHandle;
+#[cfg(not(test))]
+use std::{sync::Mutex, time::Duration};
+#[cfg(not(test))]
+use tauri::{Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use url::Url;
+
+#[cfg(not(test))]
+const ORIGIN: &str = "https://rutracker.org";
+#[cfg(not(test))]
+const WINDOW: &str = "rutracker-session";
+#[cfg(not(test))]
+const LOOKUP: &str = include_str!("rutracker.js");
+const LIMIT: usize = 4 * 1024 * 1024;
+#[cfg(not(test))]
+const TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(not(test))]
+static BROWSER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum Failure {
+    SignIn,
+    CloudflareChallenge,
+    Blocked,
+    Timeout,
+    RateLimited,
+    Malformed,
+    ResponseTooLarge,
+    Unavailable,
+}
+
+impl Failure {
+    pub(super) fn message(self) -> &'static str {
+        match self {
+            Self::SignIn => "Sign in to RuTracker from Settings, then try again.",
+            Self::CloudflareChallenge => "RuTracker stopped this request at a Cloudflare browser check. Open Sign in to check whether the page lets you continue, then retry Test.",
+            Self::Blocked => "RuTracker declined the request. Check access in the RuTracker sign-in window.",
+            Self::Timeout => "RuTracker request timed out.",
+            Self::RateLimited => "RuTracker is rate limiting requests.",
+            Self::Malformed => "RuTracker returned an unexpected response.",
+            Self::ResponseTooLarge => "RuTracker response exceeded the size limit.",
+            Self::Unavailable => "Could not reach RuTracker.",
+        }
+    }
+}
+
+fn official_origin(url: &Url) -> bool {
+    url.scheme() == "https" && url.host_str() == Some("rutracker.org")
+        && url.port().is_none() && url.username().is_empty() && url.password().is_none()
+}
+
+#[cfg(not(test))]
+fn browser(app: &AppHandle) -> Result<WebviewWindow, Failure> {
+    if let Some(window) = app.get_webview_window(WINDOW) {
+        return Ok(window);
+    }
+    let profile = app.path().app_data_dir().map_err(|_| Failure::Unavailable)?.join("rutracker-profile");
+    let url = Url::parse(&format!("{ORIGIN}/forum/index.php")).map_err(|_| Failure::Unavailable)?;
+    let builder = WebviewWindowBuilder::new(app, WINDOW, WebviewUrl::External(url))
+        .data_directory(profile)
+        .visible(false)
+        .focused(false)
+        .title("Blacktape | RuTracker")
+        .inner_size(940.0, 700.0)
+        .on_navigation(official_origin)
+        .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
+        .on_download(|_, _| false);
+    #[cfg(target_os = "macos")]
+    let builder = builder.data_store_identifier(*b"BlacktapeRuTrack");
+    let window = builder.build().map_err(|_| Failure::Unavailable)?;
+    let session = window.clone();
+    // Keep session-only cookies alive after the user closes the visible sign-in window.
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            let _ = session.hide();
+        }
+    });
+    Ok(window)
+}
+
+#[cfg(not(test))]
+pub(super) async fn open_login(app: &AppHandle) -> Result<(), String> {
+    let _guard = BROWSER.lock().await;
+    let window = browser(app).map_err(|error| error.message())?;
+    let url = Url::parse(&format!("{ORIGIN}/forum/login.php")).map_err(|_| Failure::Unavailable.message())?;
+    window.navigate(url).map_err(|_| Failure::Unavailable.message())?;
+    window.show().map_err(|_| Failure::Unavailable.message())?;
+    window.set_focus().map_err(|_| Failure::Unavailable.message())?;
+    Ok(())
+}
+
+#[cfg(not(test))]
+async fn evaluate<T: DeserializeOwned>(window: &WebviewWindow, script: String) -> Result<T, Failure> {
+    let (send, receive) = tokio::sync::oneshot::channel();
+    let send = Mutex::new(Some(send));
+    window.eval_with_callback(script, move |value| {
+        if let Some(send) = send.lock().ok().and_then(|mut guard| guard.take()) {
+            let _ = send.send(value);
+        }
+    }).map_err(|_| Failure::Unavailable)?;
+    let value = receive.await.map_err(|_| Failure::Unavailable)?;
+    serde_json::from_str(&value).map_err(|_| Failure::Malformed)
+}
+
+#[cfg(not(test))]
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum BrowserResult<T> {
+    Failed { error: Failure },
+    Data { data: T },
+}
+
+#[cfg(not(test))]
+async fn request<T: DeserializeOwned>(app: &AppHandle, path: String, kind: &str) -> Result<T, Failure> {
+    tokio::time::timeout(TIMEOUT, async {
+        let _guard = BROWSER.lock().await;
+        let window = browser(app)?;
+        loop {
+            let ready: Option<bool> = evaluate(&window, format!("location.origin === '{ORIGIN}' && document.readyState !== 'loading'")).await?;
+            if ready == Some(true) { break; }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let request = format!("__blacktape_{}", uuid::Uuid::new_v4().simple());
+        let path = serde_json::to_string(&path).map_err(|_| Failure::Malformed)?;
+        window.eval(format!("(() => {{
+            const state = {{ controller: new AbortController() }};
+            window.{request} = state;
+            void ({LOOKUP})({path}, '{kind}', state.controller.signal).then(
+                value => state.result = value,
+                () => state.result = {{ error: 'unavailable' }},
+            );
+        }})();")).map_err(|_| Failure::Unavailable)?;
+        let cleanup = BrowserRequest { window, key: request };
+        loop {
+            let script = format!("window.{}?.result ?? null", cleanup.key);
+            match evaluate(&cleanup.window, script).await? {
+                Some(BrowserResult::Data { data }) => return Ok(data),
+                Some(BrowserResult::Failed { error }) => return Err(error),
+                None => tokio::time::sleep(Duration::from_millis(120)).await,
+            }
+        }
+    }).await.map_err(|_| Failure::Timeout)?
+}
+
+// Desktop webviews need the Windows application manifest, which the unit-test runner lacks.
+#[cfg(test)]
+async fn request<T: DeserializeOwned>(_app: &AppHandle, _path: String, _kind: &str) -> Result<T, Failure> {
+    Err(Failure::Unavailable)
+}
+
+#[cfg(test)]
+pub(super) async fn open_login(_app: &AppHandle) -> Result<(), String> {
+    Err(Failure::Unavailable.message().into())
+}
+
+#[cfg(not(test))]
+struct BrowserRequest {
+    window: WebviewWindow,
+    key: String,
+}
+
+#[cfg(not(test))]
+impl Drop for BrowserRequest {
+    fn drop(&mut self) {
+        let key = &self.key;
+        let _ = self.window.eval(format!("window.{key}?.controller.abort(); delete window.{key};"));
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct Row {
+    pub(super) title: String,
+    pub(super) link: String,
+    pub(super) seeders: Option<u64>,
+}
+
+fn search_path(query: &str) -> String {
+    let query = query.split(|ch: char| !ch.is_alphanumeric()).filter(|word| !word.is_empty()).collect::<Vec<_>>().join("%");
+    let mut url = Url::parse("https://rutracker.org/forum/tracker.php").expect("static RuTracker URL");
+    url.query_pairs_mut().append_pair("nm", &query);
+    format!("{}?{}", url.path(), url.query().unwrap_or_default())
+}
+
+pub(super) async fn search(app: &AppHandle, query: &str) -> Result<Vec<Row>, Failure> {
+    request(app, search_path(query), "search").await
+}
+
+pub(super) fn topic_from_link(link: &str) -> Option<u64> {
+    let base = Url::parse("https://rutracker.org/forum/").ok()?;
+    let url = base.join(link).ok()?;
+    if !official_origin(&url) || url.path() != "/forum/dl.php" || url.fragment().is_some() { return None; }
+    let mut pairs = url.query_pairs();
+    let (key, value) = pairs.next()?;
+    if key != "t" || pairs.next().is_some() { return None; }
+    value.parse().ok().filter(|id| *id != 0)
+}
+
+pub(super) fn topic(input: &str) -> Option<u64> {
+    let digits = input.strip_prefix("rutracker:")?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) { return None; }
+    digits.parse().ok().filter(|id| *id != 0)
+}
+
+fn public_tracker(input: &[u8]) -> Option<String> {
+    let url = Url::parse(std::str::from_utf8(input).ok()?).ok()?;
+    let host = url.host_str()?;
+    if !matches!(host, "bt.t-ru.org" | "bt2.t-ru.org" | "bt3.t-ru.org" | "bt4.t-ru.org")
+        || !matches!(url.scheme(), "http" | "https") || url.port().is_some()
+        || url.path() != "/ann" || !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    // RuTracker publishes a separate public announce URL for magnets. Never give the engine an account key.
+    Some(format!("{}://{host}/ann?magnet", url.scheme()))
+}
+
+fn prepare_torrent(bytes: &[u8], expected: Option<&str>) -> Result<(InspectedRelease, Vec<u8>), String> {
+    let release = inspect::parse_metainfo(bytes, expected)?;
+    let metainfo = torrent_from_bytes_ext::<ByteBuf>(bytes).map_err(|_| "Invalid RuTracker torrent metadata.")?;
+    if metainfo.meta.info.private {
+        return Err("This RuTracker release requires private tracker support.".into());
+    }
+    let tracker = metainfo.meta.iter_announce().find_map(|tracker| public_tracker(tracker.as_ref()))
+        .ok_or("This release has no supported RuTracker announce endpoint.")?;
+    let mut safe = format!("d8:announce{}:{tracker}4:info", tracker.len()).into_bytes();
+    safe.extend_from_slice(metainfo.info_bytes.as_ref());
+    safe.push(b'e');
+    Ok((release, safe))
+}
+
+pub(super) async fn torrent(app: &AppHandle, topic: u64, expected: Option<&str>) -> Result<(InspectedRelease, Vec<u8>), String> {
+    let encoded: String = request(app, format!("/forum/dl.php?t={topic}"), "torrent").await.map_err(Failure::message)?;
+    if encoded.len() > LIMIT.div_ceil(3) * 4 { return Err(Failure::ResponseTooLarge.message().into()); }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).map_err(|_| "Invalid RuTracker torrent response.")?;
+    prepare_torrent(&bytes, expected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(tracker: &str, private: bool) -> Vec<u8> {
+        format!("d8:announce{}:{tracker}4:infod6:lengthi1e4:name10:Track.flac12:piece lengthi16384e6:pieces20:abcdefghijklmnopqrst{}ee",
+            tracker.len(), if private { "7:privatei1e" } else { "" }).into_bytes()
+    }
+
+    #[test]
+    fn tracker_replies_can_only_identify_a_topic_on_the_official_origin() {
+        for link in ["dl.php?t=42", "/forum/dl.php?t=42", "https://rutracker.org/forum/dl.php?t=42"] {
+            assert_eq!(topic_from_link(link), Some(42));
+        }
+        for link in ["//evil.test/forum/dl.php?t=42", "https://rutracker.org.evil.test/forum/dl.php?t=42",
+            "http://rutracker.org/forum/dl.php?t=42", "https://rutracker.org:81/forum/dl.php?t=42",
+            "dl.php?t=42&token=hidden", "dl.php?t=0", "viewtopic.php?t=42"] {
+            assert_eq!(topic_from_link(link), None, "{link}");
+        }
+        assert_eq!(topic("rutracker:42"), Some(42));
+        assert!(topic("rutracker:42?anything").is_none());
+        assert_eq!(search_path("Björk – Debut & live"), "/forum/tracker.php?nm=Bj%C3%B6rk%25Debut%25live");
+    }
+
+    #[test]
+    fn public_download_preserves_the_verified_hash_and_keeps_account_keys_out_of_the_engine() {
+        let original = fixture("http://bt2.t-ru.org/ann?uk=fixture-key", false);
+        let (release, safe) = prepare_torrent(&original, None).unwrap();
+        assert_eq!(release.tracks[0].codec, "FLAC");
+        assert!(!String::from_utf8_lossy(&safe).contains("fixture-key"));
+        let parsed = torrent_from_bytes_ext::<ByteBuf>(&safe).unwrap();
+        assert_eq!(parsed.meta.info_hash.as_string(), release.info_hash);
+        assert_eq!(parsed.meta.announce.unwrap().as_ref(), b"http://bt2.t-ru.org/ann?magnet");
+        assert!(prepare_torrent(&original, Some("wrong hash")).is_err());
+        assert!(prepare_torrent(&fixture("http://bt2.t-ru.org/ann?uk=fixture-key", true), None).is_err());
+        assert!(prepare_torrent(&fixture("https://bt.t-ru.org.evil.test/ann", false), None).is_err());
+    }
+}

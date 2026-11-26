@@ -104,6 +104,14 @@ pub(super) fn normalize_locator_for_download(input: &str) -> Result<(), String> 
     }
 }
 
+pub(super) async fn inspect_with_app(app: Option<&tauri::AppHandle>, input: &str) -> Result<InspectedRelease, String> {
+    if let Some(topic) = super::rutracker::topic(input) {
+        let app = app.ok_or("RuTracker browser session is unavailable.")?;
+        return super::rutracker::torrent(app, topic, None).await.map(|(release, _)| release);
+    }
+    inspect(input).await
+}
+
 pub(crate) async fn inspect(input: &str) -> Result<InspectedRelease, String> {
     let input = input.trim();
     if input.len() > MAX_INPUT_LENGTH {

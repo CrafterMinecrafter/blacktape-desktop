@@ -368,6 +368,13 @@ impl TaskRegistry {
         tasks.remove(task_id)
     }
 
+    pub(super) async fn set_task_message(&self, task_id: &str, message: &str) -> Option<(usize, usize)> {
+        let mut tasks = self.tasks.lock().await;
+        let task = tasks.get_mut(task_id)?;
+        task.state.message = message.to_string();
+        Some((task.state.current, task.state.total))
+    }
+
     pub async fn get_all_states(&self) -> Vec<ActiveDownloadState> {
         let tasks = self.tasks.lock().await;
         tasks.values().map(|t| t.state.clone()).collect()
