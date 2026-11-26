@@ -3,11 +3,16 @@ use reqwest::{header, StatusCode};
 use serde::Deserialize;
 use sha1::{Digest, Sha1};
 use std::path::Path;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use url::Url;
 
 const MAX_BLOCK: u64 = 8 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 4;
+/// A block of up to `MAX_BLOCK` bytes has to fit even on a slow connection.
+const SEED_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// A server that sends nothing for this long is given up, so peers can take over.
+const SEED_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -200,10 +205,10 @@ async fn fetch_range(
         if !clients.contains_key(&host) {
             clients.insert(host.clone(), super::inspect::public_client(&url).await?);
         }
-        let mut response = clients[&host].get(url.clone())
-            .header(header::ACCEPT_ENCODING, "identity")
-            .header(header::RANGE, format!("bytes={}-{}", range.start, range.end - 1))
-            .send().await.map_err(|_| "Archive web seed request failed.")?;
+        let request = range_request(&clients[&host], url.clone(), &range);
+        let response = tokio::time::timeout(SEED_IDLE_TIMEOUT, request.send()).await
+            .map_err(|_| "Archive web seed did not respond.")?
+            .map_err(|_| "Archive web seed request failed.")?;
         if response.status().is_redirection() {
             url = response.headers().get(header::LOCATION).and_then(|v| v.to_str().ok())
                 .and_then(|v| url.join(v).ok()).ok_or("Invalid Archive web seed redirect.")?;
@@ -214,15 +219,31 @@ async fn fetch_range(
             || response.headers().get(header::CONTENT_RANGE).and_then(|v| v.to_str().ok()) != Some(&expected) {
             return Err("Archive web seed returned an invalid byte range.".into());
         }
-        let mut bytes = Vec::with_capacity(len);
-        while let Some(chunk) = response.chunk().await.map_err(|_| "Could not read Archive web seed data.")? {
-            if chunk.len() > len - bytes.len() { return Err("Archive web seed exceeded its byte range.".into()); }
-            bytes.extend_from_slice(&chunk);
-        }
-        if bytes.len() != len { return Err("Archive web seed returned a short byte range.".into()); }
-        return Ok(bytes);
+        return read_range(response, len, SEED_IDLE_TIMEOUT).await;
     }
     Err("Archive web seed redirected too many times.".into())
+}
+
+fn range_request(client: &reqwest::Client, url: Url, range: &std::ops::Range<u64>) -> reqwest::RequestBuilder {
+    client.get(url)
+        .header(header::ACCEPT_ENCODING, "identity")
+        .header(header::RANGE, format!("bytes={}-{}", range.start, range.end - 1))
+        // Replaces the short metadata timeout of `public_client`.
+        .timeout(SEED_REQUEST_TIMEOUT)
+}
+
+/// Reads exactly `len` bytes of the body, failing when no data arrives for `idle`.
+async fn read_range(mut response: reqwest::Response, len: usize, idle: Duration) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::with_capacity(len);
+    while let Some(chunk) = tokio::time::timeout(idle, response.chunk()).await
+        .map_err(|_| "Archive web seed stopped sending data.")?
+        .map_err(|_| "Could not read Archive web seed data.")?
+    {
+        if chunk.len() > len - bytes.len() { return Err("Archive web seed exceeded its byte range.".into()); }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.len() != len { return Err("Archive web seed returned a short byte range.".into()); }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -288,5 +309,54 @@ mod tests {
         let cancelled = dir.path().join("cancelled.flac");
         assert_eq!(layout.transfer_with(1, 3, &cancelled, |_| std::future::ready(false), fetch).await.unwrap_err(), "Task cancelled");
         assert!(tokio::fs::read(cancelled).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn range_request_overrides_the_client_timeout_and_asks_for_the_exact_bytes() {
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
+        let url = Url::parse("https://archive.org/download/item/item_archive.flac").unwrap();
+        let request = range_request(&client, url, &(2..10)).build().unwrap();
+        assert_eq!(request.timeout(), Some(&SEED_REQUEST_TIMEOUT));
+        assert!(SEED_REQUEST_TIMEOUT > Duration::from_secs(60));
+        assert_eq!(request.headers().get(header::RANGE).and_then(|value| value.to_str().ok()), Some("bytes=2-9"));
+    }
+
+    /// Accepts one request and answers with a body that declares 4 bytes but sends `body`, keeping the socket open.
+    async fn serve_partial_body(body: &'static [u8]) -> Url {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/item.flac", listener.local_addr().unwrap())).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 { return; }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\n").await.unwrap();
+            stream.write_all(body).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn read_range_fails_when_the_seed_stops_before_the_declared_length() {
+        let url = serve_partial_body(b"ab").await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = client.get(url).send().await.unwrap();
+        let error = read_range(response, 4, Duration::from_millis(300)).await.unwrap_err();
+        assert_eq!(error, "Archive web seed stopped sending data.");
+    }
+
+    #[tokio::test]
+    async fn read_range_returns_every_declared_byte() {
+        let url = serve_partial_body(b"abcd").await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = client.get(url).send().await.unwrap();
+        let bytes = read_range(response, 4, Duration::from_secs(5)).await.unwrap();
+        assert_eq!(bytes, b"abcd".to_vec());
     }
 }
