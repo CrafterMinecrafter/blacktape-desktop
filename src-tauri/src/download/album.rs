@@ -1246,21 +1246,24 @@ pub async fn process_album_url(
             Ok((target_library_dir, Vec::new(), cover_path))
         }
         Err(err) => {
-            if let Some(torrent_err) = transfer_err {
-                return Err(torrent_err);
+            if saved_songs.is_empty() {
+                if folder_created {
+                    discard_album_folder(&target_library_dir, &root_library_dir);
+                }
+                return Err(transfer_err.unwrap_or(err));
             }
-            if !saved_songs.is_empty() {
-                return Ok((target_library_dir, Vec::new(), cover_path));
+            match transfer_err {
+                Some(torrent_err) => Err(torrent_err),
+                None => Ok((target_library_dir, Vec::new(), cover_path)),
             }
-            if saved_songs.is_empty()
-                && folder_created
-                && target_library_dir.exists()
-                && fs::remove_dir_all(&target_library_dir).is_ok()
-            {
-                remove_empty_parents_up_to(&target_library_dir, &root_library_dir);
-            }
-            Err(err)
         }
+    }
+}
+
+/// Removes an album folder created by a download that saved no songs.
+fn discard_album_folder(target_dir: &Path, root_dir: &Path) {
+    if target_dir.exists() && fs::remove_dir_all(target_dir).is_ok() {
+        remove_empty_parents_up_to(target_dir, root_dir);
     }
 }
 
@@ -1291,6 +1294,17 @@ mod tests {
     use super::*;
     use crate::db::db::tests::setup_test_db;
     use crate::library_index::normalize::normalize_url_key;
+
+    #[test]
+    fn discarding_a_failed_album_removes_its_cover_and_empty_parents_only() {
+        let root = tempfile::tempdir().unwrap();
+        let album = root.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("cover.jpg"), b"cover").unwrap();
+        discard_album_folder(&album, root.path());
+        assert!(!root.path().join("Artist").exists());
+        assert!(root.path().exists());
+    }
 
     fn album_of(urls: &[&str]) -> AlbumDownload {
         AlbumDownload {

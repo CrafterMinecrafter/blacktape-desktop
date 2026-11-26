@@ -427,7 +427,7 @@ async fn transfer_attempt(
             .ok_or("RuTracker track has no verified torrent metadata.".to_string())?;
         Some(super::rutracker::torrent(app, topic, Some(&expected.info_hash)).await?.1)
     } else {
-        // Validate scheme before handing locator to librqbit.
+        // Validate scheme before the locator is used.
         super::inspect::normalize_locator_for_download(locator)?;
         None
     };
@@ -450,7 +450,7 @@ async fn transfer_attempt(
     let added = if let Some(bytes) = rutracker_bytes {
         match get_or_init_session(cache_root.join("rutracker"), true).await {
             Ok(session) => try_add_torrent(
-                app, task_id, &session, AddTorrent::from_bytes(bytes), &only_files, &job_dir,
+                app, task_id, &session, locator, Some(bytes), &only_files, &job_dir,
                 total_task_tracks, "Connecting to RuTracker peers",
             ).await.map(|handle| (session, handle)),
             Err(error) => Err(error),
@@ -774,7 +774,8 @@ async fn add_torrent_with_recovery(
                 app,
                 task_id,
                 &tracker_session,
-                AddTorrent::from_url(locator),
+                locator,
+                None,
                 only_files,
                 job_dir,
                 total_task_tracks,
@@ -806,7 +807,6 @@ async fn add_torrent(
     total_task_tracks: usize,
     trackers_only: bool,
 ) -> Result<(Arc<Session>, Arc<ManagedTorrent>), String> {
-    let cached_bytes = super::inspect::cached_torrent_bytes(locator);
     let session = get_or_init_session(cache_root.to_path_buf(), trackers_only).await?;
     let status = if trackers_only {
         "Retrying torrent via trackers"
@@ -817,7 +817,8 @@ async fn add_torrent(
         app,
         task_id,
         &session,
-        preferred_torrent_source(locator, cached_bytes.as_deref()),
+        locator,
+        None,
         only_files,
         job_dir,
         total_task_tracks,
@@ -827,18 +828,29 @@ async fn add_torrent(
     Ok((session, handle))
 }
 
-fn preferred_torrent_source<'a>(locator: &'a str, cached: Option<&[u8]>) -> AddTorrent<'a> {
-    match cached {
-        Some(bytes) if !bytes.is_empty() => AddTorrent::from_bytes(bytes.to_vec()),
-        _ => AddTorrent::from_url(locator),
+/// The only source of what librqbit adds from a locator. It must never receive an HTTP(S) URL: librqbit
+/// would fetch it without the public-address and size checks of `inspect`.
+async fn torrent_source(locator: &str) -> Result<AddTorrent<'static>, String> {
+    super::inspect::normalize_locator_for_download(locator)?;
+    if let Some(bytes) = super::inspect::cached_torrent_bytes(locator) {
+        return Ok(AddTorrent::from_bytes(bytes));
     }
+    let locator = locator.trim();
+    if locator.starts_with("magnet:") {
+        return Ok(AddTorrent::from_url(locator.to_owned()));
+    }
+    super::inspect::inspect(locator).await?;
+    super::inspect::cached_torrent_bytes(locator)
+        .map(AddTorrent::from_bytes)
+        .ok_or_else(|| "Torrent metadata is unavailable.".into())
 }
 
 async fn try_add_torrent(
     app: Option<&AppHandle>,
     task_id: &str,
     session: &Arc<Session>,
-    source: AddTorrent<'_>,
+    locator: &str,
+    verified_bytes: Option<Vec<u8>>,
     only_files: &[usize],
     job_dir: &std::path::Path,
     total_task_tracks: usize,
@@ -855,12 +867,19 @@ async fn try_add_torrent(
     let started = Instant::now();
     let mut last_notice = Instant::now();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
-    let mut add_fut = std::pin::pin!(session.add_torrent(source, Some(add_opts)));
+    let mut add_fut = std::pin::pin!(async {
+        let source = match verified_bytes {
+            Some(bytes) => AddTorrent::from_bytes(bytes),
+            None => torrent_source(locator).await?,
+        };
+        session.add_torrent(source, Some(add_opts)).await
+            .map_err(|e| format!("Failed starting torrent download: {e}"))
+    });
 
     let response = loop {
         tokio::select! {
             res = &mut add_fut => {
-                break res.map_err(|e| format!("Failed starting torrent download: {e}"))?;
+                break res?;
             }
             _ = tick.tick() => {
                 if is_task_cancelled(app, task_id).await {
@@ -1264,13 +1283,39 @@ mod tests {
         assert_eq!(tokio::fs::read(path).await.unwrap(), b"abc");
     }
 
-    #[test]
-    fn starts_with_cached_metadata_and_uses_locator_when_unavailable() {
-        let locator = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
-        assert!(matches!(preferred_torrent_source(locator, Some(b"torrent metadata")), AddTorrent::TorrentFileBytes(_)));
-        assert!(matches!(preferred_torrent_source(locator, None), AddTorrent::Url(_)));
-        assert!(matches!(preferred_torrent_source(locator, Some(b"")), AddTorrent::Url(_)));
-        assert!(matches!(preferred_torrent_source("https://archive.org/test.torrent", None), AddTorrent::Url(_)));
+    #[tokio::test]
+    async fn http_locators_are_never_handed_to_the_engine() {
+        for locator in ["http://127.0.0.1/a.torrent", "https://torrent.invalid/a.torrent"] {
+            assert!(torrent_source(locator).await.is_err(), "{locator}");
+        }
+        let cached = "https://torrent.invalid/cached.torrent";
+        super::super::inspect::cache_torrent_bytes(cached, b"torrent metadata");
+        assert!(matches!(torrent_source(cached).await, Ok(AddTorrent::TorrentFileBytes(_))));
+        let magnet = "magnet:?xt=urn:btih:fedcba9876543210fedcba9876543210fedcba98";
+        assert!(matches!(torrent_source(magnet).await, Ok(AddTorrent::Url(_))));
+    }
+
+    #[tokio::test]
+    async fn recovery_retry_adds_the_cached_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let mut metadata = b"d4:infod6:lengthi3e4:name12:recovery.mp312:piece lengthi16384e6:pieces20:".to_vec();
+        metadata.extend_from_slice(&[1; 20]);
+        metadata.extend_from_slice(b"ee");
+        let hash = librqbit::torrent_from_bytes::<librqbit::ByteBuf>(&metadata).unwrap().info_hash.as_string();
+        let locator = format!("magnet:?xt=urn:btih:{hash}");
+        super::super::inspect::cache_torrent_bytes(&hash, &metadata);
+        let cache_root = root.path().join("cache");
+        // The torrent is already managed by the first session, so the first attempt fails.
+        let first = get_or_init_session(cache_root.clone(), false).await.unwrap();
+        try_add_torrent(None, "recovery", &first, &locator, None, &[0], &root.path().join("a"), 1, "")
+            .await.unwrap();
+        let (second, handle) = add_torrent_with_recovery(
+            None, "recovery", &cache_root, &root.path().join("b"), &locator, &[0], 1,
+        ).await.unwrap();
+        assert_eq!(handle.info_hash().as_string(), hash);
+        assert!(!Arc::ptr_eq(&first, &second));
+        first.stop().await;
+        second.stop().await;
     }
 
     #[test]
