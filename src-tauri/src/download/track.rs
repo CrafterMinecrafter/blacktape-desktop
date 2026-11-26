@@ -252,6 +252,10 @@ pub async fn process_track_url(
             track: track_info.clone(),
         };
         let completed_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cache_root = crate::torrent::download::torrent_cache_root(std::path::Path::new(output_dir));
+        let staging = crate::torrent::download::TorrentStagingCleanup(
+            crate::torrent::download::torrent_staging_dir(&cache_root, task_id),
+        );
         let result = crate::torrent::download::download_torrent_files(
             app_handle,
             task_id,
@@ -263,7 +267,7 @@ pub async fn process_track_url(
             None,
         )
         .await;
-        selected_torrent_track(result, &track_info.title)?
+        staged_torrent_track(staging, result, &track_info.title)?
     } else {
         ytdlp::download_single(app_handle, &track_info, output_dir, task_id).await?
     };
@@ -286,6 +290,17 @@ pub async fn process_track_url(
         vec![(temp_file_path, downloaded_track)],
         cover_path,
     ))
+}
+
+/// Keeps the staging folder only when it holds a track to save; otherwise dropping `staging` removes it.
+fn staged_torrent_track(
+    staging: crate::torrent::download::TorrentStagingCleanup,
+    result: Result<crate::torrent::download::TorrentTransferResult, String>,
+    title: &str,
+) -> Result<(PathBuf, TrackDownload), String> {
+    let selected = selected_torrent_track(result, title)?;
+    staging.keep();
+    Ok(selected)
 }
 
 fn selected_torrent_track(
@@ -348,5 +363,55 @@ mod torrent_selection_tests {
             completed: vec![(PathBuf::from("song.flac"), track, 0)], failed_tracks: Vec::new(), failure: None,
         };
         assert_eq!(selected_torrent_track(Ok(result), "Song").unwrap().0, PathBuf::from("song.flac"));
+    }
+
+    fn staged_folder_with_track(root: &std::path::Path) -> PathBuf {
+        let dir = root.join("staging");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("track.flac"), b"audio").unwrap();
+        dir
+    }
+
+    async fn wait_until_removed(path: &std::path::Path) -> bool {
+        for _ in 0..100 {
+            if !path.exists() { return true; }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        !path.exists()
+    }
+
+    #[tokio::test]
+    async fn failed_torrent_transfer_removes_its_staging_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = staged_folder_with_track(root.path());
+        let staging = crate::torrent::download::TorrentStagingCleanup(dir.clone());
+        let result = staged_torrent_track(staging, Err("No peers responded".into()), "Song");
+        assert_eq!(result.err(), Some("No peers responded".to_string()));
+        assert!(wait_until_removed(&dir).await);
+    }
+
+    #[tokio::test]
+    async fn transfer_without_a_completed_file_removes_its_staging_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = staged_folder_with_track(root.path());
+        let staging = crate::torrent::download::TorrentStagingCleanup(dir.clone());
+        let result = TorrentTransferResult { completed: Vec::new(), failed_tracks: Vec::new(), failure: None };
+        assert!(staged_torrent_track(staging, Ok(result), "Song").is_err());
+        assert!(wait_until_removed(&dir).await);
+    }
+
+    #[tokio::test]
+    async fn completed_torrent_transfer_keeps_its_staging_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = staged_folder_with_track(root.path());
+        let staging = crate::torrent::download::TorrentStagingCleanup(dir.clone());
+        let track = TrackDownload { title: "Song".into(), ..Default::default() };
+        let result = TorrentTransferResult {
+            completed: vec![(dir.join("track.flac"), track, 0)], failed_tracks: Vec::new(), failure: None,
+        };
+        let (path, _) = staged_torrent_track(staging, Ok(result), "Song").unwrap();
+        assert_eq!(path, dir.join("track.flac"));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(dir.join("track.flac").exists());
     }
 }

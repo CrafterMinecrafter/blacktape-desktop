@@ -41,9 +41,17 @@ async fn remove_torrent_directory(dir: &std::path::Path) {
 
 pub(crate) struct TorrentStagingCleanup(pub PathBuf);
 
+impl TorrentStagingCleanup {
+    /// Leaves the folder in place: its files are handed on to be saved.
+    pub(crate) fn keep(mut self) {
+        self.0 = PathBuf::new();
+    }
+}
+
 impl Drop for TorrentStagingCleanup {
     fn drop(&mut self) {
         let dir = std::mem::take(&mut self.0);
+        if dir.as_os_str().is_empty() { return; }
         tokio::spawn(async move { remove_torrent_directory(&dir).await; });
     }
 }
