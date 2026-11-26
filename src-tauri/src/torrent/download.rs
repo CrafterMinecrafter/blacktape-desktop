@@ -9,14 +9,93 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 const TORRENT_INIT_TIMEOUT: Duration = Duration::from_secs(25);
-const TORRENT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(25);
+/// Nobody was found by then: announce to the trackers and ask the DHT again.
+const TORRENT_NO_PEERS_TIMEOUT: Duration = Duration::from_secs(20);
+/// Peers are known but nothing has arrived: restarting would only throw them away, so they get longer.
+const TORRENT_SILENT_PEERS_TIMEOUT: Duration = Duration::from_secs(60);
 const TORRENT_STALL_TIMEOUT: Duration = Duration::from_secs(45);
+/// Longest wait for the next verified piece while unverified data keeps arriving.
+const TORRENT_UNVERIFIED_TIMEOUT: Duration = Duration::from_secs(180);
 const POLL_INTERVAL: Duration = Duration::from_millis(350);
-const NO_TORRENT_DATA: &str = "Timed out waiting for the selected torrent to send data.";
+const NO_TORRENT_PEERS: &str = "No peers were found for the selected torrent.";
 
 enum TransferError {
-    NoData,
+    NoPeers,
     Other(String),
+}
+
+/// What the swarm of one torrent has shown so far.
+#[derive(Debug, Clone, Copy, Default)]
+struct SwarmSample {
+    /// Bytes of pieces that passed the hash check.
+    verified: u64,
+    /// Bytes received from peers, including pieces that are still incomplete.
+    fetched: u64,
+    found: usize,
+    connected: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stall {
+    NoPeers,
+    SilentPeers,
+    Interrupted,
+}
+
+struct SwarmWatch {
+    seen: SwarmSample,
+    last_data: Instant,
+    last_verified: Instant,
+}
+
+impl SwarmWatch {
+    fn new(now: Instant) -> Self {
+        Self { seen: SwarmSample::default(), last_data: now, last_verified: now }
+    }
+
+    fn observe(&mut self, sample: SwarmSample, now: Instant) {
+        if sample.verified > self.seen.verified {
+            self.last_verified = now;
+            self.last_data = now;
+        }
+        if sample.fetched > self.seen.fetched {
+            self.last_data = now;
+        }
+        self.seen = SwarmSample {
+            verified: sample.verified.max(self.seen.verified),
+            fetched: sample.fetched.max(self.seen.fetched),
+            found: sample.found.max(self.seen.found),
+            connected: sample.connected,
+        };
+    }
+
+    fn has_data(&self) -> bool {
+        self.seen.verified > 0 || self.seen.fetched > 0
+    }
+
+    fn stall(&self, now: Instant) -> Option<Stall> {
+        let idle = now.saturating_duration_since(self.last_data);
+        if self.has_data() {
+            let unverified = now.saturating_duration_since(self.last_verified);
+            return (idle >= TORRENT_STALL_TIMEOUT || unverified >= TORRENT_UNVERIFIED_TIMEOUT)
+                .then_some(Stall::Interrupted);
+        }
+        if self.seen.found == 0 {
+            (idle >= TORRENT_NO_PEERS_TIMEOUT).then_some(Stall::NoPeers)
+        } else {
+            (idle >= TORRENT_SILENT_PEERS_TIMEOUT).then_some(Stall::SilentPeers)
+        }
+    }
+
+    fn waiting_message(&self, now: Instant) -> String {
+        let idle = now.saturating_duration_since(self.last_data).as_secs();
+        let SwarmSample { found, connected, .. } = self.seen;
+        if self.has_data() {
+            format!("Waiting for torrent data ({idle}s, connected peers: {connected})...")
+        } else {
+            format!("Waiting for torrent seeders ({idle}s, peers found: {found}, connected: {connected})...")
+        }
+    }
 }
 
 struct TorrentJob {
@@ -85,17 +164,18 @@ impl From<String> for TransferError {
     }
 }
 
-async fn retry_without_dht<T, F, Fut>(mut attempt: F) -> Result<T, String>
+/// Starts the torrent a second time when nobody was found. The session, and with it the DHT, stays.
+async fn retry_when_no_peers<T, F, Fut>(mut attempt: F) -> Result<T, String>
 where
-    F: FnMut(bool) -> Fut,
+    F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, TransferError>>,
 {
-    let result = match attempt(false).await {
-        Err(TransferError::NoData) => attempt(true).await,
+    let result = match attempt().await {
+        Err(TransferError::NoPeers) => attempt().await,
         result => result,
     };
     result.map_err(|error| match error {
-        TransferError::NoData => NO_TORRENT_DATA.into(),
+        TransferError::NoPeers => NO_TORRENT_PEERS.into(),
         TransferError::Other(message) => message,
     })
 }
@@ -314,10 +394,10 @@ async fn download_one_torrent(
             Err(error) => tracing::debug!(task_id, %error, "Archive web seed unavailable; trying peers"),
         }
     }
-    retry_without_dht(|trackers_only| {
+    retry_when_no_peers(|| {
         transfer_attempt(
             Some(app), task_id, library_dir, locator, requests, total_task_tracks,
-            Arc::clone(&completed_counter), track_sender.clone(), trackers_only,
+            Arc::clone(&completed_counter), track_sender.clone(),
         )
     })
     .await
@@ -414,7 +494,6 @@ async fn transfer_attempt(
     total_task_tracks: usize,
     completed_counter: Arc<std::sync::atomic::AtomicUsize>,
     track_sender: Option<tokio::sync::mpsc::Sender<(PathBuf, TrackDownload, usize)>>,
-    trackers_only: bool,
 ) -> Result<TorrentTransferResult, TransferError> {
     use std::sync::atomic::Ordering;
 
@@ -463,17 +542,6 @@ async fn transfer_attempt(
             ).await.map(|handle| (session, handle)),
             Err(error) => Err(error),
         }
-    } else if trackers_only {
-        emit_task_progress(
-            app, task_id, completed_counter.load(Ordering::SeqCst), total_task_tracks,
-            "Retrying torrent via trackers…",
-        )
-        .await;
-        add_torrent(
-            app, task_id, &cache_root, &job_dir, locator, &only_files,
-            total_task_tracks, true,
-        )
-        .await
     } else {
         add_torrent_with_recovery(
             app, task_id, &cache_root, &job_dir, locator, &only_files, total_task_tracks,
@@ -568,12 +636,11 @@ async fn transfer_attempt(
     let mut last_pct: HashMap<usize, i32> = HashMap::new();
     let mut completed = Vec::new();
     let mut failed_tracks = Vec::new();
-    let mut last_progress_bytes = 0u64;
-    let mut last_progress_at = Instant::now();
+    let mut watch = SwarmWatch::new(Instant::now());
     let mut last_wait_notice_at = Instant::now();
     let mut cancelled = false;
     let mut transfer_failure: Option<String> = None;
-    let mut no_data_timeout = false;
+    let mut no_peers = false;
 
     loop {
         if is_task_cancelled(app, task_id).await {
@@ -588,36 +655,38 @@ async fn transfer_attempt(
             break;
         }
 
-        if stats.progress_bytes > last_progress_bytes {
-            last_progress_bytes = stats.progress_bytes;
-            last_progress_at = Instant::now();
-        } else {
-            let stall_limit = if last_progress_bytes == 0 {
-                TORRENT_FIRST_BYTE_TIMEOUT
-            } else {
-                TORRENT_STALL_TIMEOUT
-            };
-            if !stats.finished && last_progress_at.elapsed() >= stall_limit {
-                tracing::warn!(task_id, bytes = last_progress_bytes, "Torrent download stalled without peer progress");
-                no_data_timeout = last_progress_bytes == 0 && completed.is_empty();
-                if !no_data_timeout {
-                    transfer_failure = Some("Torrent download stalled while waiting for remaining data.".into());
+        let live = stats.live.as_ref().map(|live| &live.snapshot);
+        let now = Instant::now();
+        let verified_before = watch.seen.verified;
+        watch.observe(SwarmSample {
+            verified: stats.progress_bytes,
+            fetched: live.map_or(0, |live| live.fetched_bytes),
+            found: live.map_or(0, |live| live.peer_stats.seen),
+            connected: live.map_or(0, |live| live.peer_stats.live),
+        }, now);
+        if !stats.finished {
+            if let Some(stall) = watch.stall(now) {
+                let SwarmSample { verified, fetched, found, connected } = watch.seen;
+                tracing::warn!(task_id, ?stall, found, connected, fetched, verified, "Torrent download stalled");
+                match stall {
+                    Stall::NoPeers => no_peers = true,
+                    Stall::SilentPeers => transfer_failure = Some(
+                        "Peers were found for the selected torrent, but none sent data.".into(),
+                    ),
+                    Stall::Interrupted => transfer_failure = Some(
+                        "Torrent download stalled while waiting for remaining data.".into(),
+                    ),
                 }
                 break;
             }
-            if last_wait_notice_at.elapsed() >= Duration::from_secs(3) {
-                last_wait_notice_at = Instant::now();
-                let message = if last_progress_bytes == 0 {
-                    format!("Waiting for torrent seeders ({}s)...", last_progress_at.elapsed().as_secs())
-                } else {
-                    format!("Waiting for torrent data ({}s)...", last_progress_at.elapsed().as_secs())
-                };
+            if watch.seen.verified == verified_before && last_wait_notice_at.elapsed() >= Duration::from_secs(3) {
+                last_wait_notice_at = now;
                 emit_task_progress(
                     app,
                     task_id,
                     completed_counter.load(Ordering::SeqCst),
                     total_task_tracks,
-                    &message,
+                    &watch.waiting_message(now),
                 )
                 .await;
             }
@@ -708,8 +777,8 @@ async fn transfer_attempt(
     if cancelled {
         return Err("Task cancelled".to_string().into());
     }
-    if no_data_timeout {
-        return Err(TransferError::NoData);
+    if no_peers {
+        return Err(TransferError::NoPeers);
     }
     if completed.is_empty() {
         if let Some(ref err) = transfer_failure {
@@ -743,7 +812,7 @@ async fn add_torrent_with_recovery(
     .await;
 
     let primary = add_torrent(
-        app, task_id, cache_root, job_dir, locator, only_files, total_task_tracks, false,
+        app, task_id, cache_root, job_dir, locator, only_files, total_task_tracks,
     )
     .await;
 
@@ -813,14 +882,8 @@ async fn add_torrent(
     locator: &str,
     only_files: &[usize],
     total_task_tracks: usize,
-    trackers_only: bool,
 ) -> Result<(Arc<Session>, Arc<ManagedTorrent>), String> {
-    let session = get_or_init_session(cache_root.to_path_buf(), trackers_only).await?;
-    let status = if trackers_only {
-        "Retrying torrent via trackers"
-    } else {
-        "Connecting to torrent peers"
-    };
+    let session = get_or_init_session(cache_root.to_path_buf(), false).await?;
     let handle = try_add_torrent(
         app,
         task_id,
@@ -830,7 +893,7 @@ async fn add_torrent(
         only_files,
         job_dir,
         total_task_tracks,
-        status,
+        "Connecting to torrent peers",
     )
     .await?;
     Ok((session, handle))
@@ -1137,32 +1200,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_byte_timeout_retries_once_with_trackers() {
-        let mut modes = Vec::new();
-        let result = retry_without_dht(|trackers_only| {
-            modes.push(trackers_only);
-            std::future::ready(if trackers_only { Ok("downloaded") } else { Err(TransferError::NoData) })
+    async fn a_swarm_without_peers_is_tried_once_more() {
+        let mut attempts = 0;
+        let result = retry_when_no_peers(|| {
+            attempts += 1;
+            std::future::ready(if attempts == 2 { Ok("downloaded") } else { Err(TransferError::NoPeers) })
         }).await;
         assert_eq!(result.unwrap(), "downloaded");
-        assert_eq!(modes, [false, true]);
+        assert_eq!(attempts, 2);
 
-        modes.clear();
-        let result = retry_without_dht(|trackers_only| {
-            modes.push(trackers_only);
-            std::future::ready(Err::<(), _>(TransferError::NoData))
+        attempts = 0;
+        let result = retry_when_no_peers(|| {
+            attempts += 1;
+            std::future::ready(Err::<(), _>(TransferError::NoPeers))
         }).await;
-        assert_eq!(result.unwrap_err(), NO_TORRENT_DATA);
-        assert_eq!(modes, [false, true]);
+        assert_eq!(result.unwrap_err(), NO_TORRENT_PEERS);
+        assert_eq!(attempts, 2);
     }
 
     #[tokio::test]
     async fn cancellation_and_other_failures_do_not_restart_the_transfer() {
         for message in ["Task cancelled", "Torrent download stalled while waiting for remaining data."] {
-            let result = retry_without_dht(|trackers_only| {
-                assert!(!trackers_only);
+            let mut attempts = 0;
+            let result = retry_when_no_peers(|| {
+                attempts += 1;
                 std::future::ready(Err::<(), _>(TransferError::Other(message.into())))
             }).await;
             assert_eq!(result.unwrap_err(), message);
+            assert_eq!(attempts, 1);
         }
     }
 
@@ -1207,7 +1272,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracker_retry_downloads_and_stages_selected_file() {
+    async fn second_announce_downloads_and_stages_selected_file() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1271,11 +1336,13 @@ mod tests {
         }];
         let counter = Arc::new(AtomicUsize::new(0));
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-        let result = tokio::time::timeout(Duration::from_secs(60), retry_without_dht(|trackers_only| {
-            peer_available.store(trackers_only, Ordering::SeqCst);
+        let mut attempts = 0;
+        let result = tokio::time::timeout(Duration::from_secs(60), retry_when_no_peers(|| {
+            attempts += 1;
+            peer_available.store(attempts > 1, Ordering::SeqCst);
             transfer_attempt(
                 None, "tracker-retry-test", root.path(), &locator, &requests,
-                1, Arc::clone(&counter), Some(sender.clone()), trackers_only,
+                1, Arc::clone(&counter), Some(sender.clone()),
             )
         })).await;
         tracker.abort();
@@ -1358,5 +1425,70 @@ mod tests {
         assert_eq!(tokio::fs::read(&dst).await.unwrap(), b"flac-bytes");
 
         let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[test]
+    fn swarm_without_peers_stalls_at_the_no_peers_timeout() {
+        let start = Instant::now();
+        let watch = SwarmWatch::new(start);
+        assert_eq!(watch.stall(start + TORRENT_NO_PEERS_TIMEOUT - Duration::from_secs(1)), None);
+        assert_eq!(watch.stall(start + TORRENT_NO_PEERS_TIMEOUT), Some(Stall::NoPeers));
+    }
+
+    #[test]
+    fn swarm_with_peers_but_no_bytes_stalls_at_the_silent_peers_timeout() {
+        let start = Instant::now();
+        let mut watch = SwarmWatch::new(start);
+        watch.observe(SwarmSample { found: 3, connected: 1, ..Default::default() }, start + Duration::from_secs(1));
+        // Peers are known, so the longer silent-peers timeout applies instead of the no-peers one.
+        assert_eq!(watch.stall(start + TORRENT_NO_PEERS_TIMEOUT), None);
+        // A later sample reporting no peers does not forget the ones found earlier.
+        watch.observe(SwarmSample::default(), start + TORRENT_NO_PEERS_TIMEOUT);
+        assert_eq!(watch.seen.found, 3);
+        assert_eq!(watch.stall(start + TORRENT_SILENT_PEERS_TIMEOUT - Duration::from_secs(1)), None);
+        assert_eq!(watch.stall(start + TORRENT_SILENT_PEERS_TIMEOUT), Some(Stall::SilentPeers));
+    }
+
+    #[test]
+    fn unverified_bytes_keep_the_swarm_alive_until_fetching_stops() {
+        let start = Instant::now();
+        let mut watch = SwarmWatch::new(start);
+        let last_growth = start + Duration::from_secs(30);
+        watch.observe(SwarmSample { fetched: 100, found: 2, connected: 1, ..Default::default() }, last_growth);
+        // Past the silent-peers timeout, but bytes are still arriving, so nothing is stalled yet.
+        assert_eq!(watch.stall(start + TORRENT_SILENT_PEERS_TIMEOUT), None);
+        // Fetching stopped at the last growth; the stall fires after TORRENT_STALL_TIMEOUT of silence.
+        assert_eq!(watch.stall(last_growth + TORRENT_STALL_TIMEOUT - Duration::from_secs(1)), None);
+        assert_eq!(watch.stall(last_growth + TORRENT_STALL_TIMEOUT), Some(Stall::Interrupted));
+    }
+
+    #[test]
+    fn fetched_bytes_without_verified_pieces_interrupt_after_the_unverified_timeout() {
+        let start = Instant::now();
+        let mut watch = SwarmWatch::new(start);
+        // Fetched bytes grow every 5 seconds, so the stall timeout never fires; verified never grows.
+        for elapsed in (5..TORRENT_UNVERIFIED_TIMEOUT.as_secs()).step_by(5) {
+            let now = start + Duration::from_secs(elapsed);
+            watch.observe(SwarmSample { fetched: elapsed, found: 1, connected: 1, ..Default::default() }, now);
+            assert_eq!(watch.stall(now), None, "at {elapsed}s");
+        }
+        assert_eq!(watch.stall(start + TORRENT_UNVERIFIED_TIMEOUT - Duration::from_secs(1)), None);
+        assert_eq!(watch.stall(start + TORRENT_UNVERIFIED_TIMEOUT), Some(Stall::Interrupted));
+    }
+
+    #[test]
+    fn waiting_message_reports_peers_before_data_and_data_after() {
+        let start = Instant::now();
+        let mut watch = SwarmWatch::new(start);
+        watch.observe(SwarmSample { found: 4, connected: 2, ..Default::default() }, start);
+        let message = watch.waiting_message(start + Duration::from_secs(3));
+        assert!(message.starts_with("Waiting for torrent seeders"), "{message}");
+        assert!(message.contains("peers found: 4"), "{message}");
+        assert!(message.contains("connected: 2"), "{message}");
+
+        watch.observe(SwarmSample { fetched: 10, found: 4, connected: 2, ..Default::default() }, start + Duration::from_secs(4));
+        let message = watch.waiting_message(start + Duration::from_secs(5));
+        assert!(message.starts_with("Waiting for torrent data"), "{message}");
+        assert!(message.contains("connected peers: 2"), "{message}");
     }
 }
