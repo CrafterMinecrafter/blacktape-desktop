@@ -20,6 +20,8 @@ const TORRENT_STALL_TIMEOUT: Duration = Duration::from_secs(45);
 const TORRENT_UNVERIFIED_TIMEOUT: Duration = Duration::from_secs(180);
 const POLL_INTERVAL: Duration = Duration::from_millis(350);
 const NO_TORRENT_PEERS: &str = "No peers were found for the selected torrent.";
+const ADD_TIMED_OUT: &str = "Timed out connecting to torrent peers or DHT.";
+const INIT_TIMED_OUT: &str = "Timed out waiting for torrent peers/metadata.";
 
 enum TransferError {
     NoPeers,
@@ -46,7 +48,27 @@ enum Lane {
     Quick,
 }
 
-/// The request the torrent belongs to: the first one that receives data.
+impl Lane {
+    /// How long adding and initializing the torrent may take. The patient request gets longer, so the quick
+    /// one has time to ask a second time before both are over.
+    fn start_timeout(self) -> Duration {
+        match self {
+            Self::Patient => TORRENT_NO_PEERS_TIMEOUT,
+            Self::Quick => TORRENT_INIT_TIMEOUT,
+        }
+    }
+}
+
+/// The quick request asks again after timing out while starting, as it does when nobody is found.
+fn start_failure(lane: Lane, message: String) -> TransferError {
+    if lane == Lane::Quick && (message == ADD_TIMED_OUT || message == INIT_TIMED_OUT) {
+        TransferError::NoPeers
+    } else {
+        TransferError::Other(message)
+    }
+}
+
+/// The request the torrent belongs to: the first one that receives a verified piece.
 #[derive(Default)]
 struct Winner(OnceLock<Lane>);
 
@@ -113,6 +135,11 @@ impl SwarmWatch {
 
     fn has_data(&self) -> bool {
         self.seen.verified > 0 || self.seen.fetched > 0
+    }
+
+    /// Unverified bytes may come from a single peer that then goes silent, so they do not decide the winner.
+    fn has_verified_data(&self) -> bool {
+        self.seen.verified > 0
     }
 
     fn stall(&self, now: Instant) -> Option<Stall> {
@@ -207,6 +234,18 @@ impl Drop for TorrentJob {
 impl From<String> for TransferError {
     fn from(message: String) -> Self {
         Self::Other(message)
+    }
+}
+
+/// Starts a torrent once more when nobody was found, which announces it to the tracker again.
+async fn retry_once_without_peers<T, F, Fut>(mut attempt: F) -> Result<T, TransferError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, TransferError>>,
+{
+    match attempt().await {
+        Err(TransferError::NoPeers) => attempt().await,
+        result => result,
     }
 }
 
@@ -473,7 +512,7 @@ async fn download_one_torrent(
     };
     if super::rutracker::topic(locator).is_some() {
         // RuTracker torrents share one session, where a second request would only collide with the first.
-        return attempt(Lane::Patient).await.map_err(TransferError::into_message);
+        return retry_once_without_peers(|| attempt(Lane::Patient)).await.map_err(TransferError::into_message);
     }
     race_lanes(&winner, attempt(Lane::Patient), || attempt(Lane::Quick)).await
 }
@@ -615,7 +654,7 @@ async fn transfer_attempt(
         match get_or_init_session(cache_root.join("rutracker"), true).await {
             Ok(session) => try_add_torrent(
                 app, task_id, &session, locator, Some(bytes), &only_files, &job_dir,
-                total_task_tracks, Some("Connecting to RuTracker peers"),
+                total_task_tracks, Some("Connecting to RuTracker peers"), lane.start_timeout(),
             ).await.map(|handle| (session, handle)),
             Err(error) => Err(error),
         }
@@ -629,7 +668,7 @@ async fn transfer_attempt(
         Ok(added) => added,
         Err(error) => {
             job.clean().await;
-            return Err(error.into());
+            return Err(start_failure(lane, error));
         }
     };
     job.torrent = Some((session, handle.id()));
@@ -656,8 +695,8 @@ async fn transfer_attempt(
             break Ok(());
         }
         let elapsed = init_started.elapsed();
-        if elapsed >= TORRENT_INIT_TIMEOUT {
-            break Err("Timed out waiting for torrent peers/metadata.".to_string());
+        if elapsed >= lane.start_timeout() {
+            break Err(INIT_TIMED_OUT.to_string());
         }
         if lane == Lane::Patient && last_status_at.elapsed() >= Duration::from_secs(2) {
             last_status_at = Instant::now();
@@ -674,7 +713,7 @@ async fn transfer_attempt(
 
     if let Err(msg) = init_res {
         job.clean().await;
-        return Err(msg.into());
+        return Err(start_failure(lane, msg));
     }
 
     if lane == Lane::Patient {
@@ -746,7 +785,7 @@ async fn transfer_attempt(
         }, now);
         // Checked before any file is staged, so only one request ever hands tracks on.
         let undecided = winner.holder().is_none();
-        if !winner.keeps(lane, watch.has_data() || stats.finished) {
+        if !winner.keeps(lane, watch.has_verified_data() || stats.finished) {
             superseded = true;
             break;
         }
@@ -762,6 +801,7 @@ async fn transfer_attempt(
                     Stall::NoPeers => no_peers = true,
                     // The quick request simply asks again.
                     Stall::SilentPeers if lane == Lane::Quick => no_peers = true,
+                    Stall::Interrupted if lane == Lane::Quick && !watch.has_verified_data() => no_peers = true,
                     Stall::SilentPeers => transfer_failure = Some(
                         "Peers were found for the selected torrent, but none sent data.".into(),
                     ),
@@ -906,6 +946,7 @@ async fn add_torrent(
     let session = get_or_init_session(cache_root.to_path_buf(), lane == Lane::Quick).await?;
     let added = try_add_torrent(
         app, task_id, &session, locator, None, only_files, job_dir, total_task_tracks, status,
+        lane.start_timeout(),
     )
     .await;
     match added {
@@ -950,6 +991,7 @@ async fn try_add_torrent(
     job_dir: &std::path::Path,
     total_task_tracks: usize,
     status_prefix: Option<&str>,
+    timeout: Duration,
 ) -> Result<Arc<ManagedTorrent>, String> {
     let add_opts = AddTorrentOptions {
         paused: false,
@@ -981,8 +1023,8 @@ async fn try_add_torrent(
                     return Err("Task cancelled".into());
                 }
                 let elapsed = started.elapsed();
-                if elapsed >= TORRENT_INIT_TIMEOUT {
-                    return Err("Timed out connecting to torrent peers or DHT.".into());
+                if elapsed >= timeout {
+                    return Err(ADD_TIMED_OUT.into());
                 }
                 if let Some(status_prefix) = status_prefix.filter(|_| last_notice.elapsed() >= Duration::from_secs(2)) {
                     last_notice = Instant::now();
@@ -1571,5 +1613,82 @@ mod tests {
         let message = watch.waiting_message(start + Duration::from_secs(5));
         assert!(message.starts_with("Waiting for torrent data"), "{message}");
         assert!(message.contains("connected peers: 2"), "{message}");
+    }
+
+    #[test]
+    fn start_failure_turns_quick_start_timeouts_into_no_peers() {
+        assert!(matches!(start_failure(Lane::Quick, ADD_TIMED_OUT.into()), TransferError::NoPeers));
+        assert!(matches!(start_failure(Lane::Quick, INIT_TIMED_OUT.into()), TransferError::NoPeers));
+        assert!(matches!(start_failure(Lane::Quick, "disk full".into()), TransferError::Other(m) if m == "disk full"));
+        assert!(matches!(start_failure(Lane::Patient, ADD_TIMED_OUT.into()), TransferError::Other(m) if m == ADD_TIMED_OUT));
+        assert!(matches!(start_failure(Lane::Patient, INIT_TIMED_OUT.into()), TransferError::Other(m) if m == INIT_TIMED_OUT));
+    }
+
+    #[test]
+    fn patient_start_timeout_is_longer_than_the_quick_one() {
+        assert!(Lane::Patient.start_timeout() > Lane::Quick.start_timeout());
+    }
+
+    #[test]
+    fn fetched_bytes_alone_are_not_verified_data() {
+        let start = Instant::now();
+        let mut watch = SwarmWatch::new(start, Lane::Patient);
+        watch.observe(SwarmSample { fetched: 100, found: 1, connected: 1, ..Default::default() }, start);
+        assert!(watch.has_data());
+        assert!(!watch.has_verified_data());
+        watch.observe(SwarmSample { verified: 64, fetched: 100, found: 1, connected: 1, ..Default::default() }, start + Duration::from_secs(1));
+        assert!(watch.has_verified_data());
+    }
+
+    #[tokio::test]
+    async fn retry_once_without_peers_attempts_again_after_no_peers() {
+        use std::cell::Cell;
+
+        let calls = Cell::new(0);
+        let result = retry_once_without_peers(|| {
+            calls.set(calls.get() + 1);
+            let call = calls.get();
+            async move { if call == 1 { Err(TransferError::NoPeers) } else { Ok(call) } }
+        })
+        .await;
+        assert!(matches!(result, Ok(2)));
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_once_without_peers_gives_up_after_two_no_peers() {
+        use std::cell::Cell;
+
+        let calls = Cell::new(0);
+        let result: Result<(), TransferError> = retry_once_without_peers(|| {
+            calls.set(calls.get() + 1);
+            async { Err(TransferError::NoPeers) }
+        })
+        .await;
+        assert!(matches!(result, Err(TransferError::NoPeers)));
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_once_without_peers_returns_first_success_or_other_error_directly() {
+        use std::cell::Cell;
+
+        let calls = Cell::new(0);
+        let ok: Result<u8, TransferError> = retry_once_without_peers(|| {
+            calls.set(calls.get() + 1);
+            async { Ok(7) }
+        })
+        .await;
+        assert!(matches!(ok, Ok(7)));
+        assert_eq!(calls.get(), 1);
+
+        calls.set(0);
+        let other: Result<u8, TransferError> = retry_once_without_peers(|| {
+            calls.set(calls.get() + 1);
+            async { Err(TransferError::Other("boom".into())) }
+        })
+        .await;
+        assert!(matches!(other, Err(TransferError::Other(m)) if m == "boom"));
+        assert_eq!(calls.get(), 1);
     }
 }
