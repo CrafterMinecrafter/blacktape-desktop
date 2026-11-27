@@ -244,8 +244,8 @@ pub async fn search_full_with_cache(
     let musicbrainz = async {
         if want_canonical {
             super::fetch_canonical_album_suggestions_result(
+                &crate::metadata::MusicBrainzClient::new(cache_dir),
                 query,
-                cache_dir,
                 Platform::Youtube,
                 8,
                 Duration::from_millis(6000),

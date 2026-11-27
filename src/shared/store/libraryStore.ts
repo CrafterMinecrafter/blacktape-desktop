@@ -158,6 +158,8 @@ interface LibraryState {
   searchResults: SearchSuggestion[];
   searchCache: Record<string, any[]>;
   searchWarning: string | null;
+  /** The query whose first results are shown while slower sources are still searching. */
+  partialResultsFor: string | null;
   setSearchQuery: (query: string) => void;
   executeSearch: (query: string, force?: boolean) => Promise<void>;
 
@@ -207,6 +209,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
   searchResults: [],
   searchCache: {},
   searchWarning: null,
+  partialResultsFor: null,
 
   activeCategory: "All",
   activePlatform: "All",
@@ -218,11 +221,11 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     const token = searchGuard.begin();
     const trimmedQuery = query.trim().toLowerCase();
     if (!trimmedQuery) {
-      set({ searchResults: [], searchWarning: null });
+      set({ searchResults: [], searchWarning: null, partialResultsFor: null });
       return;
     }
 
-    set({ searchWarning: null });
+    set({ searchWarning: null, partialResultsFor: null });
     const { searchCache } = get();
 
     if (!force && searchCache[trimmedQuery]) {
@@ -231,22 +234,33 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     }
 
     let warning: string | null = null;
-    let unlisten: (() => void) | null = null;
+    let finished = false;
+    const unlisten: (() => void)[] = [];
     try {
       if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
-        unlisten = await listen<{ query: string; message: string }>(
+        unlisten.push(await listen<{ query: string; message: string }>(
           "search-mb-warning",
           (ev) => {
             if (ev.payload.query.trim().toLowerCase() === trimmedQuery) {
               warning = ev.payload.message;
             }
           },
-        );
+        ));
+        unlisten.push(await listen<{ query: string; results: SearchSuggestion[] }>(
+          "search-partial",
+          (ev) => {
+            // An event that arrives late must not replace the complete results.
+            if (finished || !searchGuard.isLatest(token)) return;
+            if (ev.payload.query.trim().toLowerCase() !== trimmedQuery) return;
+            set({ searchResults: ev.payload.results, partialResultsFor: trimmedQuery });
+          },
+        ));
       }
       const results: SearchSuggestion[] = await searchPlatforms(
         trimmedQuery,
         SEARCH_PLATFORMS,
       );
+      finished = true;
       const isLatest = searchGuard.isLatest(token);
 
       set((state) => {
@@ -264,7 +278,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       console.error("Search failed", error);
       captureFrontendError(error, "libraryStore.executeSearch");
     } finally {
-      unlisten?.();
+      unlisten.forEach((stop) => stop());
     }
   },
 

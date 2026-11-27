@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::future::Future;
 use std::time::Duration;
+use tokio::task::JoinSet;
 
 #[derive(Debug, Serialize, Clone)]
 pub struct SearchSuggestion {
@@ -42,23 +43,63 @@ const FAST_PATH_TIMEOUT: Duration = Duration::from_millis(3500);
 
 type SearchResult = Result<Vec<SearchSuggestion>, Box<dyn Error + Send + Sync>>;
 
+/// Shorter queries are not sent to MusicBrainz from the search dropdown: they are mostly half-typed words.
+const MUSICBRAINZ_MIN_QUERY_CHARS: usize = 3;
+
+pub fn is_long_enough_for_musicbrainz(query: &str) -> bool {
+    query.trim().chars().count() >= MUSICBRAINZ_MIN_QUERY_CHARS
+}
+
+/// Gathers the suggestions of all sources. When the slow one (MusicBrainz) is still running after the others
+/// have answered, their results are handed to `on_partial` first.
+pub async fn collect_suggestions(
+    mut fast: JoinSet<SearchResult>,
+    mut slow: JoinSet<Vec<SearchSuggestion>>,
+    on_partial: impl FnOnce(&[SearchSuggestion]),
+) -> Vec<SearchSuggestion> {
+    let mut found = Vec::new();
+    while let Some(result) = fast.join_next().await {
+        match result {
+            Ok(Ok(results)) => found.extend(results),
+            Ok(Err(e)) => tracing::warn!("Platform search error: {e}"),
+            Err(e) => tracing::error!("Task join error in search suggestions: {e}"),
+        }
+    }
+    let mut ready = slow.try_join_next();
+    if ready.is_none() && !slow.is_empty() && !found.is_empty() {
+        on_partial(&found);
+    }
+    loop {
+        let result = match ready.take() {
+            Some(result) => result,
+            None => match slow.join_next().await {
+                Some(result) => result,
+                None => return found,
+            },
+        };
+        match result {
+            Ok(results) => found.extend(results),
+            Err(e) => tracing::error!("Task join error in search suggestions: {e}"),
+        }
+    }
+}
+
 /// Fetches canonical album releases from MusicBrainz `release-group` API (under a strict timeout),
 /// preferring primary studio albums and high-edition canonical entries, deduplicating `(artist, title)`
 /// pairs, and converting them into `SearchSuggestion` items prefixed with `canonical:rg:<mbid>`.
 pub async fn fetch_canonical_album_suggestions_result(
+    client: &crate::metadata::MusicBrainzClient,
     query: &str,
-    cache_dir: Option<std::path::PathBuf>,
     platform: Platform,
     limit: usize,
     timeout: Duration,
 ) -> Result<Vec<SearchSuggestion>, String> {
-    let client = crate::metadata::MusicBrainzClient::new(cache_dir);
-    let mut groups = match tokio::time::timeout(timeout, client.search_release_groups(query)).await {
-        Ok(Ok(g)) => g,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => {
-            return Err("MusicBrainz request timed out after 6s. Please try again.".to_string());
-        }
+    let answer = tokio::time::timeout(timeout, client.search_release_groups(query))
+        .await
+        .unwrap_or_else(|_| Err("MusicBrainz request timed out after 6s. Please try again.".to_string()));
+    let mut groups = match answer {
+        Ok(groups) => groups,
+        Err(error) => client.saved_release_groups(query).await.ok_or(error)?,
     };
     groups.retain(|rg| !crate::metadata::musicbrainz::is_bootleg_only_group(&rg.releases));
     // Prefer full studio Albums over EPs over Singles, no secondary types, and high release counts.
@@ -152,7 +193,8 @@ pub async fn fetch_canonical_album_suggestions(
     limit: usize,
     timeout: Duration,
 ) -> Vec<SearchSuggestion> {
-    fetch_canonical_album_suggestions_result(query, cache_dir, platform, limit, timeout)
+    let client = crate::metadata::MusicBrainzClient::new(cache_dir);
+    fetch_canonical_album_suggestions_result(&client, query, platform, limit, timeout)
         .await
         .unwrap_or_default()
 }
@@ -387,5 +429,117 @@ mod fallback_tests {
             Duration::from_secs(1),
         ));
         assert!(result.expect("ok").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod collect_suggestions_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::oneshot;
+
+    fn suggestion(item_type: ItemType, name: &str) -> SearchSuggestion {
+        SearchSuggestion {
+            item_type,
+            name: name.to_string(),
+            band_name: "Artist".to_string(),
+            album_name: None,
+            item_url_path: String::new(),
+            img: String::new(),
+            subscriber_count: None,
+            audience_kind: None,
+            album_url: None,
+            view_count: None,
+            year: None,
+            duration: None,
+            platform: Platform::Youtube,
+        }
+    }
+
+    #[test]
+    fn musicbrainz_needs_three_characters_after_trim() {
+        assert!(!is_long_enough_for_musicbrainz("ab"));
+        assert!(!is_long_enough_for_musicbrainz("  ab  "));
+        assert!(is_long_enough_for_musicbrainz("abc"));
+        assert!(is_long_enough_for_musicbrainz("мир"));
+        assert!(!is_long_enough_for_musicbrainz("ок"));
+    }
+
+    #[tokio::test]
+    async fn partial_callback_runs_while_slow_source_is_pending() {
+        let (release_slow, slow_waits) = oneshot::channel::<()>();
+        let mut fast: JoinSet<SearchResult> = JoinSet::new();
+        fast.spawn(async { Ok(vec![suggestion(ItemType::Track, "Fast")]) });
+        let mut slow: JoinSet<Vec<SearchSuggestion>> = JoinSet::new();
+        slow.spawn(async move {
+            // Only finishes once on_partial has run, so the callback is guaranteed to see it pending.
+            slow_waits.await.expect("on_partial must release the slow source");
+            vec![suggestion(ItemType::Album, "Slow")]
+        });
+
+        let partial_names = Arc::new(Mutex::new(Vec::new()));
+        let partial_names_in_callback = partial_names.clone();
+        let found = collect_suggestions(fast, slow, move |partial| {
+            *partial_names_in_callback.lock().unwrap() =
+                partial.iter().map(|s| s.name.clone()).collect::<Vec<_>>();
+            let _ = release_slow.send(());
+        })
+        .await;
+
+        assert_eq!(*partial_names.lock().unwrap(), vec!["Fast".to_string()]);
+        let mut names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["Fast", "Slow"]);
+    }
+
+    #[tokio::test]
+    async fn partial_callback_not_called_without_slow_source() {
+        let mut fast: JoinSet<SearchResult> = JoinSet::new();
+        fast.spawn(async { Ok(vec![suggestion(ItemType::Track, "Fast")]) });
+        let slow: JoinSet<Vec<SearchSuggestion>> = JoinSet::new();
+        let called = Arc::new(AtomicBool::new(false));
+        let called_in_callback = called.clone();
+
+        let found = collect_suggestions(fast, slow, move |_| {
+            called_in_callback.store(true, Ordering::SeqCst);
+        })
+        .await;
+
+        assert!(!called.load(Ordering::SeqCst));
+        assert_eq!(found.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn partial_callback_not_called_when_fast_sources_found_nothing() {
+        let mut fast: JoinSet<SearchResult> = JoinSet::new();
+        fast.spawn(async { Ok(vec![]) });
+        fast.spawn(async { Err("fast source down".into()) });
+        let mut slow: JoinSet<Vec<SearchSuggestion>> = JoinSet::new();
+        slow.spawn(async { vec![suggestion(ItemType::Album, "Slow")] });
+        let called = Arc::new(AtomicBool::new(false));
+        let called_in_callback = called.clone();
+
+        let found = collect_suggestions(fast, slow, move |_| {
+            called_in_callback.store(true, Ordering::SeqCst);
+        })
+        .await;
+
+        assert!(!called.load(Ordering::SeqCst));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, "Slow");
+    }
+
+    #[tokio::test]
+    async fn failing_fast_source_keeps_results_of_other_sources() {
+        let mut fast: JoinSet<SearchResult> = JoinSet::new();
+        fast.spawn(async { Err("boom".into()) });
+        fast.spawn(async { Ok(vec![suggestion(ItemType::Artist, "Survivor")]) });
+        let slow: JoinSet<Vec<SearchSuggestion>> = JoinSet::new();
+
+        let found = collect_suggestions(fast, slow, |_| {}).await;
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, "Survivor");
     }
 }
