@@ -197,6 +197,11 @@ pub async fn execute(app: &AppHandle, args: &[&str]) -> Result<String, String> {
 
 const MAX_CONCURRENT_DOWNLOADS: usize = 4;
 
+fn http_download_semaphore() -> Arc<Semaphore> {
+    static SEMAPHORE: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
+    Arc::clone(SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS))))
+}
+
 struct DownloadContext {
     app: AppHandle,
     task_id: String,
@@ -821,7 +826,7 @@ pub async fn download_batch_streaming(
 
     let total_tracks = tracks.len();
     let completed_counter = Arc::new(AtomicUsize::new(0));
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
+    let semaphore = http_download_semaphore();
 
     struct AbortOnDropSet<T: 'static> {
         inner: tokio::task::JoinSet<T>,
@@ -1240,6 +1245,14 @@ mod hardening_tests {
         assert_eq!(args[buf_idx + 1], "16M");
         assert!(args.contains(&"--no-cache-dir".to_string()));
         assert_eq!(MAX_CONCURRENT_DOWNLOADS, 4);
+    }
+
+    #[test]
+    fn http_download_semaphore_is_shared_across_tasks() {
+        let a = http_download_semaphore();
+        let b = http_download_semaphore();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(a.available_permits(), MAX_CONCURRENT_DOWNLOADS);
     }
 
     #[tokio::test]

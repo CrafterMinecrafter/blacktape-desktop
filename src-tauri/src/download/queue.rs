@@ -424,6 +424,26 @@ pub struct DownloadQueue {
     pub tx: mpsc::UnboundedSender<DownloadTask>,
 }
 
+async fn run_queued_task(
+    task: DownloadTask,
+    app: AppHandle,
+    ready: tokio::sync::oneshot::Receiver<()>,
+) {
+    let task_id = task.id.clone();
+    if ready.await.is_err() {
+        return;
+    }
+    if let Err(e) = handle_download_task(task, app.clone()).await {
+        tracing::error!(task_id = %task_id, error = %e, "Download task failed");
+    }
+    if let Some(registry) = app.try_state::<TaskRegistry>() {
+        let mut tasks = registry.tasks.lock().await;
+        if tasks.get(&task_id).is_some_and(|info| !info.is_cancelled) {
+            tasks.remove(&task_id);
+        }
+    }
+}
+
 pub fn init_queue_worker(app: AppHandle) -> mpsc::UnboundedSender<DownloadTask> {
     let (tx, mut rx) = mpsc::unbounded_channel::<DownloadTask>();
 
@@ -433,15 +453,9 @@ pub fn init_queue_worker(app: AppHandle) -> mpsc::UnboundedSender<DownloadTask> 
         while let Some(task) = rx.recv().await {
             let task_id = task.id.clone();
             let app_clone = app.clone();
-            let task_id_for_log = task_id.clone();
 
             let (start, ready) = tokio::sync::oneshot::channel();
-            let join_handle = tokio::spawn(async move {
-                if ready.await.is_err() { return; }
-                if let Err(e) = handle_download_task(task, app_clone).await {
-                    tracing::error!(task_id = %task_id_for_log, error = %e, "Download task failed");
-                }
-            });
+            let join_handle = tokio::spawn(run_queued_task(task, app_clone, ready));
 
             if let Some(registry) = app.try_state::<TaskRegistry>() {
                 registry
@@ -449,15 +463,6 @@ pub fn init_queue_worker(app: AppHandle) -> mpsc::UnboundedSender<DownloadTask> 
                     .await;
             }
             let _ = start.send(());
-
-            let _ = join_handle.await;
-
-            if let Some(registry) = app.try_state::<TaskRegistry>() {
-                let mut tasks = registry.tasks.lock().await;
-                if tasks.get(&task_id).is_some_and(|info| !info.is_cancelled) {
-                    tasks.remove(&task_id);
-                }
-            }
         }
     });
 
