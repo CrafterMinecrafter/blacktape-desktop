@@ -68,7 +68,6 @@
     justify-content: start;
     align-items: start;
     overflow-y: auto;
-    scrollbar-width: thin;
     min-height: 0;
     flex: 1;
 }
