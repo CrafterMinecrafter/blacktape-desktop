@@ -493,28 +493,54 @@ async fn download_one_torrent(
     completed_counter: Arc<std::sync::atomic::AtomicUsize>,
     track_sender: Option<tokio::sync::mpsc::Sender<(PathBuf, TrackDownload, usize)>>,
 ) -> Result<TorrentTransferResult, String> {
+    let mut archive_completed = Vec::new();
+    let mut peer_requests = requests.to_vec();
     if let Some(item) = super::web_seed::archive_item(locator) {
         match download_archive_seed(
             Some(app), task_id, library_dir, locator, &item, requests, total_task_tracks,
             &completed_counter, track_sender.as_ref(),
         ).await {
-            Ok(result) => return Ok(result),
+            Ok(result) if result.failed_tracks.is_empty() && result.failure.is_none() => return Ok(result),
+            Ok(result) => {
+                let failed_indices: HashSet<usize> = result.failed_tracks.iter().map(|(idx, _)| *idx).collect();
+                archive_completed = result.completed;
+                peer_requests.retain(|req| failed_indices.contains(&req.track_index));
+                tracing::debug!(
+                    task_id,
+                    completed = archive_completed.len(),
+                    remaining = peer_requests.len(),
+                    "Archive web seed partially completed; falling back to peers for remaining tracks"
+                );
+            }
             Err(error) if error == "Task cancelled" => return Err(error),
             Err(error) => tracing::debug!(task_id, %error, "Archive web seed unavailable; trying peers"),
         }
     }
+    if peer_requests.is_empty() {
+        return Ok(TorrentTransferResult {
+            completed: archive_completed,
+            failed_tracks: Vec::new(),
+            failure: None,
+        });
+    }
     let winner = Winner::default();
     let attempt = |lane| {
         transfer_attempt(
-            Some(app), task_id, library_dir, locator, requests, total_task_tracks,
+            Some(app), task_id, library_dir, locator, &peer_requests, total_task_tracks,
             Arc::clone(&completed_counter), track_sender.clone(), lane, &winner,
         )
     };
-    if super::rutracker::topic(locator).is_some() {
+    let mut peer_res = if super::rutracker::topic(locator).is_some() {
         // RuTracker torrents share one session, where a second request would only collide with the first.
-        return retry_once_without_peers(|| attempt(Lane::Patient)).await.map_err(TransferError::into_message);
+        retry_once_without_peers(|| attempt(Lane::Patient)).await.map_err(TransferError::into_message)?
+    } else {
+        race_lanes(&winner, attempt(Lane::Patient), || attempt(Lane::Quick)).await?
+    };
+    if !archive_completed.is_empty() {
+        archive_completed.extend(peer_res.completed);
+        peer_res.completed = archive_completed;
     }
-    race_lanes(&winner, attempt(Lane::Patient), || attempt(Lane::Quick)).await
+    Ok(peer_res)
 }
 
 async fn download_archive_seed(
@@ -545,41 +571,102 @@ async fn download_archive_seed(
             return Err("The selected track no longer matches the torrent file list.".into());
         }
     }
-    let seed = super::web_seed::ArchiveSeed::parse(&bytes, item, &target.info_hash)?;
+    let seed = Arc::new(super::web_seed::ArchiveSeed::parse(&bytes, item, &target.info_hash)?);
     let staging = torrent_staging_dir(&torrent_cache_root(library_dir), task_id);
     std::fs::create_dir_all(&staging).map_err(|_| "Could not create web seed staging folder.")?;
     emit_task_progress(app, task_id, counter.load(Ordering::SeqCst), total_tracks, "Downloading from Archive web seed…").await;
-    let mut completed: Vec<(PathBuf, TrackDownload, usize)> = Vec::new();
+
+    let concurrency = Arc::new(tokio::sync::Semaphore::new(3));
+    let mut join_set = tokio::task::JoinSet::new();
     for request in requests {
-        let source = request.track.torrent_target.as_ref()
-            .and_then(|target| std::iter::once(target).chain(&target.alternatives).find(|source| source.magnet_uri == locator));
-        let extension = source.and_then(|source| std::path::Path::new(&source.file_path).extension())
-            .and_then(|ext| ext.to_str()).filter(|ext| ext.len() <= 8 && ext.bytes().all(|byte| byte.is_ascii_alphanumeric()))
-            .unwrap_or("flac");
-        let path = staging.join(format!("web-{}.{extension}", Uuid::new_v4()));
-        let result = seed.transfer(request.file_index, request.file_size, &path, |percent| async move {
-            if is_task_cancelled(app, task_id).await { return false; }
-            emit_track_progress(app, task_id, request.track_index, &request.track.title, percent).await;
-            true
-        }).await;
-        if let Err(error) = result {
-            let _ = tokio::fs::remove_file(&path).await;
-            for (staged, _, _) in completed {
-                let _ = tokio::fs::remove_file(staged).await;
+        let permit = concurrency.clone();
+        let seed = Arc::clone(&seed);
+        let staging = staging.clone();
+        let request = request.clone();
+        let locator = locator.to_owned();
+        let app_handle = app.cloned();
+        let task_id = task_id.to_owned();
+        join_set.spawn(async move {
+            let _guard = permit.acquire().await.map_err(|_| (request.track_index, request.track.clone(), "Task cancelled".to_string()))?;
+            if is_task_cancelled(app_handle.as_ref(), &task_id).await {
+                return Err((request.track_index, request.track.clone(), "Task cancelled".to_string()));
             }
-            return Err(error);
-        }
-        completed.push((path, request.track.clone(), request.track_index));
+            let source = request.track.torrent_target.as_ref()
+                .and_then(|target| std::iter::once(target).chain(&target.alternatives).find(|source| source.magnet_uri == locator));
+            let extension = source.and_then(|source| std::path::Path::new(&source.file_path).extension())
+                .and_then(|ext| ext.to_str()).filter(|ext| ext.len() <= 8 && ext.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+                .unwrap_or("flac");
+            let path = staging.join(format!("web-{}.{extension}", Uuid::new_v4()));
+            let app_for_progress = app_handle.clone();
+            let task_for_progress = task_id.clone();
+            let track_index = request.track_index;
+            let track_title = request.track.title.clone();
+            let result = seed.transfer(request.file_index, request.file_size, &path, move |percent| {
+                let app_p = app_for_progress.clone();
+                let task_p = task_for_progress.clone();
+                let title_p = track_title.clone();
+                async move {
+                    if is_task_cancelled(app_p.as_ref(), &task_p).await { return false; }
+                    emit_track_progress(app_p.as_ref(), &task_p, track_index, &title_p, percent).await;
+                    true
+                }
+            }).await;
+            match result {
+                Ok(()) => Ok((path, request.track, request.track_index)),
+                Err(error) => {
+                    let _ = tokio::fs::remove_file(&path).await;
+                    Err((request.track_index, request.track, error))
+                }
+            }
+        });
     }
-    for (path, track, index) in &completed {
-        emit_track_progress(app, task_id, *index, &track.title, 100).await;
-        let current = counter.fetch_add(1, Ordering::SeqCst) + 1;
-        emit_task_progress(app, task_id, current, total_tracks, "Downloaded from Archive web seed").await;
-        if let Some(sender) = sender {
-            let _ = sender.send((path.clone(), track.clone(), *index)).await;
+
+    let mut completed: Vec<(PathBuf, TrackDownload, usize)> = Vec::new();
+    let mut failed_tracks: Vec<(usize, TrackDownload)> = Vec::new();
+    let mut first_error: Option<String> = None;
+    let mut cancelled = false;
+    while let Some(joined) = join_set.join_next().await {
+        match joined {
+            Ok(Ok((path, track, index))) => {
+                emit_track_progress(app, task_id, index, &track.title, 100).await;
+                let current = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                emit_task_progress(app, task_id, current, total_tracks, "Downloaded from Archive web seed").await;
+                if let Some(sender) = sender {
+                    let _ = sender.send((path.clone(), track.clone(), index)).await;
+                }
+                completed.push((path, track, index));
+            }
+            Ok(Err((_, _, error))) if error == "Task cancelled" => {
+                cancelled = true;
+                join_set.abort_all();
+            }
+            Ok(Err((index, track, error))) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                failed_tracks.push((index, track));
+            }
+            Err(join_err) => {
+                if first_error.is_none() {
+                    first_error = Some(format!("Web seed worker failed: {join_err}"));
+                }
+            }
         }
     }
-    Ok(TorrentTransferResult { completed, failed_tracks: Vec::new(), failure: None })
+    if cancelled {
+        for (staged, _, _) in completed {
+            let _ = tokio::fs::remove_file(staged).await;
+        }
+        return Err("Task cancelled".into());
+    }
+    if completed.is_empty() {
+        return Err(first_error.unwrap_or_else(|| "Archive web seed failed.".into()));
+    }
+    Ok(TorrentTransferResult {
+        completed,
+        failed_tracks,
+        failure: first_error,
+    })
 }
 
 fn selected_file_matches(request: &TorrentFileRequest, locator: &str, path: &str, size: u64) -> bool {

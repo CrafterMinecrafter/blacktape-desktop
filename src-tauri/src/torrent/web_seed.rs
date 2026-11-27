@@ -7,8 +7,10 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use url::Url;
 
-const MAX_BLOCK: u64 = 8 * 1024 * 1024;
+const MAX_PIECE_LENGTH: u64 = 8 * 1024 * 1024;
+const MAX_BLOCK: u64 = 2 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 4;
+const MAX_RANGE_ATTEMPTS: usize = 3;
 /// A block of up to `MAX_BLOCK` bytes has to fit even on a slow connection.
 const SEED_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// A server that sends nothing for this long is given up, so peers can take over.
@@ -84,7 +86,7 @@ impl ArchiveSeed {
             return Err("Archive item does not match the torrent root.".into());
         }
         let piece_length = u64::from(info.piece_length);
-        if piece_length == 0 || piece_length > MAX_BLOCK {
+        if piece_length == 0 || piece_length > MAX_PIECE_LENGTH {
             return Err("Torrent piece length exceeds the web seed limit.".into());
         }
         let mut files = Vec::new();
@@ -127,7 +129,7 @@ impl ArchiveSeed {
         self.transfer_with(index, size, path, progress, |url, range, size| {
             let clients = clients.clone();
             async move {
-                fetch_range(&mut *clients.lock().await, &url, range, size).await
+                fetch_range_with_retries(&clients, &url, range, size).await
             }
         }).await
     }
@@ -148,7 +150,7 @@ impl ArchiveSeed {
         let end = file.start + file.length;
         let mut start = file.start / self.piece_length * self.piece_length;
         let limit = end.div_ceil(self.piece_length).saturating_mul(self.piece_length).min(self.total);
-        let block_size = MAX_BLOCK / self.piece_length * self.piece_length;
+        let block_size = (MAX_BLOCK.max(self.piece_length) / self.piece_length) * self.piece_length;
         while start < limit {
             let percent = ((start.saturating_sub(file.start) as u128 * 100) / size as u128) as i32;
             if !progress(percent).await {
@@ -193,35 +195,97 @@ impl ArchiveSeed {
     }
 }
 
-async fn fetch_range(
-    clients: &mut std::collections::HashMap<String, reqwest::Client>,
-    original: &Url, range: std::ops::Range<u64>, size: u64,
+enum RangeError {
+    Transient(String),
+    Fatal(String),
+}
+
+async fn fetch_range_with_retries(
+    clients: &tokio::sync::Mutex<std::collections::HashMap<String, reqwest::Client>>,
+    original: &Url,
+    range: std::ops::Range<u64>,
+    size: u64,
 ) -> Result<Vec<u8>, String> {
+    let mut last_err = String::new();
+    for attempt in 0..MAX_RANGE_ATTEMPTS {
+        if attempt > 0 {
+            let backoff_ms = 500u64 * (1u64 << (attempt - 1));
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        }
+        match fetch_range_once(clients, original, range.clone(), size).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(RangeError::Fatal(msg)) => return Err(msg),
+            Err(RangeError::Transient(msg)) => last_err = msg,
+        }
+    }
+    Err(last_err)
+}
+
+async fn client_for_host(
+    clients: &tokio::sync::Mutex<std::collections::HashMap<String, reqwest::Client>>,
+    url: &Url,
+) -> Result<reqwest::Client, RangeError> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| RangeError::Fatal("Invalid web seed host.".into()))?
+        .to_owned();
+    {
+        let guard = clients.lock().await;
+        if let Some(client) = guard.get(&host) {
+            return Ok(client.clone());
+        }
+    }
+    let created = super::inspect::public_client(url)
+        .await
+        .map_err(RangeError::Transient)?;
+    let mut guard = clients.lock().await;
+    Ok(guard.entry(host).or_insert(created).clone())
+}
+
+async fn fetch_range_once(
+    clients: &tokio::sync::Mutex<std::collections::HashMap<String, reqwest::Client>>,
+    original: &Url,
+    range: std::ops::Range<u64>,
+    size: u64,
+) -> Result<Vec<u8>, RangeError> {
     let mut url = original.clone();
     let len = (range.end - range.start) as usize;
     for _ in 0..=MAX_REDIRECTS {
-        if !allowed_url(&url) { return Err("Unsafe Archive web seed redirect.".into()); }
-        let host = url.host_str().ok_or("Invalid web seed host.")?.to_owned();
-        if !clients.contains_key(&host) {
-            clients.insert(host.clone(), super::inspect::public_client(&url).await?);
+        if !allowed_url(&url) {
+            return Err(RangeError::Fatal("Unsafe Archive web seed redirect.".into()));
         }
-        let request = range_request(&clients[&host], url.clone(), &range);
-        let response = tokio::time::timeout(SEED_IDLE_TIMEOUT, request.send()).await
-            .map_err(|_| "Archive web seed did not respond.")?
-            .map_err(|_| "Archive web seed request failed.")?;
+        let client = client_for_host(clients, &url).await?;
+        let request = range_request(&client, url.clone(), &range);
+        let response = tokio::time::timeout(SEED_IDLE_TIMEOUT, request.send())
+            .await
+            .map_err(|_| RangeError::Transient("Archive web seed did not respond.".into()))?
+            .map_err(|_| RangeError::Transient("Archive web seed request failed.".into()))?;
         if response.status().is_redirection() {
-            url = response.headers().get(header::LOCATION).and_then(|v| v.to_str().ok())
-                .and_then(|v| url.join(v).ok()).ok_or("Invalid Archive web seed redirect.")?;
+            url = response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| url.join(v).ok())
+                .ok_or_else(|| RangeError::Fatal("Invalid Archive web seed redirect.".into()))?;
             continue;
+        }
+        if response.status() == StatusCode::TOO_MANY_REQUESTS || response.status().is_server_error() {
+            return Err(RangeError::Transient(format!(
+                "Archive web seed returned HTTP {}.",
+                response.status().as_u16()
+            )));
         }
         let expected = format!("bytes {}-{}/{size}", range.start, range.end - 1);
         if response.status() != StatusCode::PARTIAL_CONTENT
-            || response.headers().get(header::CONTENT_RANGE).and_then(|v| v.to_str().ok()) != Some(&expected) {
-            return Err("Archive web seed returned an invalid byte range.".into());
+            || response.headers().get(header::CONTENT_RANGE).and_then(|v| v.to_str().ok()) != Some(&expected)
+        {
+            return Err(RangeError::Fatal("Archive web seed returned an invalid byte range.".into()));
         }
-        return read_range(response, len, SEED_IDLE_TIMEOUT).await;
+        return read_range(response, len, SEED_IDLE_TIMEOUT)
+            .await
+            .map_err(RangeError::Transient);
     }
-    Err("Archive web seed redirected too many times.".into())
+    Err(RangeError::Fatal("Archive web seed redirected too many times.".into()))
 }
 
 fn range_request(client: &reqwest::Client, url: Url, range: &std::ops::Range<u64>) -> reqwest::RequestBuilder {
