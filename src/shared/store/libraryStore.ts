@@ -238,20 +238,20 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     const unlisten: (() => void)[] = [];
     try {
       if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
-        unlisten.push(await listen<{ query: string; message: string }>(
+        unlisten.push(await listen<{ requestId: number; message: string }>(
           "search-mb-warning",
           (ev) => {
-            if (ev.payload.query.trim().toLowerCase() === trimmedQuery) {
+            if (ev.payload.requestId === token) {
               warning = ev.payload.message;
             }
           },
         ));
-        unlisten.push(await listen<{ query: string; results: SearchSuggestion[] }>(
+        unlisten.push(await listen<{ requestId: number; results: SearchSuggestion[] }>(
           "search-partial",
           (ev) => {
             // An event that arrives late must not replace the complete results.
             if (finished || !searchGuard.isLatest(token)) return;
-            if (ev.payload.query.trim().toLowerCase() !== trimmedQuery) return;
+            if (ev.payload.requestId !== token) return;
             set({ searchResults: ev.payload.results, partialResultsFor: trimmedQuery });
           },
         ));
@@ -259,6 +259,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       const results: SearchSuggestion[] = await searchPlatforms(
         trimmedQuery,
         SEARCH_PLATFORMS,
+        token,
       );
       finished = true;
       const isLatest = searchGuard.isLatest(token);

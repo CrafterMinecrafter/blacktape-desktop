@@ -46,8 +46,9 @@ function activeListenerCount() {
 async function startSearch(query: string) {
   const run = useLibraryStore.getState().executeSearch(query);
   await vi.waitFor(() => expect(searchPlatformsMock).toHaveBeenCalled());
+  const requestId: number = searchPlatformsMock.mock.calls[0][2];
   // Wrapped so that awaiting startSearch does not wait for the search itself.
-  return { run };
+  return { run, requestId };
 }
 
 describe("executeSearch partial results", () => {
@@ -75,8 +76,8 @@ describe("executeSearch partial results", () => {
     );
     const partial = [item("early hit")];
 
-    const { run } = await startSearch("Radiohead");
-    emit("search-partial", { query: "Radiohead", results: partial });
+    const { run, requestId } = await startSearch("Radiohead");
+    emit("search-partial", { requestId, results: partial });
 
     expect(useLibraryStore.getState().searchResults).toEqual(partial);
     expect(useLibraryStore.getState().partialResultsFor).toBe("radiohead");
@@ -85,14 +86,14 @@ describe("executeSearch partial results", () => {
     await run;
   });
 
-  it("ignores partial results that belong to another query", async () => {
+  it("ignores partial results that belong to another request", async () => {
     let finish: (value: SearchSuggestion[]) => void = () => {};
     searchPlatformsMock.mockImplementation(
       () => new Promise<SearchSuggestion[]>((resolve) => (finish = resolve)),
     );
 
-    const { run } = await startSearch("Radiohead");
-    emit("search-partial", { query: "Portishead", results: [item("other query")] });
+    const { run, requestId } = await startSearch("Radiohead");
+    emit("search-partial", { requestId: requestId - 1, results: [item("other request")] });
 
     expect(useLibraryStore.getState().searchResults).toEqual([]);
     expect(useLibraryStore.getState().partialResultsFor).toBeNull();
@@ -105,14 +106,14 @@ describe("executeSearch partial results", () => {
     searchPlatformsMock.mockResolvedValue([item("final hit")]);
     const finalResults = [item("final hit")];
 
-    const { run } = await startSearch("Radiohead");
+    const { run, requestId } = await startSearch("Radiohead");
     await run;
     expect(useLibraryStore.getState().searchResults).toEqual(finalResults);
 
     // The listener was removed on completion; call the handler directly to simulate a late delivery.
     const partialHandler = listenMock.mock.calls.find(([event]) => event === "search-partial")?.[1];
     expect(partialHandler).toBeDefined();
-    partialHandler?.({ payload: { query: "Radiohead", results: [item("late partial")] } });
+    partialHandler?.({ payload: { requestId, results: [item("late partial")] } });
 
     expect(useLibraryStore.getState().searchResults).toEqual(finalResults);
   });
@@ -126,5 +127,38 @@ describe("executeSearch partial results", () => {
     expect(listenMock).toHaveBeenCalledWith("search-partial", expect.any(Function));
     expect(listenMock).toHaveBeenCalledWith("search-mb-warning", expect.any(Function));
     expect(activeListenerCount()).toBe(0);
+  });
+
+  it("ignores a MusicBrainz warning that belongs to another request", async () => {
+    let finish: (value: SearchSuggestion[]) => void = () => {};
+    searchPlatformsMock.mockImplementation(
+      () => new Promise<SearchSuggestion[]>((resolve) => (finish = resolve)),
+    );
+    const results = [item("final hit")];
+
+    const { run, requestId } = await startSearch("Radiohead");
+    emit("search-mb-warning", { requestId: requestId - 1, message: "MusicBrainz is unavailable" });
+
+    finish(results);
+    await run;
+
+    expect(useLibraryStore.getState().searchWarning).toBeNull();
+    expect(useLibraryStore.getState().searchCache["radiohead"]).toEqual(results);
+  });
+
+  it("shows the MusicBrainz warning of the running request and does not cache its results", async () => {
+    let finish: (value: SearchSuggestion[]) => void = () => {};
+    searchPlatformsMock.mockImplementation(
+      () => new Promise<SearchSuggestion[]>((resolve) => (finish = resolve)),
+    );
+
+    const { run, requestId } = await startSearch("Radiohead");
+    emit("search-mb-warning", { requestId, message: "MusicBrainz is unavailable" });
+
+    finish([item("partial hit")]);
+    await run;
+
+    expect(useLibraryStore.getState().searchWarning).toBe("MusicBrainz is unavailable");
+    expect(useLibraryStore.getState().searchCache).not.toHaveProperty("radiohead");
   });
 });

@@ -164,6 +164,8 @@ async fn get_search_suggestions(
     app: AppHandle,
     query: String,
     platforms: Vec<Platform>,
+    // Marks the events of this call: two calls may search for the same text.
+    request_id: u64,
 ) -> Vec<SearchSuggestion> {
     use std::sync::atomic::Ordering;
     let seq = LATEST_SUGGESTION_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
@@ -207,7 +209,7 @@ async fn get_search_suggestions(
             };
             answer.unwrap_or_else(|message| {
                 // Also sent for a replaced search, so that its incomplete results are not cached.
-                let _ = app_for_mb.emit("search-mb-warning", serde_json::json!({ "query": q_mb, "message": message }));
+                let _ = app_for_mb.emit("search-mb-warning", serde_json::json!({ "requestId": request_id, "message": message }));
                 Vec::new()
             })
         });
@@ -224,7 +226,7 @@ async fn get_search_suggestions(
     };
     let found = search::collect_suggestions(tasks, musicbrainz, |partial| {
         if LATEST_SUGGESTION_SEQ.load(Ordering::SeqCst) == seq {
-            let _ = app.emit("search-partial", serde_json::json!({ "query": query, "results": rank(partial.to_vec()) }));
+            let _ = app.emit("search-partial", serde_json::json!({ "requestId": request_id, "results": rank(partial.to_vec()) }));
         }
     })
     .await;
