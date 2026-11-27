@@ -95,6 +95,7 @@ export const SearchBar = ({ className, ...rootProps }: SearchBarProps) => {
   const {
     searchResults,
     searchWarning,
+    partialResultsFor,
     setSearchQuery,
     executeSearch,
     activeCategory,
@@ -168,7 +169,8 @@ export const SearchBar = ({ className, ...rootProps }: SearchBarProps) => {
   }, [debouncedQuery, setSearchQuery, executeSearch]);
 
   const showingSkeleton =
-    isSearching || (query.trim() !== "" && query.trim() !== debouncedQuery.trim());
+    (isSearching || (query.trim() !== "" && query.trim() !== debouncedQuery.trim())) &&
+    partialResultsFor !== query.trim().toLowerCase();
 
   const filteredResults = useMemo(() => {
     return searchResults.filter((item) => {

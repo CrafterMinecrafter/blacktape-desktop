@@ -2,9 +2,10 @@ use super::{inspect, release::InspectedRelease};
 use base64::Engine;
 use librqbit::{torrent_from_bytes_ext, ByteBuf};
 use serde::{de::DeserializeOwned, Deserialize};
+use std::time::Duration;
 use tauri::AppHandle;
 #[cfg(not(test))]
-use std::{sync::Mutex, time::Duration};
+use std::sync::Mutex;
 #[cfg(not(test))]
 use tauri::{Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use url::Url;
@@ -18,6 +19,9 @@ const LOOKUP: &str = include_str!("rutracker.js");
 const LIMIT: usize = 4 * 1024 * 1024;
 #[cfg(not(test))]
 const TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a request may wait behind the others for its turn in the browser.
+#[cfg(not(test))]
+const QUEUE_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(not(test))]
 static BROWSER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -116,10 +120,20 @@ enum BrowserResult<T> {
     Data { data: T },
 }
 
+/// Runs `task` once `lock` is free. Waiting for the turn does not use up the time of the task itself.
+async fn queued<T>(
+    lock: &tokio::sync::Mutex<()>,
+    queue_timeout: Duration,
+    run_timeout: Duration,
+    task: impl std::future::Future<Output = Result<T, Failure>>,
+) -> Result<T, Failure> {
+    let _turn = tokio::time::timeout(queue_timeout, lock.lock()).await.map_err(|_| Failure::Timeout)?;
+    tokio::time::timeout(run_timeout, task).await.map_err(|_| Failure::Timeout)?
+}
+
 #[cfg(not(test))]
 async fn request<T: DeserializeOwned>(app: &AppHandle, path: String, kind: &str) -> Result<T, Failure> {
-    tokio::time::timeout(TIMEOUT, async {
-        let _guard = BROWSER.lock().await;
+    queued(&BROWSER, QUEUE_TIMEOUT, TIMEOUT, async {
         let window = browser(app)?;
         loop {
             let ready: Option<bool> = evaluate(&window, format!("location.origin === '{ORIGIN}' && document.readyState !== 'loading'")).await?;
@@ -145,7 +159,7 @@ async fn request<T: DeserializeOwned>(app: &AppHandle, path: String, kind: &str)
                 None => tokio::time::sleep(Duration::from_millis(120)).await,
             }
         }
-    }).await.map_err(|_| Failure::Timeout)?
+    }).await
 }
 
 // Desktop webviews need the Windows application manifest, which the unit-test runner lacks.
@@ -276,5 +290,43 @@ mod tests {
         assert!(prepare_torrent(&original, Some("wrong hash")).is_err());
         assert!(prepare_torrent(&fixture("http://bt2.t-ru.org/ann?uk=fixture-key", true), None).is_err());
         assert!(prepare_torrent(&fixture("https://bt.t-ru.org.evil.test/ann", false), None).is_err());
+    }
+
+    #[tokio::test]
+    async fn waiting_for_the_turn_does_not_count_against_the_run_timeout() {
+        let lock = tokio::sync::Mutex::new(());
+        let held = lock.lock().await;
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            drop(held);
+        };
+        let (result, ()) = tokio::join!(
+            queued(&lock, Duration::from_secs(10), Duration::from_millis(200), async { Ok::<u8, Failure>(7) }),
+            release,
+        );
+        assert_eq!(result.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn queued_task_times_out_when_the_lock_is_not_freed_in_time_and_never_runs() {
+        let lock = tokio::sync::Mutex::new(());
+        let _held = lock.lock().await;
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let result = queued(&lock, Duration::from_millis(100), Duration::from_secs(5), async {
+            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok::<u8, Failure>(1)
+        }).await;
+        assert!(matches!(result, Err(Failure::Timeout)));
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn task_slower_than_the_run_timeout_gives_timeout() {
+        let lock = tokio::sync::Mutex::new(());
+        let result = queued(&lock, Duration::from_secs(10), Duration::from_millis(200), async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok::<u8, Failure>(1)
+        }).await;
+        assert!(matches!(result, Err(Failure::Timeout)));
     }
 }

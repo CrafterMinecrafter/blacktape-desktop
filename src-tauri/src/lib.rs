@@ -156,19 +156,24 @@ async fn get_artist_albums(
 
 static LATEST_SUGGESTION_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// MusicBrainz is asked only once the query has stayed unchanged this long.
+const MUSICBRAINZ_TYPING_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
 
 #[command]
 async fn get_search_suggestions(
     app: AppHandle,
     query: String,
     platforms: Vec<Platform>,
+    // Marks the events of this call: two calls may search for the same text.
+    request_id: u64,
 ) -> Vec<SearchSuggestion> {
     use std::sync::atomic::Ordering;
     let seq = LATEST_SUGGESTION_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
     let mut tasks: JoinSet<Result<Vec<SearchSuggestion>, Box<dyn Error + Send + Sync>>> =
         JoinSet::new();
 
-    let want_canonical = platforms.contains(&Platform::Youtube) || platforms.len() > 1;
+    let want_canonical = (platforms.contains(&Platform::Youtube) || platforms.len() > 1)
+        && search::is_long_enough_for_musicbrainz(&query);
     for platform in platforms {
         let q = query.clone();
         tasks.spawn(async move {
@@ -182,51 +187,50 @@ async fn get_search_suggestions(
     }
 
     let app_for_mb = app.clone();
+    let mut musicbrainz = JoinSet::new();
     if want_canonical {
         let q_mb = query.clone();
         let cache_dir = app.path().app_cache_dir().ok();
-        tasks.spawn(async move {
-            // Brief yield so rapid keystrokes cancel stale MusicBrainz queries before hitting the rate limiter.
-            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-            if LATEST_SUGGESTION_SEQ.load(Ordering::SeqCst) != seq {
-                return Ok(Vec::new());
-            }
-            match search::fetch_canonical_album_suggestions_result(
-                &q_mb,
-                cache_dir,
-                Platform::Youtube,
-                6,
-                std::time::Duration::from_millis(6000),
-            )
-            .await
-            {
-                Ok(items) => Ok(items),
-                Err(err) => {
-                    if LATEST_SUGGESTION_SEQ.load(Ordering::SeqCst) == seq {
-                        let _ = app_for_mb.emit("search-mb-warning", serde_json::json!({ "query": q_mb, "message": err }));
-                    }
-                    Ok(Vec::new())
-                }
-            }
+        musicbrainz.spawn(async move {
+            let is_latest = move || LATEST_SUGGESTION_SEQ.load(Ordering::SeqCst) == seq;
+            tokio::time::sleep(MUSICBRAINZ_TYPING_PAUSE).await;
+            let client = crate::metadata::MusicBrainzClient::new(cache_dir).only_while(is_latest);
+            let answer = if is_latest() {
+                search::fetch_canonical_album_suggestions_result(
+                    &client,
+                    &q_mb,
+                    Platform::Youtube,
+                    6,
+                    std::time::Duration::from_millis(6000),
+                )
+                .await
+            } else {
+                Err("The search was replaced by a newer one.".to_string())
+            };
+            answer.unwrap_or_else(|message| {
+                // Also sent for a replaced search, so that its incomplete results are not cached.
+                let _ = app_for_mb.emit("search-mb-warning", serde_json::json!({ "requestId": request_id, "message": message }));
+                Vec::new()
+            })
         });
     }
 
-    let mut raw_suggestions = Vec::new();
-    while let Some(res) = tasks.join_next().await {
-        match res {
-            Ok(Ok(results)) => raw_suggestions.extend(results),
-            Ok(Err(e)) => tracing::warn!("Platform search error: {e}"),
-            Err(e) => tracing::error!("Task join error in search suggestions: {e}"),
+    let rank = |suggestions: Vec<SearchSuggestion>| {
+        search::ranking::rank_with_options(
+            suggestions,
+            &query,
+            search::ranking::RankOptions {
+                promote_canonical_albums: true,
+            },
+        )
+    };
+    let found = search::collect_suggestions(tasks, musicbrainz, |partial| {
+        if LATEST_SUGGESTION_SEQ.load(Ordering::SeqCst) == seq {
+            let _ = app.emit("search-partial", serde_json::json!({ "requestId": request_id, "results": rank(partial.to_vec()) }));
         }
-    }
-
-    search::ranking::rank_with_options(
-        raw_suggestions,
-        &query,
-        search::ranking::RankOptions {
-            promote_canonical_albums: true,
-        },
-    )
+    })
+    .await;
+    rank(found)
 }
 
 #[command]

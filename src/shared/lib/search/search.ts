@@ -5,9 +5,11 @@ import { Platform } from "@/shared/types.ts";
 export const searchPlatforms = (
   query: string,
   platforms: Platform[],
+  requestId: number,
 ): Promise<SearchSuggestion[]> => {
   return invoke<SearchSuggestion[]>("get_search_suggestions", {
     query,
     platforms,
+    requestId,
   });
 };

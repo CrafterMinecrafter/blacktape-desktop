@@ -3,6 +3,8 @@ use crate::types::Platform;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 #[derive(Serialize)]
 struct SearchRequest {
@@ -78,8 +80,20 @@ impl From<BandcampResult> for SearchSuggestion {
     }
 }
 
+/// One client, so searches reuse the connection; the timeout keeps a stalled request from holding up the rest.
+fn http_client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_default()
+    })
+}
+
 pub async fn search(query: &str) -> Result<Vec<SearchSuggestion>, Box<dyn Error + Send + Sync>> {
-    let client = Client::new();
+    let client = http_client();
     let url = "https://bandcamp.com/api/bcsearch_public_api/1/autocomplete_elastic";
 
     let request_body = SearchRequest {

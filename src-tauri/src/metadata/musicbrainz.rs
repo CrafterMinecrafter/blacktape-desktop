@@ -5,7 +5,7 @@ use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
@@ -14,6 +14,7 @@ const MUSICBRAINZ_USER_AGENT: &str = "Blacktape/0.8.0 ( mail.seafood@proton.me; 
 const RATE_LIMIT_INTERVAL_MS: u64 = 1150;
 const MB_RETRY_BUDGET: Duration = Duration::from_millis(6500);
 const MB_MAX_ATTEMPTS: usize = 3;
+const SUPERSEDED: &str = "This MusicBrainz search was replaced by a newer one.";
 
 static GLOBAL_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 static GLOBAL_REQUEST_GATE: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
@@ -35,11 +36,25 @@ fn shared_rate_limiter() -> &'static Mutex<Option<Instant>> {
 #[derive(Clone)]
 pub struct MusicBrainzClient {
     cache_dir: Option<PathBuf>,
+    wanted: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl MusicBrainzClient {
     pub fn new(cache_dir: Option<PathBuf>) -> Self {
-        Self { cache_dir }
+        Self { cache_dir, wanted: None }
+    }
+
+    /// Requests that are no longer wanted when their turn comes are not sent, so they do not delay newer ones.
+    pub fn only_while(mut self, wanted: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        self.wanted = Some(Arc::new(wanted));
+        self
+    }
+
+    fn ensure_wanted(&self) -> Result<(), String> {
+        match &self.wanted {
+            Some(wanted) if !wanted() => Err(SUPERSEDED.into()),
+            _ => Ok(()),
+        }
     }
 
     async fn get_json_with_retry(&self, url: &str, context: &str) -> Result<String, String> {
@@ -59,6 +74,7 @@ impl MusicBrainzClient {
             // concurrently and the 1.15s cooldown is measured from response completion.
             let resp_result = {
                 let mut last_time = shared_rate_limiter().lock().await;
+                self.ensure_wanted()?;
                 if let Some(prev) = *last_time {
                     let elapsed = prev.elapsed();
                     if elapsed < Duration::from_millis(RATE_LIMIT_INTERVAL_MS) {
@@ -66,6 +82,8 @@ impl MusicBrainzClient {
                         tokio::time::sleep(delay).await;
                     }
                 }
+                // A newer search may have arrived during the spacing delay.
+                self.ensure_wanted()?;
                 let res = shared_http_client().get(url).send().await;
                 *last_time = Some(Instant::now());
                 res
@@ -166,6 +184,17 @@ impl MusicBrainzClient {
         tokio::fs::read_to_string(path).await.ok()
     }
 
+    fn release_group_cache_key(lucene_query: &str) -> String {
+        format!("rg_search_v2:{}", lucene_query.trim().to_lowercase())
+    }
+
+    /// The saved answer to this search however old it is, for when MusicBrainz cannot answer now.
+    pub async fn saved_release_groups(&self, query: &str) -> Option<Vec<MbReleaseGroupSummary>> {
+        let key = Self::release_group_cache_key(&build_mb_lucene_query(query.trim()));
+        let saved = tokio::fs::read_to_string(self.cache_path(&key)?).await.ok()?;
+        serde_json::from_str::<MbReleaseGroupSearchResponse>(&saved).ok().map(|parsed| parsed.release_groups)
+    }
+
     pub async fn write_cache(&self, key: &str, content: &str) {
         if let Some(path) = self.cache_path(key) {
             if let Some(parent) = path.parent() {
@@ -184,7 +213,7 @@ impl MusicBrainzClient {
             return Ok(Vec::new());
         }
 
-        let cache_key = format!("rg_search_v2:{}", trimmed.to_lowercase());
+        let cache_key = Self::release_group_cache_key(trimmed);
         if let Some(cached) = self.read_cache(&cache_key).await {
             if let Ok(parsed) = serde_json::from_str::<MbReleaseGroupSearchResponse>(&cached) {
                 tracing::debug!("Cache hit for MusicBrainz release-group search");
@@ -2164,5 +2193,86 @@ mod tests {
         assert_eq!(rel.id, "rg:rg-soft-parade");
         assert_eq!(rel.mbid.as_deref(), Some("rel-soft-parade"));
         assert_eq!(rel.title, "The Soft Parade");
+    }
+
+    #[tokio::test]
+    async fn superseded_request_fails_before_connecting() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = MusicBrainzClient::new(None).only_while(|| false);
+
+        let err = client
+            .get_json_with_retry(&format!("http://127.0.0.1:{port}/ws/2/release-group/?fmt=json"), "test")
+            .await
+            .expect_err("a superseded request must not succeed");
+
+        assert!(err.contains("replaced by a newer one"), "unexpected error: {err}");
+        match listener.accept() {
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "no connection expected"),
+            Ok(_) => panic!("superseded request connected to the server"),
+        }
+    }
+
+    fn saved_release_groups_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bt_mb_saved_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    const SAVED_RELEASE_GROUPS_JSON: &str =
+        r#"{"release-groups":[{"id":"rg-saved","title":"Saved Album","primary-type":"Album"}]}"#;
+
+    #[tokio::test]
+    async fn saved_release_groups_is_none_without_saved_answer() {
+        let dir = saved_release_groups_test_dir("missing");
+        let client = MusicBrainzClient::new(Some(dir.clone()));
+
+        assert!(client.saved_release_groups("death grips").await.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn saved_release_groups_reads_answer_saved_under_search_key() {
+        let dir = saved_release_groups_test_dir("fresh");
+        let client = MusicBrainzClient::new(Some(dir.clone()));
+        let key = MusicBrainzClient::release_group_cache_key(&build_mb_lucene_query("Death Grips"));
+        assert_eq!(key, "rg_search_v2:death grips");
+        client.write_cache(&key, SAVED_RELEASE_GROUPS_JSON).await;
+
+        let groups = client
+            .saved_release_groups("Death Grips")
+            .await
+            .expect("saved answer should be found");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, "rg-saved");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn saved_release_groups_still_returns_answer_older_than_cache_ttl() {
+        let dir = saved_release_groups_test_dir("expired");
+        let client = MusicBrainzClient::new(Some(dir.clone()));
+        let key = MusicBrainzClient::release_group_cache_key(&build_mb_lucene_query("Death Grips"));
+        client.write_cache(&key, SAVED_RELEASE_GROUPS_JSON).await;
+        let path = client.cache_path(&key).expect("cache path");
+        let thirty_days_ago = std::time::SystemTime::now() - Duration::from_secs(30 * 24 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(thirty_days_ago)
+            .unwrap();
+
+        assert!(client.read_cache(&key).await.is_none(), "read_cache must expire old entries");
+        let groups = client
+            .saved_release_groups("Death Grips")
+            .await
+            .expect("saved answer should be used even when old");
+        assert_eq!(groups[0].id, "rg-saved");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
