@@ -193,24 +193,32 @@ pub fn pick_candidate_entry_for_tier(
 
     let fmt = preferred_format.map(str::trim).unwrap_or("");
     let chosen_pos = if let Some(source_spec) = fmt.strip_prefix("source:") {
-        let (target_plat, target_tier) = match source_spec.split_once(':') {
-            Some((p, t)) => (p.to_ascii_lowercase(), t.to_ascii_lowercase()),
-            None => (source_spec.to_ascii_lowercase(), String::new()),
+        let mut parts = source_spec.splitn(3, ':');
+        let target_plat = parts.next().unwrap_or("").to_ascii_lowercase();
+        let target_tier = parts.next().unwrap_or("").to_ascii_lowercase();
+        let target_hash = parts.next().filter(|s| !s.is_empty());
+        let matches_plat_tier = |c: &crate::metadata::types::AudioCandidate| {
+            let plat_ok = c.source.platform_name().eq_ignore_ascii_case(&target_plat);
+            if !plat_ok {
+                return false;
+            }
+            match target_tier.as_str() {
+                "standard" => c.quality_tier == AudioQualityTier::StandardLossy,
+                "high" => c.quality_tier == AudioQualityTier::HighLossy,
+                "lossless" => c.quality_tier == AudioQualityTier::Lossless,
+                _ => true,
+            }
         };
-        candidates
-            .iter()
-            .position(|c| {
-                let plat_ok = c.source.platform_name().eq_ignore_ascii_case(&target_plat);
-                if !plat_ok {
-                    return false;
-                }
-                match target_tier.as_str() {
-                    "standard" => c.quality_tier == AudioQualityTier::StandardLossy,
-                    "high" => c.quality_tier == AudioQualityTier::HighLossy,
-                    "lossless" => c.quality_tier == AudioQualityTier::Lossless,
-                    _ => true,
-                }
+        target_hash
+            .and_then(|hash| {
+                candidates.iter().position(|c| match &c.source {
+                    crate::metadata::types::AudioSource::Torrent { info_hash, .. } => {
+                        matches_plat_tier(c) && info_hash.eq_ignore_ascii_case(hash)
+                    }
+                    _ => false,
+                })
             })
+            .or_else(|| candidates.iter().position(matches_plat_tier))
             .or_else(|| {
                 candidates
                     .iter()
@@ -1637,6 +1645,37 @@ mod tests {
             pick_candidate_entry_for_tier(&list, Some("high"), 0).unwrap();
         assert_eq!(idx_high, 1);
         assert_eq!(primary_high, "https://youtube.com/watch?v=1");
+    }
+
+    #[test]
+    fn pick_candidate_entry_for_tier_selects_specific_torrent_info_hash_when_given() {
+        use crate::metadata::types::{AudioCandidate, AudioQualityTier, AudioSource};
+
+        let tor = |hash: &str| AudioCandidate {
+            source: AudioSource::Torrent {
+                info_hash: hash.into(),
+                magnet_uri: format!("magnet:?xt=urn:btih:{hash}"),
+                file_index: 0,
+                file_path: "01.flac".into(),
+                file_size: 1000,
+                seeders: 10,
+            },
+            quality_tier: AudioQualityTier::Lossless,
+            codec: "FLAC".into(),
+            bitrate_kbps: None,
+            sample_rate_hz: None,
+            duration_ms: 180_000,
+            match_confidence: 1.0,
+            is_strict_match: true,
+            display_label: "TORRENT".into(),
+            matched_title: None,
+            matched_artist: None,
+        };
+        let list = vec![tor("archive-hash"), tor("rutracker-hash")];
+        let (idx, _, _) =
+            pick_candidate_entry_for_tier(&list, Some("source:torrent:lossless:rutracker-hash"), 0)
+                .unwrap();
+        assert_eq!(idx, 1);
     }
 
     #[test]

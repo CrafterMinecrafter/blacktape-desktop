@@ -496,7 +496,115 @@ describe("buildCanonicalQualityPlan", () => {
     ]);
     expect(plan.options[0].warning).toContain("Matched 1/2 tracks");
     expect(plan.options[0].details).toContain("12 seeders");
+    expect(plan.options[0].details).toContain("ApiBay");
     expect(plan.options[1].details).toContain("8 seeders");
+    expect(plan.options[1].details).toContain("ApiBay");
+  });
+
+  it("shows all discovered torrent releases in priority order instead of hiding secondary providers", () => {
+    const resolutions = [
+      {
+        tier: "lossless" as const,
+        info_hash: "archive-hash",
+        magnet_uri: "magnet:?xt=urn:btih:archive-hash",
+        release_title: "Nevermind (Archive)",
+        provider: "Archive.org",
+        seeders: null,
+        codec: "FLAC",
+        bitrate_kbps: null,
+        display_label: "FLAC",
+        matched_count: 1,
+        total_expected: 1,
+        total_matched_bytes: 345_000_000,
+        missing_titles: [],
+        ambiguous_titles: [],
+        layout_warning: null,
+        tracks: [
+          {
+            expected_index: 0,
+            candidate: {
+              source: {
+                kind: "torrent" as const,
+                info_hash: "archive-hash",
+                magnet_uri: "magnet:?xt=urn:btih:archive-hash",
+                file_index: 0,
+                file_path: "01 Smells Like Teen Spirit.flac",
+                file_size: 34_500_000,
+                seeders: 0,
+              },
+              quality_tier: "lossless" as const,
+              codec: "FLAC",
+              duration_ms: 301000,
+              match_confidence: 1,
+              is_strict_match: true,
+              display_label: "TORRENT",
+            },
+          },
+        ],
+      },
+      {
+        tier: "lossless" as const,
+        info_hash: "rutracker-hash",
+        magnet_uri: "rutracker:123",
+        release_title: "Nevermind (RuTracker)",
+        provider: "RuTracker",
+        seeders: 44,
+        codec: "FLAC",
+        bitrate_kbps: null,
+        display_label: "FLAC",
+        matched_count: 1,
+        total_expected: 1,
+        total_matched_bytes: 320_000_000,
+        missing_titles: [],
+        ambiguous_titles: [],
+        layout_warning: null,
+        tracks: [
+          {
+            expected_index: 0,
+            candidate: {
+              source: {
+                kind: "torrent" as const,
+                info_hash: "rutracker-hash",
+                magnet_uri: "rutracker:123",
+                file_index: 0,
+                file_path: "01 Smells Like Teen Spirit.flac",
+                file_size: 32_000_000,
+                seeders: 44,
+              },
+              quality_tier: "lossless" as const,
+              codec: "FLAC",
+              duration_ms: 301000,
+              match_confidence: 1,
+              is_strict_match: true,
+              display_label: "TORRENT",
+            },
+          },
+        ],
+      },
+    ];
+    const merged = mergeTorrentResolutionsIntoTracks(
+      [
+        {
+          index: 0,
+          title: "Smells Like Teen Spirit",
+          artists: ["Nirvana"],
+          url: "canonical:nevermind:1",
+          available: true,
+          track_number: 1,
+          note: null,
+          candidates: [],
+        },
+      ],
+      resolutions,
+    );
+    const plan = buildCanonicalQualityPlan(merged, undefined, resolutions);
+    expect(plan.options.map((o) => o.id)).toEqual([
+      "source:torrent:lossless",
+      "source:torrent:lossless:rutracker-hash",
+    ]);
+    expect(plan.options[0].details).toContain("Archive.org");
+    expect(plan.options[1].details).toContain("44 seeders");
+    expect(plan.options[1].details).toContain("RuTracker");
   });
 
   it("synthesizes track entries for matched torrent files when baseTracks is empty", () => {

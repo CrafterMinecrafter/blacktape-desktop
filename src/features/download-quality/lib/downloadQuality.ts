@@ -454,15 +454,63 @@ export function buildCanonicalQualityPlan(
     (a, b) => b.tierRank - a.tierRank || b.count - a.count || a.platform.localeCompare(b.platform),
   );
 
-  const torrentByBucket = new Map<string, TorrentTierResolution>();
+  const torrentsByTier = new Map<TorrentTierResolution["tier"], TorrentTierResolution[]>();
   for (const res of torrentResolutions ?? []) {
-    const key = `torrent::${res.tier}`;
-    if (!torrentByBucket.has(key) && res.matched_count > 0) torrentByBucket.set(key, res);
+    if (res.matched_count <= 0) continue;
+    const list = torrentsByTier.get(res.tier) ?? [];
+    list.push(res);
+    torrentsByTier.set(res.tier, list);
   }
 
-  const options: CanonicalQualityOption[] = sortedSources.map((src) => {
+  const options: CanonicalQualityOption[] = [];
+  for (const src of sortedSources) {
     const tierSuffix = tierSuffixFor(src.tier);
-    const torrentRes = src.platform === "torrent" ? torrentByBucket.get(`torrent::${src.tier}`) : undefined;
+    const tierTorrents = src.platform === "torrent"
+      ? (torrentsByTier.get(src.tier as TorrentTierResolution["tier"]) ?? [])
+      : [];
+
+    if (src.platform === "torrent" && tierTorrents.length > 0) {
+      tierTorrents.forEach((torrentRes, idx) => {
+        const coverage =
+          totalCount > 1 ? `${torrentRes.matched_count}/${totalCount} tracks` : "Verified candidate";
+        const metaParts: string[] = [];
+        if (anyHasLocalTier) {
+          metaParts.push(
+            src.upgradableCount === 0
+              ? `${coverage} · Already at equal or higher quality`
+              : src.upgradableCount < totalCount
+                ? `Upgrades ${src.upgradableCount}/${totalCount} tracks (${totalCount - src.upgradableCount} skipped)`
+                : totalCount > 1
+                  ? `Upgrades ${src.upgradableCount}/${totalCount} tracks`
+                  : "Upgrades existing file",
+          );
+        } else {
+          metaParts.push(coverage);
+        }
+        const size = formatByteSize(torrentRes.total_matched_bytes);
+        if (size) metaParts.push(size);
+        if (torrentRes.seeders != null) {
+          metaParts.push(`${torrentRes.seeders} seeder${torrentRes.seeders === 1 ? "" : "s"}`);
+        }
+        if (torrentRes.provider) {
+          metaParts.push(torrentRes.provider);
+        }
+        const optId = idx === 0
+          ? `source:${src.platform}${tierSuffix}`
+          : `source:${src.platform}${tierSuffix || ":"}:${torrentRes.info_hash}`;
+        options.push({
+          id: optId,
+          label: torrentQualityLabel(torrentRes),
+          details: metaParts.join(" · "),
+          platform: src.platform,
+          lossless: src.tier === "lossless",
+          upgradableCount: anyHasLocalTier ? src.upgradableCount : undefined,
+          warning: torrentRes.layout_warning ?? null,
+        });
+      });
+      continue;
+    }
+
     const coverage =
       totalCount > 1 ? `${src.count}/${totalCount} tracks` : "Verified candidate";
     const metaParts: string[] = [];
@@ -479,25 +527,16 @@ export function buildCanonicalQualityPlan(
     } else {
       metaParts.push(coverage);
     }
-    if (torrentRes) {
-      const size = formatByteSize(torrentRes.total_matched_bytes);
-      if (size) metaParts.push(size);
-      if (torrentRes.seeders != null) {
-        metaParts.push(`${torrentRes.seeders} seeder${torrentRes.seeders === 1 ? "" : "s"}`);
-      } else {
-        metaParts.push(torrentRes.provider);
-      }
-    }
-    return {
+    options.push({
       id: `source:${src.platform}${tierSuffix}`,
-      label: torrentRes ? torrentQualityLabel(torrentRes) : tierDisplayLabel(src.codec, src.tier, src.bitrate),
+      label: tierDisplayLabel(src.codec, src.tier, src.bitrate),
       details: metaParts.join(" · "),
       platform: src.platform,
       lossless: src.tier === "lossless",
       upgradableCount: anyHasLocalTier ? src.upgradableCount : undefined,
-      warning: torrentRes?.layout_warning ?? null,
-    };
-  });
+      warning: null,
+    });
+  }
 
   // Include unsplit CUE-image notices at the end of options as informational disabled cards.
   for (const res of torrentResolutions ?? []) {

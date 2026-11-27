@@ -384,7 +384,8 @@ const QualityModal = ({ params, onStarted, start, scopeTracks: selectedScope, di
           const metaParts = [
             "Matching files…",
             size,
-            est.seeders != null ? `${est.seeders} seeder${est.seeders === 1 ? "" : "s"}` : est.provider,
+            est.seeders != null ? `${est.seeders} seeder${est.seeders === 1 ? "" : "s"}` : null,
+            est.provider,
           ].filter(Boolean);
           return (
             <div key={`${est.tier}:${est.release_title}`} className={clsx(styles.option, styles.optionDisabled)} role="status">
@@ -552,14 +553,17 @@ const QualityModal = ({ params, onStarted, start, scopeTracks: selectedScope, di
               <div className={styles.sectionDivider}>
                 <span>Torrents</span>
               </div>
-              {torrentResolutions.filter((res, index, releases) =>
-                res.matched_count === 0 ||
-                releases.findIndex((release) => release.tier === res.tier && release.matched_count > 0) === index
-              ).map((res) => {
-                const isCueOnly = res.matched_count === 0 && !!res.layout_warning;
-                const optId = isCueOnly
-                  ? `torrent-notice:${res.info_hash}`
-                  : `source:torrent${tierSuffixFor(res.tier)}`;
+              {(() => {
+                const seenTiers = new Set<string>();
+                return torrentResolutions.map((res) => {
+                  const isCueOnly = res.matched_count === 0 && !!res.layout_warning;
+                  const firstInTier = !isCueOnly && !seenTiers.has(res.tier);
+                  if (!isCueOnly) seenTiers.add(res.tier);
+                  const optId = isCueOnly
+                    ? `torrent-notice:${res.info_hash}`
+                    : firstInTier
+                      ? `source:torrent${tierSuffixFor(res.tier)}`
+                      : `source:torrent${tierSuffixFor(res.tier) || ":"}:${res.info_hash}`;
                 const metaParts = [
                   res.total_expected > 1
                     ? `${res.matched_count}/${res.total_expected} tracks`
@@ -569,7 +573,8 @@ const QualityModal = ({ params, onStarted, start, scopeTracks: selectedScope, di
                   formatByteSize(res.total_matched_bytes),
                   res.seeders != null
                     ? `${res.seeders} seeder${res.seeders === 1 ? "" : "s"}`
-                    : res.provider,
+                    : null,
+                  res.provider,
                 ].filter(Boolean);
                 return (
                   <button
@@ -600,7 +605,8 @@ const QualityModal = ({ params, onStarted, start, scopeTracks: selectedScope, di
                     </span>
                   </button>
                 );
-              })}
+              });
+            })()}
               {torrentPendingBlock}
             </>
           )}

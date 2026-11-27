@@ -1,10 +1,19 @@
 async (path, kind, signal) => {
-    if (location.origin !== "https://rutracker.org") return { error: "unavailable" };
+    if (location.origin !== "https://rutracker.org" && location.origin !== "https://rutracker.net") return { error: "unavailable" };
     const response = await fetch(path, { redirect: "manual", cache: "no-store", signal });
     if (response.headers.get("cf-mitigated") === "challenge") return { error: "cloudflare_challenge" };
     if (response.type === "opaqueredirect" || response.status === 401) return { error: "sign_in" };
     if (response.status === 429) return { error: "rate_limited" };
-    if (!response.ok) return { error: response.status === 403 ? "blocked" : "unavailable" };
+    if (!response.ok) {
+        if (response.status === 403) {
+            const body = await response.text().catch(() => "");
+            if (/just a moment|cf-browser-verification|cf_chl|challenges\.cloudflare\.com/i.test(body)) {
+                return { error: "cloudflare_challenge" };
+            }
+            return { error: "blocked" };
+        }
+        return { error: "unavailable" };
+    }
     const contentType = response.headers.get("content-type") || "";
     if (kind === "torrent" && contentType.includes("text/html")) return { error: "sign_in" };
     if (!response.body) return { error: "malformed" };

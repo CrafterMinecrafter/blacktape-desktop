@@ -11,17 +11,20 @@ use tauri::{Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use url::Url;
 
 #[cfg(not(test))]
-const ORIGIN: &str = "https://rutracker.org";
+const ORIGIN: &str = "https://rutracker.net";
+const OFFICIAL_ORIGINS: [&str; 2] = ["https://rutracker.net", "https://rutracker.org"];
 #[cfg(not(test))]
 const WINDOW: &str = "rutracker-session";
 #[cfg(not(test))]
 const LOOKUP: &str = include_str!("rutracker.js");
 const LIMIT: usize = 4 * 1024 * 1024;
 #[cfg(not(test))]
-const TIMEOUT: Duration = Duration::from_secs(15);
+const TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a request may wait behind the others for its turn in the browser.
 #[cfg(not(test))]
 const QUEUE_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(not(test))]
+const CHALLENGE_WAIT: Duration = Duration::from_secs(6);
 #[cfg(not(test))]
 static BROWSER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -54,7 +57,7 @@ impl Failure {
 }
 
 fn official_origin(url: &Url) -> bool {
-    url.scheme() == "https" && url.host_str() == Some("rutracker.org")
+    url.scheme() == "https" && matches!(url.host_str(), Some("rutracker.org" | "rutracker.net"))
         && url.port().is_none() && url.username().is_empty() && url.password().is_none()
 }
 
@@ -131,15 +134,52 @@ async fn queued<T>(
     tokio::time::timeout(run_timeout, task).await.map_err(|_| Failure::Timeout)?
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PageState {
+    Loading,
+    Challenge,
+    Ready,
+}
+
+fn page_state_script(origins: &[&str]) -> String {
+    let origin_check = origins
+        .iter()
+        .map(|origin| format!("location.origin === '{origin}'"))
+        .collect::<Vec<_>>()
+        .join(" || ");
+    format!(
+        "(() => {{
+            if (!({origin_check}) || document.readyState === 'loading') return 'loading';
+            if (document.querySelector('#page_container, #main_content, #logged-in-username, form[action*=\"login.php\"]')) return 'ready';
+            if (document.querySelector('#challenge-running, #challenge-form, .cf-browser-verification, [name=\"cf-turnstile-response\"]') || /just a moment/i.test(document.title || '')) return 'challenge';
+            return 'ready';
+        }})()"
+    )
+}
+
+#[cfg(not(test))]
+async fn wait_until_ready(window: &WebviewWindow) -> Result<(), Failure> {
+    let script = page_state_script(&OFFICIAL_ORIGINS);
+    let challenge_deadline = tokio::time::Instant::now() + CHALLENGE_WAIT;
+    loop {
+        match evaluate::<PageState>(window, script.clone()).await? {
+            PageState::Ready => return Ok(()),
+            PageState::Challenge if tokio::time::Instant::now() >= challenge_deadline => {
+                return Err(Failure::CloudflareChallenge);
+            }
+            PageState::Loading | PageState::Challenge => {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+    }
+}
+
 #[cfg(not(test))]
 async fn request<T: DeserializeOwned>(app: &AppHandle, path: String, kind: &str) -> Result<T, Failure> {
     queued(&BROWSER, QUEUE_TIMEOUT, TIMEOUT, async {
         let window = browser(app)?;
-        loop {
-            let ready: Option<bool> = evaluate(&window, format!("location.origin === '{ORIGIN}' && document.readyState !== 'loading'")).await?;
-            if ready == Some(true) { break; }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        wait_until_ready(&window).await?;
         let request = format!("__blacktape_{}", uuid::Uuid::new_v4().simple());
         let path = serde_json::to_string(&path).map_err(|_| Failure::Malformed)?;
         window.eval(format!("(() => {{
@@ -265,10 +305,16 @@ mod tests {
 
     #[test]
     fn tracker_replies_can_only_identify_a_topic_on_the_official_origin() {
-        for link in ["dl.php?t=42", "/forum/dl.php?t=42", "https://rutracker.org/forum/dl.php?t=42"] {
+        for link in [
+            "dl.php?t=42",
+            "/forum/dl.php?t=42",
+            "https://rutracker.org/forum/dl.php?t=42",
+            "https://rutracker.net/forum/dl.php?t=42",
+        ] {
             assert_eq!(topic_from_link(link), Some(42));
         }
         for link in ["//evil.test/forum/dl.php?t=42", "https://rutracker.org.evil.test/forum/dl.php?t=42",
+            "https://rutracker.net.evil.test/forum/dl.php?t=42",
             "http://rutracker.org/forum/dl.php?t=42", "https://rutracker.org:81/forum/dl.php?t=42",
             "dl.php?t=42&token=hidden", "dl.php?t=0", "viewtopic.php?t=42"] {
             assert_eq!(topic_from_link(link), None, "{link}");
@@ -328,5 +374,17 @@ mod tests {
             Ok::<u8, Failure>(1)
         }).await;
         assert!(matches!(result, Err(Failure::Timeout)));
+    }
+
+    #[test]
+    fn page_state_script_checks_origin_forum_dom_and_cloudflare_challenge() {
+        let script = page_state_script(&OFFICIAL_ORIGINS);
+        assert!(script.contains("https://rutracker.net"));
+        assert!(script.contains("https://rutracker.org"));
+        assert!(script.contains("#page_container"));
+        assert!(script.contains("just a moment"));
+        assert_eq!(serde_json::from_str::<PageState>("\"loading\"").unwrap(), PageState::Loading);
+        assert_eq!(serde_json::from_str::<PageState>("\"challenge\"").unwrap(), PageState::Challenge);
+        assert_eq!(serde_json::from_str::<PageState>("\"ready\"").unwrap(), PageState::Ready);
     }
 }

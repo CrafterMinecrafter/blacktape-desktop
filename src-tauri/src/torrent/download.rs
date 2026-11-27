@@ -337,7 +337,7 @@ async fn get_or_init_session(cache_root: PathBuf, disable_dht: bool) -> Result<A
 
     let mut opts = SessionOptions::default();
     opts.disable_dht = disable_dht;
-    opts.disable_dht_persistence = true;
+    opts.disable_dht_persistence = disable_dht;
     opts.fastresume = false;
     opts.persistence = None;
     opts.disable_upload = true;
@@ -651,7 +651,7 @@ async fn transfer_attempt(
     only_files.dedup();
 
     let added = if let Some(bytes) = rutracker_bytes {
-        match get_or_init_session(cache_root.join("rutracker"), true).await {
+        match get_or_init_session(cache_root.join("rutracker"), false).await {
             Ok(session) => try_add_torrent(
                 app, task_id, &session, locator, Some(bytes), &only_files, &job_dir,
                 total_task_tracks, Some("Connecting to RuTracker peers"), lane.start_timeout(),
@@ -981,6 +981,13 @@ async fn torrent_source(locator: &str) -> Result<AddTorrent<'static>, String> {
         .ok_or_else(|| "Torrent metadata is unavailable.".into())
 }
 
+const PUBLIC_TRACKERS: &[&str] = &[
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://exodus.desync.com:6969/announce",
+];
+
 async fn try_add_torrent(
     app: Option<&AppHandle>,
     task_id: &str,
@@ -998,6 +1005,7 @@ async fn try_add_torrent(
         only_files: Some(only_files.to_vec()),
         overwrite: true,
         output_folder: Some(job_dir.to_string_lossy().to_string()),
+        trackers: Some(PUBLIC_TRACKERS.iter().map(|t| (*t).to_string()).collect()),
         ..Default::default()
     };
 
