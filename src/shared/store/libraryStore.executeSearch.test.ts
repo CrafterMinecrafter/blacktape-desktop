@@ -253,6 +253,9 @@ describe("executeSearch progress", () => {
   it("a search answered from the cache is marked cached, has no sources and asks no platform", async () => {
     searchPlatformsMock.mockResolvedValueOnce([item("hit")]);
     await useLibraryStore.getState().executeSearch("Radiohead");
+    // Another search in between, so the cached query is not the previous run.
+    searchPlatformsMock.mockResolvedValueOnce([item("other")]);
+    await useLibraryStore.getState().executeSearch("Blur");
     searchPlatformsMock.mockClear();
 
     await useLibraryStore.getState().executeSearch("  radiohead  ");
@@ -261,6 +264,32 @@ describe("executeSearch progress", () => {
     expect(run?.cached).toBe(true);
     expect(run?.sources).toEqual([]);
     expect(run?.finishedAt).not.toBeNull();
+    expect(useLibraryStore.getState().searchResults).toEqual([item("hit")]);
+    expect(searchPlatformsMock).not.toHaveBeenCalled();
+  });
+
+  it("running the same query again after its search finished keeps the previous run and asks no platform", async () => {
+    let finish: (value: SearchSuggestion[]) => void = () => {};
+    searchPlatformsMock.mockImplementation(
+      () => new Promise<SearchSuggestion[]>((resolve) => (finish = resolve)),
+    );
+
+    const { run, requestId } = await startSearch("Radiohead");
+    emit("search-progress", { requestId, progress: progress("youtube", "done", { elapsedMs: 40, count: 3 }) });
+    finish([item("hit")]);
+    await run;
+
+    const first = useLibraryStore.getState().searchRun;
+    expect(first?.cached).toBe(false);
+    expect(first?.sources).toHaveLength(1);
+
+    searchPlatformsMock.mockClear();
+    await useLibraryStore.getState().executeSearch("Radiohead ");
+
+    const again = useLibraryStore.getState().searchRun;
+    expect(again).toEqual(first);
+    expect(again?.cached).toBe(false);
+    expect(again?.sources).toEqual(first?.sources);
     expect(searchPlatformsMock).not.toHaveBeenCalled();
   });
 

@@ -201,7 +201,7 @@ export const Settings = () => {
 
               <div className={styles.settingRow}>
                 <label htmlFor="search-progress-select">
-                  Search Telemetry
+                  Search Radar
                   <span className={styles.mutedText}>
                     {" "}
                     {SEARCH_PROGRESS_STYLES.find((s) => s.id === progressStyle)?.description}

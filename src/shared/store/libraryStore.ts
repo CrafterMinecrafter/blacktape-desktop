@@ -245,9 +245,15 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       sources: [],
     };
     if (!force && searchCache[trimmedQuery]) {
+      // The same query again, such as after a typed space, keeps the timings of its search.
+      const previous = get().searchRun;
+      const searchedJustNow =
+        previous !== null &&
+        previous.finishedAt !== null &&
+        previous.query.toLowerCase() === trimmedQuery;
       set({
         searchResults: searchCache[trimmedQuery],
-        searchRun: { ...run, finishedAt: run.startedAt, cached: true },
+        searchRun: searchedJustNow ? previous : { ...run, finishedAt: run.startedAt, cached: true },
       });
       return;
     }

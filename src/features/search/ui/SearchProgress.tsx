@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState, type MouseEvent } from "react";
 import clsx from "clsx";
 import {
   formatElapsed,
@@ -38,6 +38,9 @@ function describe(source: SourceProgress, now: number): string {
   }
 }
 
+/** For clicks inside the progress: the search field keeps the focus, so the dropdown stays open. */
+const keepFocus = (e: MouseEvent) => e.preventDefault();
+
 /** One chip per source: what is being asked, how long it takes and what it found. */
 export const SourceChips = ({ sources }: { sources: SourceProgress[] }) => {
   const now = useNow(sources.some((s) => s.state === "running"));
@@ -63,16 +66,11 @@ export const SearchPulse = ({ run }: { run: SearchRun }) => {
   const now = useNow(run.finishedAt === null);
   const total = formatElapsed((run.finishedAt ?? now) - run.startedAt);
   const answered = run.sources.filter((s) => s.state !== "waiting" && s.state !== "running").length;
+  const detailsId = useId();
   return (
     <>
-      <div className={styles.pulse}>
-        <button
-          type="button"
-          className={styles.counter}
-          aria-label={`Search progress for “${run.query}”`}
-          // the search field keeps the focus, so the dropdown stays open
-          onMouseDown={(e) => e.preventDefault()}
-        >
+      <div className={styles.pulse} onMouseDown={keepFocus}>
+        <button type="button" className={styles.counter} aria-describedby={detailsId}>
           {run.cached ? (
             "saved"
           ) : (
@@ -86,7 +84,7 @@ export const SearchPulse = ({ run }: { run: SearchRun }) => {
             </>
           )}
         </button>
-        <div className={styles.details} role="tooltip">
+        <div id={detailsId} className={styles.details} role="tooltip">
           <p className={styles.summary}>
             {run.cached ? "Saved results, nothing was requested" : `“${run.query}”`}
           </p>
@@ -107,7 +105,7 @@ export const SearchProgress = ({ run }: { run: SearchRun }) => {
   const now = useNow(run.finishedAt === null);
   const total = formatElapsed((run.finishedAt ?? now) - run.startedAt);
   return (
-    <div className={styles.progress}>
+    <div className={styles.progress} onMouseDown={keepFocus}>
       <p className={clsx(styles.summary, "truncate")}>
         {run.cached
           ? `“${run.query}”: saved results, nothing was requested`

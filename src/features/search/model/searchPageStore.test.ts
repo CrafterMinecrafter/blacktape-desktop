@@ -9,7 +9,7 @@ import type {
   FullSearchPage,
   SearchKind,
 } from "@/shared/lib/search/searchFull.ts";
-import { useSearchPageStore } from "./searchPageStore.ts";
+import { emptySection, useSearchPageStore } from "./searchPageStore.ts";
 import { DEFAULT_FILTERS, DEFAULT_SORT } from "./searchPageFilters.ts";
 
 type Handler = (ev: { payload: unknown }) => void;
@@ -560,6 +560,36 @@ describe("filters and sort", () => {
   });
 });
 
+describe("resumeIncomplete", () => {
+  it("settles a restored loadingMore section and closes its running and waiting sources", () => {
+    useSearchPageStore.setState({
+      query: "daft punk",
+      sections: {
+        ...initialState.sections,
+        [ItemType.Track]: {
+          ...emptySection(),
+          status: "loadingMore",
+          progress: [
+            { source: "youtube", state: "running", elapsedMs: null, count: null, startedAt: 1_000 },
+            { source: "bandcamp", state: "waiting", elapsedMs: null, count: null, startedAt: null },
+            { source: "soundcloud", state: "done", elapsedMs: 40, count: 2, startedAt: null },
+          ],
+        },
+      },
+    });
+
+    store().resumeIncomplete();
+
+    const tracks = section(ItemType.Track);
+    expect(tracks.status).toBe("ready");
+    expect(tracks.progress).toEqual([
+      { source: "youtube", state: "unknown", elapsedMs: null, count: null, startedAt: null },
+      { source: "bandcamp", state: "unknown", elapsedMs: null, count: null, startedAt: null },
+      { source: "soundcloud", state: "done", elapsedMs: 40, count: 2, startedAt: null },
+    ]);
+  });
+});
+
 function emit(event: string, payload: unknown) {
   for (const handler of [...(listeners.get(event) ?? [])]) handler({ payload });
 }
@@ -675,5 +705,32 @@ describe("search progress", () => {
     expect(listenMock).toHaveBeenCalledWith("search-full-progress", expect.any(Function));
     expect(listenMock.mock.calls.filter(([event]) => event === "search-full-progress")).toHaveLength(3);
     expect(activeListenerCount()).toBe(0);
+  });
+
+  it("still runs the search without a requestId when listening for progress fails", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    listenMock
+      .mockRejectedValueOnce(new Error("event bus down"))
+      .mockRejectedValueOnce(new Error("event bus down"))
+      .mockRejectedValueOnce(new Error("event bus down"));
+    const trackItem = item({ item_type: ItemType.Track, name: "Track" });
+    const artistItem = item({ item_type: ItemType.Artist, name: "Artist" });
+    searchFullMock.mockImplementation(async ({ kind }: { kind: SearchKind }) =>
+      page(kind === ItemType.Track ? [trackItem] : kind === ItemType.Artist ? [artistItem] : []),
+    );
+
+    store().open("daft punk");
+    await vi.waitFor(() =>
+      expect(KIND_LIST.every((kind) => section(kind).status === "ready")).toBe(true),
+    );
+
+    expect(searchFullMock).toHaveBeenCalledTimes(3);
+    for (const [args] of searchFullMock.mock.calls) {
+      expect(args).not.toHaveProperty("requestId");
+    }
+    expect(section(ItemType.Track).items).toEqual([trackItem]);
+    expect(section(ItemType.Artist).items).toEqual([artistItem]);
+    expect(consoleError).toHaveBeenCalled();
+    consoleError.mockRestore();
   });
 });

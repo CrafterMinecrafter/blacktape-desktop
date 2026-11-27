@@ -183,14 +183,21 @@ async function searchWithProgress(
   const requestId = ++lastProgressRequest;
   let sources: SourceProgress[] = [];
   onProgress(sources);
-  const stop = await listen<{ requestId: number; progress: SourceProgressEvent }>(
-    "search-full-progress",
-    (ev) => {
-      if (ev.payload.requestId !== requestId) return;
-      sources = applyProgress(sources, ev.payload.progress, Date.now());
-      onProgress(sources);
-    },
-  );
+  let stop: () => void;
+  try {
+    stop = await listen<{ requestId: number; progress: SourceProgressEvent }>(
+      "search-full-progress",
+      (ev) => {
+        if (ev.payload.requestId !== requestId) return;
+        sources = applyProgress(sources, ev.payload.progress, Date.now());
+        onProgress(sources);
+      },
+    );
+  } catch (err) {
+    // The search matters more than its progress.
+    console.error("Failed to listen for search progress:", err);
+    return searchFull(args);
+  }
   try {
     return await searchFull({ ...args, requestId });
   } finally {
@@ -363,7 +370,8 @@ export const useSearchPageStore = create<SearchPageState>((set, get) => {
 
       for (const kind of KINDS) {
         if (sections[kind]?.status === "loadingMore") {
-          setSection(kind, { status: "ready" });
+          // its progress can no longer arrive: nothing in it may keep counting
+          setSection(kind, { status: "ready", progress: closeProgress(sections[kind].progress) });
         }
       }
 
